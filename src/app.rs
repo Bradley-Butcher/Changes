@@ -841,7 +841,7 @@ fn handle_key(app: &mut App, key: event::KeyEvent, diff_tx: &mpsc::UnboundedSend
         }
 
         // Mode switching
-        KeyCode::Char('u') => {
+        KeyCode::Char('m') => {
             app.diff_modes[app.active_tab] = DiffMode::Unstaged;
             app.refresh_repo_async(app.active_tab, diff_tx);
             app.scroll_offset = 0;

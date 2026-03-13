@@ -12,11 +12,14 @@ pub enum DiffMode {
 }
 
 impl DiffMode {
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self, base_branch: Option<&str>) -> String {
         match self {
-            DiffMode::Unstaged => "Unstaged",
-            DiffMode::Staged => "Staged",
-            DiffMode::Branch => "Branch",
+            DiffMode::Unstaged => "Modified".to_string(),
+            DiffMode::Staged => "Staged".to_string(),
+            DiffMode::Branch => {
+                let base = base_branch.unwrap_or("main");
+                format!("vs {}", base)
+            }
         }
     }
 

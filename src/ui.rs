@@ -13,9 +13,15 @@ const FG_ADD: Color = Color::Rgb(100, 220, 100);
 const FG_DEL: Color = Color::Rgb(220, 100, 100);
 const FG_HUNK: Color = Color::Rgb(130, 170, 220);
 const FG_MUTED: Color = Color::Rgb(120, 120, 120);
-const FG_HEADER: Color = Color::Rgb(220, 200, 100);
+const BG_HEADER: Color = Color::Rgb(35, 40, 55);
 const BG_FLASH: Color = Color::Rgb(80, 80, 40);
 const FG_EXPAND: Color = Color::Rgb(80, 130, 180);
+const FG_STATUS_M: Color = Color::Rgb(220, 180, 60);
+const FG_STATUS_A: Color = Color::Rgb(100, 220, 100);
+const FG_STATUS_D: Color = Color::Rgb(220, 100, 100);
+const FG_STATUS_R: Color = Color::Rgb(130, 170, 220);
+const FG_PATH_DIR: Color = Color::Rgb(140, 140, 160);
+const FG_PATH_FILE: Color = Color::Rgb(240, 240, 250);
 
 pub fn draw(frame: &mut Frame, app: &mut App, highlighter: &Highlighter) {
     let chunks = Layout::default()
@@ -106,7 +112,7 @@ fn draw_empty_state(frame: &mut Frame, area: Rect) {
     ];
 
     let quote1 = r#"> git status"#;
-    let quote2 = r#"> "I see no changes... working tree clean.""#;
+    let quote2 = r#"> I see no changes ... working tree clean"#;
 
     // Total content height: logo (6) + blank + quote1 + quote2 = 9
     let content_height = 9u16;
@@ -194,36 +200,14 @@ fn draw_unified(
             break;
         }
 
-        // File header
+        // File header — full-width centered banner
         if row >= scroll && row < visible_end {
-            let status_char = match file.status {
-                FileStatus::Modified => "M",
-                FileStatus::Added => "A",
-                FileStatus::Deleted => "D",
-                FileStatus::Renamed => "R",
-                FileStatus::Untracked => "?",
-            };
-            let collapse_char = if file.collapsed { "▶" } else { "▼" };
-            let header_text = format!(
-                "{} {} {}  (+{} -{})",
-                collapse_char, status_char, file.path, file.additions, file.deletions
-            );
             let is_focused = app.focused_file == Some(file_idx);
-            let header_style = if is_focused {
-                Style::default()
-                    .fg(FG_HEADER)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                Style::default()
-                    .fg(FG_HEADER)
-                    .add_modifier(Modifier::BOLD)
-            };
-            lines.push(Line::from(Span::styled(header_text, header_style)));
+            lines.push(build_file_header(file, is_focused, inner_area.width));
         }
         row += 1;
 
         if file.collapsed {
-            // blank separator
             if row >= scroll && row < visible_end {
                 lines.push(Line::from(""));
             }
@@ -349,32 +333,17 @@ fn draw_side_by_side(
             break;
         }
 
-        // File header
+        // File header — full-width centered banner (spans both halves)
         if row >= scroll && row < visible_end {
-            let status_char = match file.status {
-                FileStatus::Modified => "M",
-                FileStatus::Added => "A",
-                FileStatus::Deleted => "D",
-                FileStatus::Renamed => "R",
-                FileStatus::Untracked => "?",
-            };
-            let collapse_char = if file.collapsed { "▶" } else { "▼" };
-            let header_text = format!(
-                "{} {} {}  (+{} -{})",
-                collapse_char, status_char, file.path, file.additions, file.deletions
-            );
             let is_focused = app.focused_file == Some(file_idx);
-            let header_style = if is_focused {
-                Style::default()
-                    .fg(FG_HEADER)
-                    .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
-            } else {
-                Style::default()
-                    .fg(FG_HEADER)
-                    .add_modifier(Modifier::BOLD)
-            };
-            left_lines.push(Line::from(Span::styled(header_text.clone(), header_style)));
-            right_lines.push(Line::from(Span::styled(header_text, header_style)));
+            let header = build_file_header(file, is_focused, inner_area.width);
+            // Left half gets the header, right half gets matching background
+            left_lines.push(header);
+            let bg = BG_HEADER;
+            right_lines.push(Line::from(Span::styled(
+                " ".repeat(inner_area.width as usize),
+                Style::default().bg(bg),
+            )));
         }
         row += 1;
 
@@ -545,6 +514,62 @@ fn build_sbs_line<'a>(
     }
 }
 
+/// Build a full-width centered file header banner.
+fn build_file_header<'a>(
+    file: &crate::diff::FileDiff,
+    is_focused: bool,
+    width: u16,
+) -> Line<'a> {
+    let collapse = if file.collapsed { "▶" } else { "▼" };
+
+    let (status_char, status_fg) = match file.status {
+        FileStatus::Modified => ("M", FG_STATUS_M),
+        FileStatus::Added => ("A", FG_STATUS_A),
+        FileStatus::Deleted => ("D", FG_STATUS_D),
+        FileStatus::Renamed => ("R", FG_STATUS_R),
+        FileStatus::Untracked => ("?", FG_MUTED),
+    };
+
+    // Split path into directory + filename
+    let (dir, filename) = match file.path.rfind('/') {
+        Some(pos) => (&file.path[..=pos], &file.path[pos + 1..]),
+        None => ("", file.path.as_str()),
+    };
+
+    let adds = format!("+{}", file.additions);
+    let dels = format!("-{}", file.deletions);
+
+    let bg = BG_HEADER;
+    let total_width = width as usize;
+    let underline = if is_focused { Modifier::UNDERLINED } else { Modifier::empty() };
+
+    // Left-aligned: small indent then content, fill remaining with bg
+    let mut spans = vec![
+        Span::styled(" ", Style::default().bg(bg)),
+        Span::styled(format!("{} ", collapse), Style::default().fg(FG_MUTED).bg(bg)),
+        Span::styled(format!("{}", status_char), Style::default().fg(status_fg).bg(bg).add_modifier(Modifier::BOLD)),
+        Span::styled("  ", Style::default().bg(bg)),
+    ];
+
+    if !dir.is_empty() {
+        spans.push(Span::styled(dir.to_string(), Style::default().fg(FG_PATH_DIR).bg(bg).add_modifier(underline)));
+    }
+    spans.push(Span::styled(
+        filename.to_string(),
+        Style::default().fg(FG_PATH_FILE).bg(bg).add_modifier(Modifier::BOLD | underline),
+    ));
+    spans.push(Span::styled("  ", Style::default().bg(bg)));
+    let used = 1 + collapse.len() + 1 + status_char.len() + 2 + dir.len() + filename.len()
+        + 2 + adds.len() + 2 + dels.len();
+    spans.push(Span::styled(adds, Style::default().fg(FG_ADD).bg(bg)));
+    spans.push(Span::styled("  ", Style::default().bg(bg)));
+    spans.push(Span::styled(dels, Style::default().fg(FG_DEL).bg(bg)));
+    let right_pad = total_width.saturating_sub(used);
+    spans.push(Span::styled(" ".repeat(right_pad), Style::default().bg(bg)));
+
+    Line::from(spans)
+}
+
 /// Extract the function context from a hunk header like `@@ -10,5 +10,7 @@ fn foo()`.
 /// Returns the function name if present, otherwise None.
 fn hunk_context(header: &str) -> Option<&str> {
@@ -593,7 +618,8 @@ fn format_expand_indicator(gap: usize, width: usize) -> String {
 
 fn draw_status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
     let total_files: usize = app.file_diffs.iter().map(|f| f.len()).sum();
-    let mode = app.current_mode().label();
+    let base = app.base_branches.get(app.active_tab).and_then(|b| b.as_deref());
+    let mode = app.current_mode().label(base);
     let view = if app.side_by_side { "side-by-side" } else { "unified" };
     let repo_count = app.repos.len();
 
@@ -865,7 +891,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         Line::from("  Click tab      Switch to tab"),
         Line::from(""),
         Line::from(vec![Span::styled("Modes & Views", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
-        Line::from("  u/s/b          Unstaged/Staged/Branch diff"),
+        Line::from("  m/s/b          Modified/Staged/Branch diff"),
         Line::from("  v              Toggle unified/side-by-side"),
         Line::from(""),
         Line::from(vec![Span::styled("Actions", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))]),
