@@ -10,6 +10,7 @@ pub struct Highlighter {
     theme_set: ThemeSet,
     /// Maps file extensions to syntax name to avoid repeated find_syntax_for_file calls
     syntax_cache: std::cell::RefCell<HashMap<String, String>>,
+    highlight_cache: std::cell::RefCell<HashMap<(String, String), Vec<CachedSpan>>>,
 }
 
 impl Default for Highlighter {
@@ -24,7 +25,14 @@ impl Highlighter {
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
             syntax_cache: std::cell::RefCell::new(HashMap::new()),
+            highlight_cache: std::cell::RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Clear the highlight cache. Call when diff content changes to prevent unbounded growth.
+    /// The syntax cache (ext -> syntax name) is kept — it's bounded by extension count.
+    pub fn clear_highlight_cache(&self) {
+        self.highlight_cache.borrow_mut().clear();
     }
 
     fn get_syntax(&self, file_path: &str) -> &SyntaxReference {
@@ -60,40 +68,53 @@ impl Highlighter {
         bg_override: Option<Color>,
     ) -> Line<'a> {
         let syntax = self.get_syntax(file_path);
-        let theme = &self.theme_set.themes["base16-ocean.dark"];
-        let mut h = HighlightLines::new(syntax, theme);
+        let cache_key = (syntax.name.clone(), text.to_string());
 
-        let regions = match h.highlight_line(text, &self.syntax_set) {
-            Ok(regions) => regions,
-            Err(_) => {
-                return Line::from(text.to_string());
-            }
+        let cached = if let Some(cached) = self.highlight_cache.borrow().get(&cache_key) {
+            cached.clone()
+        } else {
+            let theme = &self.theme_set.themes["base16-ocean.dark"];
+            let mut h = HighlightLines::new(syntax, theme);
+            let regions = match h.highlight_line(text, &self.syntax_set) {
+                Ok(regions) => regions,
+                Err(_) => {
+                    return Line::from(text.to_string());
+                }
+            };
+
+            let cached: Vec<CachedSpan> = regions
+                .into_iter()
+                .map(|(style, content)| CachedSpan {
+                    content: content.to_string(),
+                    fg: syntect_color_to_ratatui(style.foreground),
+                    bg: if style.background
+                        != (highlighting::Color {
+                            r: 0,
+                            g: 0,
+                            b: 0,
+                            a: 0,
+                        }) {
+                        Some(syntect_color_to_ratatui(style.background))
+                    } else {
+                        None
+                    },
+                    modifiers: syntect_modifiers(style.font_style),
+                })
+                .collect();
+            self.highlight_cache
+                .borrow_mut()
+                .insert(cache_key, cached.clone());
+            cached
         };
 
-        let spans: Vec<Span<'a>> = regions
+        let spans: Vec<Span<'a>> = cached
             .into_iter()
-            .map(|(style, content)| {
-                let fg = syntect_color_to_ratatui(style.foreground);
-                let mut ratatui_style = Style::default().fg(fg);
-                if let Some(bg) = bg_override {
-                    ratatui_style = ratatui_style.bg(bg);
-                } else if style.background
-                    != (highlighting::Color {
-                        r: 0,
-                        g: 0,
-                        b: 0,
-                        a: 0,
-                    })
-                {
-                    ratatui_style = ratatui_style.bg(syntect_color_to_ratatui(style.background));
+            .map(|span| {
+                let mut style = Style::default().fg(span.fg).add_modifier(span.modifiers);
+                if let Some(bg) = bg_override.or(span.bg) {
+                    style = style.bg(bg);
                 }
-                if style.font_style.contains(highlighting::FontStyle::BOLD) {
-                    ratatui_style = ratatui_style.add_modifier(Modifier::BOLD);
-                }
-                if style.font_style.contains(highlighting::FontStyle::ITALIC) {
-                    ratatui_style = ratatui_style.add_modifier(Modifier::ITALIC);
-                }
-                Span::styled(content.to_string(), ratatui_style)
+                Span::styled(span.content, style)
             })
             .collect();
 
@@ -101,6 +122,25 @@ impl Highlighter {
     }
 }
 
+#[derive(Clone)]
+struct CachedSpan {
+    content: String,
+    fg: Color,
+    bg: Option<Color>,
+    modifiers: Modifier,
+}
+
 fn syntect_color_to_ratatui(c: highlighting::Color) -> Color {
     Color::Rgb(c.r, c.g, c.b)
+}
+
+fn syntect_modifiers(font_style: highlighting::FontStyle) -> Modifier {
+    let mut modifiers = Modifier::empty();
+    if font_style.contains(highlighting::FontStyle::BOLD) {
+        modifiers |= Modifier::BOLD;
+    }
+    if font_style.contains(highlighting::FontStyle::ITALIC) {
+        modifiers |= Modifier::ITALIC;
+    }
+    modifiers
 }

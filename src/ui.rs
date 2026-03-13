@@ -1,6 +1,7 @@
 use crate::app::App;
-use crate::diff::{self, FileStatus, LineKind};
+use crate::diff::{FileStatus, LineKind};
 use crate::highlight::Highlighter;
+use crate::viewport::RowRef;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -34,6 +35,7 @@ pub struct LayoutHints {
     pub view_badge_pos: (u16, u16),
     pub status_bar_row: u16,
     pub content_y: u16,
+    pub content_height: u16,
 }
 
 pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut LayoutHints) {
@@ -49,14 +51,15 @@ pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut
     // Compute content area top for mouse hit-testing
     let diff_inner = Block::default().borders(Borders::ALL).inner(chunks[1]);
     hints.content_y = diff_inner.y;
+    hints.content_height = diff_inner.height;
 
     draw_tab_bar(frame, app, hints, chunks[0]);
     draw_diff_area(frame, app, highlighter, chunks[1]);
     draw_status_bar(frame, app, hints, chunks[2]);
 
-    if app.show_repo_adder {
+    if app.repo_adder.is_some() {
         draw_repo_adder(frame, app);
-    } else if app.show_file_picker {
+    } else if app.file_picker.is_some() {
         draw_file_picker(frame, app);
     } else if app.show_help {
         draw_help_overlay(frame);
@@ -169,6 +172,13 @@ fn draw_diff_area(frame: &mut Frame, app: &App, highlighter: &Highlighter, area:
             return;
         }
     };
+    let layout = match app.current_layout() {
+        Some(layout) => layout,
+        None => {
+            draw_empty_state(frame, area);
+            return;
+        }
+    };
 
     if files.is_empty() {
         draw_empty_state(frame, area);
@@ -176,9 +186,9 @@ fn draw_diff_area(frame: &mut Frame, app: &App, highlighter: &Highlighter, area:
     }
 
     if app.side_by_side {
-        draw_side_by_side(frame, app, highlighter, files, area);
+        draw_side_by_side(frame, app, highlighter, files, layout, area);
     } else {
-        draw_unified(frame, app, highlighter, files, area);
+        draw_unified(frame, app, highlighter, files, layout, area);
     }
 }
 
@@ -187,6 +197,7 @@ fn draw_unified(
     app: &App,
     highlighter: &Highlighter,
     files: &[crate::diff::FileDiff],
+    layout: &crate::viewport::DiffLayout,
     area: Rect,
 ) {
     let inner_area = Block::default().borders(Borders::ALL).inner(area);
@@ -194,61 +205,37 @@ fn draw_unified(
     frame.render_widget(block, area);
 
     let visible_height = inner_area.height as usize;
-    let scroll = app.scroll_offset;
-    let visible_end = scroll + visible_height;
-
-    // Compute total lines upfront for stable scrollbar sizing.
-    let total_lines: usize = files.iter().map(|f| f.total_display_lines() + 1).sum();
-
-    // Build only the visible lines — skip everything above the viewport,
-    // stop once we've filled the viewport, and only syntax-highlight visible lines.
+    let total_lines = layout.total_lines();
+    let visible_rows = app.visible_row_range(total_lines, visible_height);
     let mut lines: Vec<Line> = Vec::new();
-    let mut row: usize = 0;
 
-    'outer: for (file_idx, file) in files.iter().enumerate() {
-        let file_lines = file.total_display_lines() + 1; // +1 blank separator
 
-        // Skip files entirely above the viewport
-        if row + file_lines <= scroll {
-            row += file_lines;
+    for row in visible_rows {
+        let Some(row_ref) = layout.row(row) else {
             continue;
-        }
-
-        // Stop if we're past the viewport
-        if row >= visible_end {
-            break;
-        }
-
-        // File header — full-width centered banner
-        if row >= scroll && row < visible_end {
-            let is_focused = app.focused_file == Some(file_idx);
-            lines.push(build_file_header(file, is_focused, inner_area.width));
-        }
-        row += 1;
-
-        if file.collapsed {
-            if row >= scroll && row < visible_end {
-                lines.push(Line::from(""));
+        };
+        match row_ref {
+            RowRef::FileHeader { file_idx } => {
+                if let Some(file) = files.get(file_idx) {
+                    let is_focused = app.focused_file == Some(file_idx);
+                    lines.push(build_file_header(file, is_focused, inner_area.width));
+                }
             }
-            row += 1;
-            continue;
-        }
-
-        let lno_w = lineno_width(file);
-
-        for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
-            // Hunk header: gap indicator + function context (only when gap exists)
-            if row >= scroll && row < visible_end {
-                let gap = if hunk_idx > 0 {
-                    diff::gap_between_hunks(&file.hunks[hunk_idx - 1], hunk)
-                } else {
-                    // Gap before first hunk
-                    hunk.first_new_lineno().unwrap_or(1) as usize - 1
+            RowRef::HunkHeader {
+                file_idx,
+                hunk_idx,
+                gap_before,
+            } => {
+                let Some(file) = files.get(file_idx) else {
+                    continue;
                 };
-
-                if gap > 0 {
+                let Some(hunk) = file.hunks.get(hunk_idx) else {
+                    continue;
+                };
+                let lno_w = lineno_width(file);
+                if gap_before > 0 {
                     let mut spans = vec![Span::styled(
-                        format_expand_indicator(gap, lno_w),
+                        format_expand_indicator(gap_before, lno_w),
                         Style::default().fg(FG_EXPAND),
                     )];
                     if let Some(ctx) = hunk_context(&hunk.header) {
@@ -268,53 +255,44 @@ fn draw_unified(
                     lines.push(Line::from(""));
                 }
             }
-            row += 1;
-            if row >= visible_end {
-                break 'outer;
-            }
-
-            let flashing = app.is_hunk_flashing(file_idx, hunk_idx);
-
-            for line in &hunk.lines {
-                if row >= scroll && row < visible_end {
-                    lines.push(build_unified_line(
-                        line,
-                        &file.path,
-                        highlighter,
-                        flashing,
-                        lno_w,
-                    ));
-                }
-                row += 1;
-                if row >= visible_end {
-                    break 'outer;
-                }
-            }
-        }
-
-        // Trailing row — show bottom gap if lines exist after last hunk
-        if row >= scroll && row < visible_end {
-            let bottom_gap =
-                if !file.collapsed && !file.hunks.is_empty() && file.total_new_lines > 0 {
-                    let last_new = file
-                        .hunks
-                        .last()
-                        .and_then(|h| h.last_new_lineno())
-                        .unwrap_or(0) as usize;
-                    file.total_new_lines.saturating_sub(last_new)
-                } else {
-                    0
+            RowRef::UnifiedLine {
+                file_idx,
+                hunk_idx,
+                line_idx,
+            } => {
+                let Some(file) = files.get(file_idx) else {
+                    continue;
                 };
-            if bottom_gap > 0 {
+                let Some(hunk) = file.hunks.get(hunk_idx) else {
+                    continue;
+                };
+                let Some(line) = hunk.lines.get(line_idx) else {
+                    continue;
+                };
+                let flashing = app.is_hunk_flashing(file_idx, hunk_idx);
+                lines.push(build_unified_line(
+                    line,
+                    &file.path,
+                    highlighter,
+                    flashing,
+                    lineno_width(file),
+                ));
+            }
+            RowRef::GapTail { gap_after, .. } if gap_after > 0 => {
+                let Some(file_idx) = layout.row_file_idx(row) else {
+                    continue;
+                };
+                let Some(file) = files.get(file_idx) else {
+                    continue;
+                };
                 lines.push(Line::from(Span::styled(
-                    format_expand_indicator(bottom_gap, lno_w),
+                    format_expand_indicator(gap_after, lineno_width(file)),
                     Style::default().fg(FG_EXPAND),
                 )));
-            } else {
-                lines.push(Line::from(""));
             }
+            RowRef::Blank { .. } | RowRef::GapTail { .. } => lines.push(Line::from("")),
+            RowRef::SideBySideLine { .. } => {}
         }
-        row += 1;
     }
 
     let paragraph = Paragraph::new(lines);
@@ -322,7 +300,7 @@ fn draw_unified(
 
     if total_lines > visible_height {
         let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_height))
-            .position(app.scroll_offset);
+            .position(app.current_scroll_offset());
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
     }
@@ -333,6 +311,7 @@ fn draw_side_by_side(
     app: &App,
     highlighter: &Highlighter,
     files: &[crate::diff::FileDiff],
+    layout: &crate::viewport::DiffLayout,
     area: Rect,
 ) {
     let block = Block::default().borders(Borders::ALL);
@@ -345,127 +324,102 @@ fn draw_side_by_side(
         .split(inner_area);
 
     let visible_height = inner_area.height as usize;
-    let scroll = app.scroll_offset;
-    let visible_end = scroll + visible_height;
+    let total_lines = layout.total_lines();
+    let visible_rows = app.visible_row_range(total_lines, visible_height);
 
-    // Stable total for scrollbar
-    let total_lines: usize = files.iter().map(|f| f.total_sbs_display_lines() + 1).sum();
 
     let mut left_lines: Vec<Line> = Vec::new();
     let mut right_lines: Vec<Line> = Vec::new();
-    let mut row: usize = 0;
-    let empty_sbs: Vec<Vec<diff::SideBySideLine>> = Vec::new();
-
-    'outer: for (file_idx, file) in files.iter().enumerate() {
-        let file_lines = file.total_sbs_display_lines() + 1;
-
-        // Skip files entirely above viewport
-        if row + file_lines <= scroll {
-            row += file_lines;
+    for row in visible_rows {
+        let Some(row_ref) = layout.row(row) else {
             continue;
-        }
-        // Stop past viewport
-        if row >= visible_end {
-            break;
-        }
-
-        // File header — full-width centered banner (spans both halves)
-        if row >= scroll && row < visible_end {
-            let is_focused = app.focused_file == Some(file_idx);
-            let header = build_file_header(file, is_focused, inner_area.width);
-            // Left half gets the header, right half gets matching background
-            left_lines.push(header);
-            let bg = BG_HEADER;
-            right_lines.push(Line::from(Span::styled(
-                " ".repeat(inner_area.width as usize),
-                Style::default().bg(bg),
-            )));
-        }
-        row += 1;
-
-        if !file.collapsed {
-            let sbs_hunks = file.sbs_cache.as_ref().unwrap_or(&empty_sbs);
-
-            for (hunk_idx, sbs_lines) in sbs_hunks.iter().enumerate() {
-                // Hunk header: gap indicator + function context (only when gap exists)
-                if row >= scroll && row < visible_end {
-                    let gap = if hunk_idx > 0 && hunk_idx < file.hunks.len() {
-                        diff::gap_between_hunks(&file.hunks[hunk_idx - 1], &file.hunks[hunk_idx])
-                    } else if hunk_idx == 0 && hunk_idx < file.hunks.len() {
-                        file.hunks[0].first_new_lineno().unwrap_or(1) as usize - 1
-                    } else {
-                        0
-                    };
-
-                    let hunk_line = if gap > 0 {
-                        let mut spans = vec![Span::styled(
-                            format!("  ↕ {}", gap),
-                            Style::default().fg(FG_EXPAND),
-                        )];
-                        let ctx = if hunk_idx < file.hunks.len() {
-                            hunk_context(&file.hunks[hunk_idx].header)
-                        } else {
-                            None
-                        };
-                        if let Some(ctx) = ctx {
-                            spans.push(Span::styled(
-                                format!("  {}", ctx),
-                                Style::default().fg(FG_HUNK),
-                            ));
-                        }
-                        Line::from(spans)
-                    } else if hunk_idx > 0 {
-                        Line::from(Span::styled("  ─", Style::default().fg(FG_MUTED)))
-                    } else {
-                        Line::from("")
-                    };
-                    left_lines.push(hunk_line.clone());
-                    right_lines.push(hunk_line);
-                }
-                row += 1;
-                if row >= visible_end {
-                    break 'outer;
-                }
-
-                for sbs in sbs_lines {
-                    if row >= scroll && row < visible_end {
-                        left_lines.push(build_sbs_line(&sbs.left, &file.path, highlighter));
-                        right_lines.push(build_sbs_line(&sbs.right, &file.path, highlighter));
-                    }
-                    row += 1;
-                    if row >= visible_end {
-                        break 'outer;
-                    }
-                }
-            }
-        }
-
-        // Trailing row — show bottom gap if lines exist after last hunk
-        if row >= scroll && row < visible_end {
-            let bottom_gap =
-                if !file.collapsed && !file.hunks.is_empty() && file.total_new_lines > 0 {
-                    let last_new = file
-                        .hunks
-                        .last()
-                        .and_then(|h| h.last_new_lineno())
-                        .unwrap_or(0) as usize;
-                    file.total_new_lines.saturating_sub(last_new)
-                } else {
-                    0
+        };
+        match row_ref {
+            RowRef::FileHeader { file_idx } => {
+                let Some(file) = files.get(file_idx) else {
+                    continue;
                 };
-            if bottom_gap > 0 {
+                let is_focused = app.focused_file == Some(file_idx);
+                let header = build_file_header(file, is_focused, inner_area.width);
+                left_lines.push(header);
+                right_lines.push(Line::from(Span::styled(
+                    " ".repeat(inner_area.width as usize),
+                    Style::default().bg(BG_HEADER),
+                )));
+            }
+            RowRef::HunkHeader {
+                file_idx,
+                hunk_idx,
+                gap_before,
+            } => {
+                let Some(file) = files.get(file_idx) else {
+                    continue;
+                };
+                let ctx = file
+                    .hunks
+                    .get(hunk_idx)
+                    .and_then(|hunk| hunk_context(&hunk.header));
+                let hunk_line = if gap_before > 0 {
+                    let mut spans = vec![Span::styled(
+                        format!("  ↕ {}", gap_before),
+                        Style::default().fg(FG_EXPAND),
+                    )];
+                    if let Some(ctx) = ctx {
+                        spans.push(Span::styled(
+                            format!("  {}", ctx),
+                            Style::default().fg(FG_HUNK),
+                        ));
+                    }
+                    Line::from(spans)
+                } else if hunk_idx > 0 {
+                    Line::from(Span::styled("  ─", Style::default().fg(FG_MUTED)))
+                } else {
+                    Line::from("")
+                };
+                left_lines.push(hunk_line.clone());
+                right_lines.push(hunk_line);
+            }
+            RowRef::SideBySideLine {
+                file_idx,
+                hunk_idx,
+                line_idx,
+            } => {
+                let Some(file) = files.get(file_idx) else {
+                    continue;
+                };
+                let Some(sbs_line) = file
+                    .sbs_cache
+                    .as_ref()
+                    .and_then(|cache| cache.get(hunk_idx))
+                    .and_then(|rows| rows.get(line_idx))
+                else {
+                    continue;
+                };
+                left_lines.push(build_sbs_line(
+                    &sbs_line.left,
+                    &file.path,
+                    highlighter,
+                ));
+                right_lines.push(build_sbs_line(
+                    &sbs_line.right,
+                    &file.path,
+                    highlighter,
+                ));
+            }
+            RowRef::GapTail { gap_after, .. } if gap_after > 0 => {
                 let expand_line = Line::from(Span::styled(
-                    format!("  ↕ {}", bottom_gap),
+                    format!("  ↕ {}", gap_after),
                     Style::default().fg(FG_EXPAND),
                 ));
                 left_lines.push(expand_line.clone());
                 right_lines.push(expand_line);
-            } else {
+            }
+            RowRef::Blank { .. } | RowRef::GapTail { .. } => {
                 left_lines.push(Line::from(""));
                 right_lines.push(Line::from(""));
             }
+            RowRef::UnifiedLine { .. } => {}
         }
-        row += 1;
     }
 
     let left_para = Paragraph::new(left_lines);
@@ -476,7 +430,7 @@ fn draw_side_by_side(
 
     if total_lines > visible_height {
         let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_height))
-            .position(app.scroll_offset);
+            .position(app.current_scroll_offset());
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
     }
@@ -550,7 +504,8 @@ fn build_sbs_line<'a>(
             };
 
             let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
-            let mut highlighted = highlighter.highlight_line_content(&line.content, file_path, bg);
+            let mut highlighted =
+                highlighter.highlight_line_content(&line.content, file_path, bg);
             spans.append(&mut highlighted.spans);
             Line::from(spans)
         }
@@ -705,7 +660,7 @@ fn lineno_width(file: &crate::diff::FileDiff) -> usize {
     let digits = if max_lineno == 0 {
         1
     } else {
-        (max_lineno as f64).log10() as usize + 1
+        max_lineno.ilog10() as usize + 1
     };
     digits.max(4)
 }
@@ -857,8 +812,13 @@ fn draw_file_picker(frame: &mut Frame, app: &App) {
         return;
     }
 
+    let picker = match app.file_picker.as_ref() {
+        Some(p) => p,
+        None => return,
+    };
+
     // Input line with cursor
-    let input_text = format!(" > {}_", app.file_picker_query);
+    let input_text = format!(" > {}_", picker.query);
     let input_line = Paragraph::new(Line::from(Span::styled(
         input_text,
         Style::default().fg(Color::Yellow),
@@ -884,8 +844,8 @@ fn draw_file_picker(frame: &mut Frame, app: &App) {
     let visible_count = list_area.height as usize;
 
     // Scroll the list to keep selected item visible
-    let list_scroll = if app.file_picker_selected >= visible_count {
-        app.file_picker_selected - visible_count + 1
+    let list_scroll = if picker.selected >= visible_count {
+        picker.selected - visible_count + 1
     } else {
         0
     };
@@ -897,7 +857,7 @@ fn draw_file_picker(frame: &mut Frame, app: &App) {
         .take(visible_count)
     {
         let file = &files[file_idx];
-        let is_selected = display_idx == app.file_picker_selected;
+        let is_selected = display_idx == picker.selected;
 
         let status_char = match file.status {
             FileStatus::Modified => "M",
@@ -953,12 +913,17 @@ fn draw_repo_adder(frame: &mut Frame, app: &App) {
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
+    let adder = match app.repo_adder.as_ref() {
+        Some(a) => a,
+        None => return,
+    };
+
     if inner.height < 2 {
         return;
     }
 
     // Input line
-    let input_text = format!(" > {}_", app.repo_adder_query);
+    let input_text = format!(" > {}_", adder.query);
     let input_line = Paragraph::new(Line::from(Span::styled(
         input_text,
         Style::default().fg(Color::Yellow),
@@ -975,7 +940,7 @@ fn draw_repo_adder(frame: &mut Frame, app: &App) {
         inner.height.saturating_sub(1),
     );
 
-    if let Some(ref err) = app.repo_adder_error {
+    if let Some(ref err) = adder.error {
         let err_line = Paragraph::new(Line::from(Span::styled(
             format!(" {}", err),
             Style::default().fg(Color::Red),
@@ -986,22 +951,22 @@ fn draw_repo_adder(frame: &mut Frame, app: &App) {
     }
 
     let visible_count = list_area.height as usize;
-    let list_scroll = if app.repo_adder_cursor >= visible_count {
-        app.repo_adder_cursor - visible_count + 1
+    let list_scroll = if adder.cursor >= visible_count {
+        adder.cursor - visible_count + 1
     } else {
         0
     };
 
     let mut lines: Vec<Line> = Vec::new();
-    for (display_idx, (name, _path)) in app
-        .repo_adder_results
+    for (display_idx, (name, _path)) in adder
+        .results
         .iter()
         .enumerate()
         .skip(list_scroll)
         .take(visible_count)
     {
-        let is_cursor = display_idx == app.repo_adder_cursor;
-        let is_checked = app.repo_adder_checked.contains(&display_idx);
+        let is_cursor = display_idx == adder.cursor;
+        let is_checked = adder.checked.contains(&display_idx);
         let check = if is_checked { "[x]" } else { "[ ]" };
         let text = format!(" {} {}", check, name);
 
@@ -1019,7 +984,7 @@ fn draw_repo_adder(frame: &mut Frame, app: &App) {
         lines.push(Line::from(Span::styled(text, style)));
     }
 
-    if app.repo_adder_results.is_empty() {
+    if adder.results.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No git repos found",
             Style::default().fg(FG_MUTED).bg(Color::Rgb(30, 30, 40)),

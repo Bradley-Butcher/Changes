@@ -1,30 +1,17 @@
-mod keys;
-mod mouse;
+pub mod keys;
+pub mod mouse;
 
 use crate::diff::{DiffLine, FileDiff, LineKind};
 use crate::git::{self, DiffMode, RepoInfo};
-use crate::highlight::Highlighter;
-use crate::ui::{self, LayoutHints};
-use crate::watcher::{self, WatchEvent};
-use anyhow::Result;
-use crossterm::event::{
-    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
-};
-use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
-};
-use ratatui::Terminal;
-use ratatui::backend::CrosstermBackend;
-use std::io;
+use crate::ui::LayoutHints;
+use crate::viewport::{DiffLayout, ViewKind, ViewportState};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 // Tunable constants
 const FLASH_DURATION: Duration = Duration::from_millis(300);
-const FLASH_TICK: Duration = Duration::from_millis(50);
-const IDLE_TICK: Duration = Duration::from_secs(60);
 pub(crate) const SCROLL_SPEED: usize = 3;
 pub(crate) const PAGE_SCROLL: usize = 20;
 pub(crate) const DOUBLE_CLICK_MS: u64 = 400;
@@ -36,29 +23,42 @@ pub struct RepoState {
     pub files: Vec<FileDiff>,
     pub base_branch: Option<String>,
     pub branch_name: Option<String>,
+    pub unified_layout: Option<DiffLayout>,
+    pub sbs_layout: Option<DiffLayout>,
+    pub unified_viewport: ViewportState,
+    pub sbs_viewport: ViewportState,
+}
+
+pub struct FlashState {
+    pub until: Instant,
+    pub file_idx: usize,
+    pub hunk_idx: usize,
+}
+
+pub struct FilePickerState {
+    pub query: String,
+    pub selected: usize,
+}
+
+pub struct RepoAdderState {
+    pub query: String,
+    pub error: Option<String>,
+    pub results: Vec<(String, PathBuf)>,
+    pub cursor: usize,
+    pub checked: std::collections::HashSet<usize>,
 }
 
 pub struct App {
     pub repos: Vec<RepoState>,
     next_repo_id: u64,
     pub active_tab: usize,
-    pub scroll_offset: usize,
     pub focused_file: Option<usize>,
     pub side_by_side: bool,
     pub last_error: Option<String>,
-    pub flash_until: Option<Instant>,
-    pub flash_file_idx: Option<usize>,
-    pub flash_hunk_idx: Option<usize>,
+    pub flash: Option<FlashState>,
     pub show_help: bool,
-    pub show_file_picker: bool,
-    pub file_picker_query: String,
-    pub file_picker_selected: usize,
-    pub show_repo_adder: bool,
-    pub repo_adder_query: String,
-    pub repo_adder_error: Option<String>,
-    pub repo_adder_results: Vec<(String, PathBuf)>,
-    pub repo_adder_cursor: usize,
-    pub repo_adder_checked: std::collections::HashSet<usize>,
+    pub file_picker: Option<FilePickerState>,
+    pub repo_adder: Option<RepoAdderState>,
     pub layout: LayoutHints,
     pub last_click: Option<(u16, u16, Instant)>,
 }
@@ -75,6 +75,10 @@ impl App {
                 files: Vec::new(),
                 base_branch: None,
                 branch_name: None,
+                unified_layout: None,
+                sbs_layout: None,
+                unified_viewport: ViewportState::default(),
+                sbs_viewport: ViewportState::default(),
             })
             .collect();
         let next_repo_id = repos.len() as u64;
@@ -82,23 +86,13 @@ impl App {
             repos,
             next_repo_id,
             active_tab: 0,
-            scroll_offset: 0,
             focused_file: None,
             side_by_side: false,
             last_error: None,
-            flash_until: None,
-            flash_file_idx: None,
-            flash_hunk_idx: None,
+            flash: None,
             show_help: false,
-            show_file_picker: false,
-            file_picker_query: String::new(),
-            file_picker_selected: 0,
-            show_repo_adder: false,
-            repo_adder_query: String::new(),
-            repo_adder_error: None,
-            repo_adder_results: Vec::new(),
-            repo_adder_cursor: 0,
-            repo_adder_checked: std::collections::HashSet::new(),
+            file_picker: None,
+            repo_adder: None,
             layout: LayoutHints::default(),
             last_click: None,
         }
@@ -106,6 +100,46 @@ impl App {
 
     pub fn current_mode(&self) -> DiffMode {
         self.repos[self.active_tab].mode
+    }
+
+    pub fn set_mode(&mut self, mode: DiffMode, diff_tx: &mpsc::UnboundedSender<DiffResult>) {
+        self.repos[self.active_tab].mode = mode;
+        self.refresh_repo_async(self.active_tab, diff_tx);
+        self.jump_active_viewport_top();
+    }
+
+    pub fn toggle_collapsed(&mut self, file_idx: usize) {
+        if let Some(files) = self.current_files_mut()
+            && let Some(file) = files.get_mut(file_idx)
+        {
+            file.collapsed = !file.collapsed;
+        }
+        self.invalidate_layouts(self.active_tab);
+        self.prepare_active_layout();
+        self.clamp_active_viewport();
+    }
+
+    pub fn set_all_collapsed(&mut self, collapsed: bool) {
+        if let Some(files) = self.current_files_mut() {
+            for file in files.iter_mut() {
+                file.collapsed = collapsed;
+            }
+        }
+        self.invalidate_layouts(self.active_tab);
+        self.prepare_active_layout();
+        self.clamp_active_viewport();
+    }
+
+    pub fn active_view_kind(&self) -> ViewKind {
+        if self.side_by_side {
+            ViewKind::SideBySide
+        } else {
+            ViewKind::Unified
+        }
+    }
+
+    fn viewport_height(&self) -> usize {
+        self.layout.content_height.max(1) as usize
     }
 
     pub fn current_files(&self) -> Option<&Vec<FileDiff>> {
@@ -120,13 +154,202 @@ impl App {
         self.repos.iter().position(|r| r.id == id)
     }
 
+    pub fn current_scroll_offset(&self) -> usize {
+        self.repos
+            .get(self.active_tab)
+            .map(|repo| match self.active_view_kind() {
+                ViewKind::Unified => repo.unified_viewport.scroll_offset(),
+                ViewKind::SideBySide => repo.sbs_viewport.scroll_offset(),
+            })
+            .unwrap_or(0)
+    }
+
+    pub fn prepare_active_layout(&mut self) {
+        let idx = self.active_tab;
+        let view = self.active_view_kind();
+        self.ensure_layout(idx, view);
+    }
+
+    pub fn current_layout(&self) -> Option<&DiffLayout> {
+        self.repos
+            .get(self.active_tab)
+            .and_then(|repo| match self.active_view_kind() {
+                ViewKind::Unified => repo.unified_layout.as_ref(),
+                ViewKind::SideBySide => repo.sbs_layout.as_ref(),
+            })
+    }
+
+    fn current_viewport(&self) -> Option<&ViewportState> {
+        self.repos
+            .get(self.active_tab)
+            .map(|repo| match self.active_view_kind() {
+                ViewKind::Unified => &repo.unified_viewport,
+                ViewKind::SideBySide => &repo.sbs_viewport,
+            })
+    }
+
+    pub fn visible_row_range(&self, total_lines: usize, viewport_height: usize) -> Range<usize> {
+        self.current_viewport()
+            .map(|viewport| viewport.visible_range(total_lines, viewport_height))
+            .unwrap_or(0..0)
+    }
+
+    pub fn warm_row_range(&self, total_lines: usize, viewport_height: usize) -> Range<usize> {
+        self.current_viewport()
+            .map(|viewport| viewport.warm_range(total_lines, viewport_height))
+            .unwrap_or(0..0)
+    }
+
+    fn ensure_layout(&mut self, idx: usize, view: ViewKind) {
+        let height = self.viewport_height();
+        let repo = match self.repos.get_mut(idx) {
+            Some(repo) => repo,
+            None => return,
+        };
+        let layout_slot = match view {
+            ViewKind::Unified => &mut repo.unified_layout,
+            ViewKind::SideBySide => &mut repo.sbs_layout,
+        };
+        if layout_slot.is_some() {
+            return;
+        }
+        if view == ViewKind::SideBySide {
+            for file in &mut repo.files {
+                file.ensure_sbs_cache();
+            }
+        }
+        *layout_slot = Some(DiffLayout::build(&repo.files, view));
+        let total = layout_slot
+            .as_ref()
+            .map(DiffLayout::total_lines)
+            .unwrap_or(0);
+        match view {
+            ViewKind::Unified => repo.unified_viewport.clamp_scroll(total, height),
+            ViewKind::SideBySide => repo.sbs_viewport.clamp_scroll(total, height),
+        }
+    }
+
+    fn invalidate_layouts(&mut self, idx: usize) {
+        if let Some(repo) = self.repos.get_mut(idx) {
+            repo.unified_layout = None;
+            repo.sbs_layout = None;
+        }
+    }
+
+    pub fn clamp_active_viewport(&mut self) {
+        let idx = self.active_tab;
+        let view = self.active_view_kind();
+        self.ensure_layout(idx, view);
+        let total = self
+            .repos
+            .get(idx)
+            .and_then(|repo| match view {
+                ViewKind::Unified => repo.unified_layout.as_ref(),
+                ViewKind::SideBySide => repo.sbs_layout.as_ref(),
+            })
+            .map(DiffLayout::total_lines)
+            .unwrap_or(0);
+        let height = self.viewport_height();
+        if let Some(repo) = self.repos.get_mut(idx) {
+            match view {
+                ViewKind::Unified => repo.unified_viewport.clamp_scroll(total, height),
+                ViewKind::SideBySide => repo.sbs_viewport.clamp_scroll(total, height),
+            }
+        }
+    }
+
+    pub fn scroll_active_viewport(&mut self, delta: isize) {
+        let idx = self.active_tab;
+        let view = self.active_view_kind();
+        self.ensure_layout(idx, view);
+        let total = self
+            .repos
+            .get(idx)
+            .and_then(|repo| match view {
+                ViewKind::Unified => repo.unified_layout.as_ref(),
+                ViewKind::SideBySide => repo.sbs_layout.as_ref(),
+            })
+            .map(DiffLayout::total_lines)
+            .unwrap_or(0);
+        let height = self.viewport_height();
+        if let Some(repo) = self.repos.get_mut(idx) {
+            match view {
+                ViewKind::Unified => repo.unified_viewport.scroll_by(delta, total, height),
+                ViewKind::SideBySide => repo.sbs_viewport.scroll_by(delta, total, height),
+            }
+        }
+        self.focused_file = self.focused_file_from_scroll();
+    }
+
+    pub fn jump_active_viewport_to(&mut self, row: usize) {
+        let idx = self.active_tab;
+        let view = self.active_view_kind();
+        self.ensure_layout(idx, view);
+        let total = self
+            .repos
+            .get(idx)
+            .and_then(|repo| match view {
+                ViewKind::Unified => repo.unified_layout.as_ref(),
+                ViewKind::SideBySide => repo.sbs_layout.as_ref(),
+            })
+            .map(DiffLayout::total_lines)
+            .unwrap_or(0);
+        let height = self.viewport_height();
+        if let Some(repo) = self.repos.get_mut(idx) {
+            match view {
+                ViewKind::Unified => repo.unified_viewport.jump_to(row, total, height),
+                ViewKind::SideBySide => repo.sbs_viewport.jump_to(row, total, height),
+            }
+        }
+        self.focused_file = self.focused_file_from_scroll();
+    }
+
+    pub fn jump_active_viewport_top(&mut self) {
+        let view = self.active_view_kind();
+        if let Some(repo) = self.repos.get_mut(self.active_tab) {
+            match view {
+                ViewKind::Unified => repo.unified_viewport.jump_to_top(),
+                ViewKind::SideBySide => repo.sbs_viewport.jump_to_top(),
+            }
+        }
+        self.focused_file = self.focused_file_from_scroll();
+    }
+
+    pub fn jump_active_viewport_bottom(&mut self) {
+        let idx = self.active_tab;
+        let view = self.active_view_kind();
+        self.ensure_layout(idx, view);
+        let total = self
+            .repos
+            .get(idx)
+            .and_then(|repo| match view {
+                ViewKind::Unified => repo.unified_layout.as_ref(),
+                ViewKind::SideBySide => repo.sbs_layout.as_ref(),
+            })
+            .map(DiffLayout::total_lines)
+            .unwrap_or(0);
+        let height = self.viewport_height();
+        if let Some(repo) = self.repos.get_mut(idx) {
+            match view {
+                ViewKind::Unified => repo.unified_viewport.jump_to_bottom(total, height),
+                ViewKind::SideBySide => repo.sbs_viewport.jump_to_bottom(total, height),
+            }
+        }
+        self.focused_file = self.focused_file_from_scroll();
+    }
+
+
     /// Returns indices of files matching the picker query (case-insensitive fuzzy substring).
     pub fn filtered_file_indices(&self) -> Vec<usize> {
         let files = match self.current_files() {
             Some(f) => f,
             None => return Vec::new(),
         };
-        let query = self.file_picker_query.to_lowercase();
+        let query = self
+            .file_picker
+            .as_ref()
+            .map(|fp| fp.query.to_lowercase())
+            .unwrap_or_default();
         if query.is_empty() {
             return (0..files.len()).collect();
         }
@@ -153,9 +376,12 @@ impl App {
     }
 
     pub fn jump_to_file(&mut self, file_idx: usize) {
-        let positions = self.file_header_positions();
-        if let Some(&pos) = positions.get(file_idx) {
-            self.scroll_offset = pos;
+        self.prepare_active_layout();
+        if let Some(pos) = self
+            .current_layout()
+            .and_then(|layout| layout.file_header_row(file_idx))
+        {
+            self.jump_active_viewport_to(pos);
             self.focused_file = Some(file_idx);
         }
     }
@@ -247,13 +473,17 @@ impl App {
 
         // Invalidate SBS cache — will be recomputed on demand before next draw
         file.sbs_cache = None;
-        if self.side_by_side {
-            file.ensure_sbs_cache();
-        }
+        self.invalidate_layouts(self.active_tab);
+        self.prepare_active_layout();
+        self.clamp_active_viewport();
     }
 
     pub fn refresh_repo_adder_results(&mut self) {
-        let input = &self.repo_adder_query;
+        let adder = match self.repo_adder.as_mut() {
+            Some(a) => a,
+            None => return,
+        };
+        let input = &adder.query;
         let (dir_part, filter) = if input.is_empty() {
             (".", "")
         } else if input.ends_with('/') {
@@ -300,10 +530,10 @@ impl App {
         }
 
         results.sort_by(|a, b| a.0.cmp(&b.0));
-        self.repo_adder_results = results;
-        self.repo_adder_cursor = 0;
-        self.repo_adder_checked.clear();
-        self.repo_adder_error = None;
+        adder.results = results;
+        adder.cursor = 0;
+        adder.checked.clear();
+        adder.error = None;
     }
 
     pub fn add_repo(&mut self, input: &str) -> Result<usize, String> {
@@ -345,9 +575,12 @@ impl App {
             files: Vec::new(),
             base_branch: None,
             branch_name: None,
+            unified_layout: None,
+            sbs_layout: None,
+            unified_viewport: ViewportState::default(),
+            sbs_viewport: ViewportState::default(),
         });
         self.active_tab = idx;
-        self.scroll_offset = 0;
         self.focused_file = None;
 
         Ok(idx)
@@ -364,6 +597,7 @@ impl App {
                 file.ensure_sbs_cache();
             }
         }
+        self.ensure_layout(self.active_tab, ViewKind::SideBySide);
     }
 
     pub fn apply_diff_result(&mut self, idx: usize, result: anyhow::Result<Vec<FileDiff>>) {
@@ -386,6 +620,26 @@ impl App {
                 }
 
                 self.repos[idx].files = new_files;
+                self.invalidate_layouts(idx);
+                self.ensure_layout(idx, ViewKind::Unified);
+                if self.side_by_side && idx == self.active_tab {
+                    self.ensure_layout(idx, ViewKind::SideBySide);
+                }
+                let height = self.viewport_height();
+                if let Some(repo) = self.repos.get_mut(idx) {
+                    let unified_total = repo
+                        .unified_layout
+                        .as_ref()
+                        .map(DiffLayout::total_lines)
+                        .unwrap_or(0);
+                    repo.unified_viewport.clamp_scroll(unified_total, height);
+                    let sbs_total = repo
+                        .sbs_layout
+                        .as_ref()
+                        .map(DiffLayout::total_lines)
+                        .unwrap_or(0);
+                    repo.sbs_viewport.clamp_scroll(sbs_total, height);
+                }
                 self.last_error = None;
             }
             Err(e) => {
@@ -427,95 +681,41 @@ impl App {
     }
 
     pub fn total_display_lines(&self) -> usize {
-        self.current_files()
-            .map(|files| files.iter().map(|f| self.file_display_lines(f) + 1).sum())
+        self.current_layout()
+            .map(DiffLayout::total_lines)
             .unwrap_or(0)
     }
 
     pub fn file_header_positions(&self) -> Vec<usize> {
         let mut positions = Vec::new();
-        let mut pos = 0;
-        if let Some(files) = self.current_files() {
-            for file in files {
-                positions.push(pos);
-                pos += self.file_display_lines(file) + 1;
+        if let Some(layout) = self.current_layout() {
+            for file_idx in 0..self.current_files().map(|files| files.len()).unwrap_or(0) {
+                if let Some(row) = layout.file_header_row(file_idx) {
+                    positions.push(row);
+                }
             }
         }
         positions
     }
 
-    /// Returns the display line count for a file, accounting for SBS mode.
-    fn file_display_lines(&self, file: &FileDiff) -> usize {
-        if self.side_by_side {
-            file.total_sbs_display_lines()
-        } else {
-            file.total_display_lines()
-        }
-    }
-
     pub fn focused_file_from_scroll(&self) -> Option<usize> {
-        let positions = self.file_header_positions();
-        let mut result = None;
-        for (i, &pos) in positions.iter().enumerate() {
-            if pos <= self.scroll_offset {
-                result = Some(i);
-            } else {
-                break;
-            }
-        }
-        result
+        self.current_layout()
+            .and_then(|layout| layout.focused_file_at_scroll(self.current_scroll_offset()))
     }
 
     pub fn is_hunk_flashing(&self, file_idx: usize, hunk_idx: usize) -> bool {
-        if let Some(until) = self.flash_until {
-            Instant::now() < until
-                && self.flash_file_idx == Some(file_idx)
-                && self.flash_hunk_idx == Some(hunk_idx)
+        if let Some(ref flash) = self.flash {
+            Instant::now() < flash.until
+                && flash.file_idx == file_idx
+                && flash.hunk_idx == hunk_idx
         } else {
             false
         }
     }
 
     pub fn file_and_hunk_at_row(&self, content_row: usize) -> Option<(usize, usize)> {
-        let positions = self.file_header_positions();
-        let files = self.current_files()?;
-
-        let mut file_idx = None;
-        for (i, &pos) in positions.iter().enumerate() {
-            if content_row >= pos {
-                file_idx = Some(i);
-            } else {
-                break;
-            }
-        }
-        let file_idx = file_idx?;
-        let file = files.get(file_idx)?;
-        if file.collapsed || file.hunks.is_empty() {
-            return None;
-        }
-
-        let file_start = positions[file_idx];
-        let row_in_file = content_row.saturating_sub(file_start + 1);
-
-        let mut line_count = 0;
-        for (i, hunk) in file.hunks.iter().enumerate() {
-            let hunk_lines = if self.side_by_side {
-                file.sbs_cache
-                    .as_ref()
-                    .and_then(|c| c.get(i))
-                    .map(|h| h.len())
-                    .unwrap_or(hunk.lines.len())
-            } else {
-                hunk.lines.len()
-            };
-            let hunk_size = 1 + hunk_lines;
-            if row_in_file < line_count + hunk_size {
-                return Some((file_idx, i));
-            }
-            line_count += hunk_size;
-        }
-
-        Some((file_idx, file.hunks.len().saturating_sub(1)))
+        self.current_layout()
+            .and_then(|layout| layout.hunk_at_row(content_row))
     }
 
     pub fn copy_hunk_at_row(&mut self, content_row: usize) -> Option<String> {
@@ -532,20 +732,11 @@ impl App {
             return None;
         }
 
-        let file_start = self.file_header_positions().get(file_idx).copied()?;
-        let relative_scroll = self.scroll_offset.saturating_sub(file_start + 1);
-        let mut line_count = 0;
-        let mut target_hunk = 0;
-
-        for (i, hunk) in file.hunks.iter().enumerate() {
-            let hunk_lines = hunk.lines.len() + 1;
-            if line_count + hunk_lines > relative_scroll {
-                target_hunk = i;
-                break;
-            }
-            line_count += hunk_lines;
-            target_hunk = i;
-        }
+        let target_hunk = self
+            .current_layout()
+            .and_then(|layout| layout.hunk_at_or_after_row(self.current_scroll_offset(), file_idx))
+            .map(|(_, hunk_idx)| hunk_idx)
+            .unwrap_or(0);
 
         self.copy_hunk(file_idx, target_hunk)
     }
@@ -580,15 +771,15 @@ impl App {
             result.push_str(&format!("{} {}\n", prefix, line.content));
         }
 
-        self.flash_until = Some(Instant::now() + FLASH_DURATION);
-        self.flash_file_idx = Some(file_idx);
-        self.flash_hunk_idx = Some(target_hunk);
+        self.flash = Some(FlashState {
+            until: Instant::now() + FLASH_DURATION,
+            file_idx,
+            hunk_idx: target_hunk,
+        });
 
         Some(result)
     }
 }
-
-// -- Event loop and terminal management --
 
 pub struct DiffResult {
     pub repo_id: u64,
@@ -600,280 +791,6 @@ pub struct BaseBranchResult {
     pub repo_id: u64,
     pub branch: Option<String>,
     pub branch_name: Option<String>,
-}
-
-enum AppEvent {
-    Terminal(Event),
-    FileChange(WatchEvent),
-    DiffDone(DiffResult),
-    BaseBranch(BaseBranchResult),
-    Tick,
-}
-
-/// Bundles the event channels used by the run loop.
-struct Channels {
-    watch_rx: mpsc::UnboundedReceiver<WatchEvent>,
-    diff_rx: mpsc::UnboundedReceiver<DiffResult>,
-    diff_tx: mpsc::UnboundedSender<DiffResult>,
-    base_rx: mpsc::UnboundedReceiver<BaseBranchResult>,
-    base_tx: mpsc::UnboundedSender<BaseBranchResult>,
-}
-
-fn restore_terminal() {
-    let _ = disable_raw_mode();
-    let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
-    let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
-}
-
-pub async fn run(path: PathBuf) -> Result<()> {
-    let repo_infos = git::discover_repos(&path)?;
-
-    let mut app = App::new(repo_infos);
-    app.refresh_all_sync();
-
-    // Set up file watcher with shared repo paths
-    let (watch_tx, watch_rx) = mpsc::unbounded_channel::<WatchEvent>();
-    let repo_paths: Vec<PathBuf> = app.repos.iter().map(|r| r.info.path.clone()).collect();
-    let shared_paths = Arc::new(RwLock::new(repo_paths));
-    let mut debouncer = watcher::start_watching(shared_paths.clone(), watch_tx)?;
-    for p in shared_paths
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .iter()
-    {
-        watcher::watch_repo(&mut debouncer, p)?;
-    }
-
-    // Panic hook to restore terminal on crash
-    let original_hook = std::panic::take_hook();
-    std::panic::set_hook(Box::new(move |info| {
-        restore_terminal();
-        original_hook(info);
-    }));
-
-    // Set up terminal
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-
-    let highlighter = Highlighter::new();
-
-    let (diff_tx, diff_rx) = mpsc::unbounded_channel::<DiffResult>();
-    let (base_tx, base_rx) = mpsc::unbounded_channel::<BaseBranchResult>();
-
-    // Resolve base branches + branch names in background at startup
-    for repo in app.repos.iter() {
-        let id = repo.id;
-        let path = repo.info.path.clone();
-        let tx = base_tx.clone();
-        std::thread::spawn(move || {
-            let branch = git::find_base_branch(&path);
-            let branch_name = git::current_branch(&path);
-            let _ = tx.send(BaseBranchResult {
-                repo_id: id,
-                branch,
-                branch_name,
-            });
-        });
-    }
-
-    let mut channels = Channels {
-        watch_rx,
-        diff_rx,
-        diff_tx,
-        base_rx,
-        base_tx,
-    };
-
-    let result = run_loop(
-        &mut terminal,
-        &mut app,
-        &mut channels,
-        &highlighter,
-        &mut debouncer,
-        &shared_paths,
-    )
-    .await;
-
-    restore_terminal();
-
-    result
-}
-
-async fn run_loop(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-    ch: &mut Channels,
-    highlighter: &Highlighter,
-    debouncer: &mut notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>,
-    shared_paths: &Arc<RwLock<Vec<PathBuf>>>,
-) -> Result<()> {
-    let (term_tx, mut term_rx) = mpsc::unbounded_channel::<Event>();
-    std::thread::spawn(move || {
-        loop {
-            match event::read() {
-                Ok(ev) => {
-                    if term_tx.send(ev).is_err() {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
-
-    let mut needs_redraw = true;
-
-    loop {
-        if needs_redraw {
-            app.ensure_sbs_caches();
-            let mut hints = LayoutHints::default();
-            terminal.draw(|f| ui::draw(f, app, highlighter, &mut hints))?;
-            app.layout = hints;
-            needs_redraw = false;
-        }
-
-        let tick_dur = if app.flash_until.is_some() {
-            FLASH_TICK
-        } else {
-            IDLE_TICK
-        };
-        let tick_sleep = tokio::time::sleep(tick_dur);
-        tokio::pin!(tick_sleep);
-
-        let event = tokio::select! {
-            Some(ev) = term_rx.recv() => AppEvent::Terminal(ev),
-            Some(ev) = ch.watch_rx.recv() => AppEvent::FileChange(ev),
-            Some(ev) = ch.diff_rx.recv() => AppEvent::DiffDone(ev),
-            Some(ev) = ch.base_rx.recv() => AppEvent::BaseBranch(ev),
-            () = &mut tick_sleep => AppEvent::Tick,
-        };
-
-        match event {
-            AppEvent::Terminal(Event::Key(key)) => {
-                if key.kind != KeyEventKind::Press {
-                    continue;
-                }
-                if app.show_file_picker {
-                    keys::handle_file_picker_key(app, key);
-                    needs_redraw = true;
-                    continue;
-                }
-                if app.show_repo_adder {
-                    let added = keys::handle_repo_adder_key(app, key);
-                    for new_idx in added {
-                        let repo = &app.repos[new_idx];
-                        let id = repo.id;
-                        let path = repo.info.path.clone();
-                        shared_paths
-                            .write()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .push(path.clone());
-                        let _ = watcher::watch_repo(debouncer, &path);
-                        app.refresh_repo_async(new_idx, &ch.diff_tx);
-                        let btx = ch.base_tx.clone();
-                        std::thread::spawn(move || {
-                            let branch = git::find_base_branch(&path);
-                            let branch_name = git::current_branch(&path);
-                            let _ = btx.send(BaseBranchResult {
-                                repo_id: id,
-                                branch,
-                                branch_name,
-                            });
-                        });
-                    }
-                    needs_redraw = true;
-                    continue;
-                }
-                // Remove current tab
-                if key.code == KeyCode::Char('x') && app.repos.len() > 1 {
-                    let idx = app.active_tab;
-                    let path = app.repos[idx].info.path.clone();
-
-                    app.repos.remove(idx);
-
-                    if app.active_tab >= app.repos.len() {
-                        app.active_tab = app.repos.len() - 1;
-                    }
-                    app.scroll_offset = 0;
-                    app.focused_file = None;
-
-                    let _ = debouncer.watcher().unwatch(&path);
-                    if let Ok(mut paths) = shared_paths.write() {
-                        paths.retain(|p| *p != path);
-                    }
-
-                    needs_redraw = true;
-                    continue;
-                }
-                if keys::handle_key(app, key, &ch.diff_tx) {
-                    return Ok(());
-                }
-                needs_redraw = true;
-            }
-            AppEvent::Terminal(Event::Mouse(m)) => {
-                if mouse::handle_mouse(app, m, &ch.diff_tx) {
-                    needs_redraw = true;
-                }
-            }
-            AppEvent::Terminal(Event::Resize(_, _)) => {
-                needs_redraw = true;
-            }
-            AppEvent::Terminal(_) => {}
-            AppEvent::FileChange(event) => {
-                if let Some(idx) = app
-                    .repos
-                    .iter()
-                    .position(|r| r.info.path == event.repo_path)
-                {
-                    app.refresh_repo_async(idx, &ch.diff_tx);
-                    let id = app.repos[idx].id;
-                    let path = event.repo_path;
-                    let btx = ch.base_tx.clone();
-                    std::thread::spawn(move || {
-                        let branch_name = git::current_branch(&path);
-                        let base = git::find_base_branch(&path);
-                        let _ = btx.send(BaseBranchResult {
-                            repo_id: id,
-                            branch: base,
-                            branch_name,
-                        });
-                    });
-                }
-            }
-            AppEvent::DiffDone(result) => {
-                if let Some(idx) = app.find_repo(result.repo_id)
-                    && result.mode == app.repos[idx].mode
-                {
-                    app.apply_diff_result(idx, result.result);
-                    needs_redraw = true;
-                }
-            }
-            AppEvent::BaseBranch(result) => {
-                if let Some(idx) = app.find_repo(result.repo_id) {
-                    let base_changed = app.repos[idx].base_branch != result.branch;
-                    app.repos[idx].base_branch = result.branch;
-                    app.repos[idx].branch_name = result.branch_name;
-                    needs_redraw = true;
-                    if base_changed && app.repos[idx].mode == DiffMode::Branch {
-                        app.refresh_repo_async(idx, &ch.diff_tx);
-                    }
-                }
-            }
-            AppEvent::Tick => {
-                if let Some(until) = app.flash_until
-                    && Instant::now() >= until
-                {
-                    app.flash_until = None;
-                    app.flash_file_idx = None;
-                    app.flash_hunk_idx = None;
-                    needs_redraw = true;
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -905,24 +822,31 @@ mod tests {
         app
     }
 
+    fn set_picker_query(app: &mut App, query: &str) {
+        app.file_picker = Some(super::FilePickerState {
+            query: query.to_string(),
+            selected: 0,
+        });
+    }
+
     #[test]
     fn fuzzy_match_exact_match() {
         let mut app = test_app_with_files(&["src/main.rs"]);
-        app.file_picker_query = "src/main.rs".to_string();
+        set_picker_query(&mut app, "src/main.rs");
         assert_eq!(app.filtered_file_indices(), vec![0]);
     }
 
     #[test]
     fn fuzzy_match_subsequence() {
         let mut app = test_app_with_files(&["src/main.rs"]);
-        app.file_picker_query = "smr".to_string();
+        set_picker_query(&mut app, "smr");
         assert_eq!(app.filtered_file_indices(), vec![0]);
     }
 
     #[test]
     fn fuzzy_match_no_match() {
         let mut app = test_app_with_files(&["src/main.rs"]);
-        app.file_picker_query = "xyz".to_string();
+        set_picker_query(&mut app, "xyz");
         assert!(app.filtered_file_indices().is_empty());
     }
 
@@ -935,14 +859,14 @@ mod tests {
     #[test]
     fn fuzzy_match_case_insensitive() {
         let mut app = test_app_with_files(&["src/Main.RS"]);
-        app.file_picker_query = "main".to_string();
+        set_picker_query(&mut app, "main");
         assert_eq!(app.filtered_file_indices(), vec![0]);
     }
 
     #[test]
     fn fuzzy_match_query_longer_than_path() {
         let mut app = test_app_with_files(&["ab"]);
-        app.file_picker_query = "abc".to_string();
+        set_picker_query(&mut app, "abc");
         assert!(app.filtered_file_indices().is_empty());
     }
 }

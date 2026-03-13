@@ -1,4 +1,4 @@
-use super::{App, DiffResult, PAGE_SCROLL};
+use super::{App, DiffResult, FilePickerState, RepoAdderState, PAGE_SCROLL};
 use crate::git::DiffMode;
 use arboard::Clipboard;
 use crossterm::event::{self, KeyCode, KeyModifiers};
@@ -34,103 +34,86 @@ pub fn handle_key(
             } else {
                 app.active_tab = (app.active_tab + 1) % app.repos.len();
             }
-            app.scroll_offset = 0;
+            app.jump_active_viewport_top();
             app.focused_file = None;
         }
         KeyCode::Char(c) if ('1'..='9').contains(&c) => {
             let idx = (c as usize) - ('1' as usize);
             if idx < app.repos.len() {
                 app.active_tab = idx;
-                app.scroll_offset = 0;
+                app.jump_active_viewport_top();
                 app.focused_file = None;
             }
         }
 
         // Mode switching
         KeyCode::Char('m') => {
-            app.repos[app.active_tab].mode = DiffMode::Unstaged;
-            app.refresh_repo_async(app.active_tab, diff_tx);
-            app.scroll_offset = 0;
+            app.set_mode(DiffMode::Unstaged, diff_tx);
         }
         KeyCode::Char('s') => {
-            app.repos[app.active_tab].mode = DiffMode::Staged;
-            app.refresh_repo_async(app.active_tab, diff_tx);
-            app.scroll_offset = 0;
+            app.set_mode(DiffMode::Staged, diff_tx);
         }
         KeyCode::Char('b') => {
-            app.repos[app.active_tab].mode = DiffMode::Branch;
-            app.refresh_repo_async(app.active_tab, diff_tx);
-            app.scroll_offset = 0;
+            app.set_mode(DiffMode::Branch, diff_tx);
         }
 
         // View toggle
         KeyCode::Char('v') => {
             app.side_by_side = !app.side_by_side;
+            app.prepare_active_layout();
+            app.clamp_active_viewport();
         }
 
         // Scrolling
         KeyCode::Char('j') | KeyCode::Down => {
-            app.scroll_offset = app.scroll_offset.saturating_add(1);
-            app.focused_file = app.focused_file_from_scroll();
+            app.scroll_active_viewport(1);
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(1);
-            app.focused_file = app.focused_file_from_scroll();
+            app.scroll_active_viewport(-1);
         }
         KeyCode::Char('J') => {
-            let positions = app.file_header_positions();
-            if let Some(next) = positions.iter().find(|&&p| p > app.scroll_offset) {
-                app.scroll_offset = *next;
-                app.focused_file = app.focused_file_from_scroll();
+            app.prepare_active_layout();
+            if let Some(next) = app
+                .current_layout()
+                .and_then(|layout| layout.next_file_header_row(app.current_scroll_offset()))
+            {
+                app.jump_active_viewport_to(next);
             }
         }
         KeyCode::Char('K') => {
-            let positions = app.file_header_positions();
-            if let Some(prev) = positions.iter().rev().find(|&&p| p < app.scroll_offset) {
-                app.scroll_offset = *prev;
-                app.focused_file = app.focused_file_from_scroll();
+            app.prepare_active_layout();
+            if let Some(prev) = app
+                .current_layout()
+                .and_then(|layout| layout.prev_file_header_row(app.current_scroll_offset()))
+            {
+                app.jump_active_viewport_to(prev);
             }
         }
         KeyCode::Char('g') => {
-            app.scroll_offset = 0;
+            app.jump_active_viewport_top();
             app.focused_file = Some(0);
         }
         KeyCode::Char('G') => {
-            let total = app.total_display_lines();
-            app.scroll_offset = total.saturating_sub(1);
-            app.focused_file = app.focused_file_from_scroll();
+            app.jump_active_viewport_bottom();
         }
         KeyCode::PageDown => {
-            app.scroll_offset = app.scroll_offset.saturating_add(PAGE_SCROLL);
-            app.focused_file = app.focused_file_from_scroll();
+            app.scroll_active_viewport(PAGE_SCROLL as isize);
         }
         KeyCode::PageUp => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(PAGE_SCROLL);
-            app.focused_file = app.focused_file_from_scroll();
+            app.scroll_active_viewport(-(PAGE_SCROLL as isize));
         }
 
         // Collapse
         KeyCode::Enter => {
-            if let Some(idx) = app.focused_file
-                && let Some(files) = app.current_files_mut()
-                && let Some(file) = files.get_mut(idx)
-            {
-                file.collapsed = !file.collapsed;
+            if let Some(idx) = app.focused_file {
+                app.toggle_collapsed(idx);
             }
         }
         KeyCode::Char('c') => {
-            if let Some(files) = app.current_files_mut() {
-                for file in files.iter_mut() {
-                    file.collapsed = true;
-                }
-            }
+            app.set_all_collapsed(true);
         }
         KeyCode::Char('e') => {
-            if let Some(files) = app.current_files_mut() {
-                for file in files.iter_mut() {
-                    file.collapsed = false;
-                }
-            }
+            app.set_all_collapsed(false);
         }
 
         // Copy
@@ -144,17 +127,21 @@ pub fn handle_key(
 
         // File picker
         KeyCode::Char('f') => {
-            app.show_file_picker = true;
-            app.file_picker_query.clear();
-            app.file_picker_selected = 0;
+            app.file_picker = Some(FilePickerState {
+                query: String::new(),
+                selected: 0,
+            });
         }
 
         // Add repo
         KeyCode::Char('a') => {
-            app.show_repo_adder = true;
-            app.repo_adder_query.clear();
-            app.repo_adder_error = None;
-            app.repo_adder_checked.clear();
+            app.repo_adder = Some(RepoAdderState {
+                query: String::new(),
+                error: None,
+                results: Vec::new(),
+                cursor: 0,
+                checked: std::collections::HashSet::new(),
+            });
             app.refresh_repo_adder_results();
         }
 
@@ -164,36 +151,53 @@ pub fn handle_key(
 }
 
 pub fn handle_file_picker_key(app: &mut App, key: event::KeyEvent) {
+    if app.file_picker.is_none() {
+        return;
+    }
     match key.code {
         KeyCode::Esc => {
-            app.show_file_picker = false;
+            app.file_picker = None;
         }
         KeyCode::Enter => {
+            let selected = app.file_picker.as_ref().unwrap().selected;
             let filtered = app.filtered_file_indices();
-            if let Some(&file_idx) = filtered.get(app.file_picker_selected) {
-                app.jump_to_file(file_idx);
-                if let Some(files) = app.current_files_mut()
-                    && let Some(file) = files.get_mut(file_idx)
+            if let Some(&file_idx) = filtered.get(selected) {
+                app.file_picker = None;
+                // Ensure the file is uncollapsed before jumping
+                if app
+                    .current_files()
+                    .and_then(|f| f.get(file_idx))
+                    .is_some_and(|f| f.collapsed)
                 {
-                    file.collapsed = false;
+                    app.toggle_collapsed(file_idx);
                 }
+                app.jump_to_file(file_idx);
+            } else {
+                app.file_picker = None;
             }
-            app.show_file_picker = false;
         }
         KeyCode::Up => {
-            app.file_picker_selected = app.file_picker_selected.saturating_sub(1);
+            if let Some(ref mut picker) = app.file_picker {
+                picker.selected = picker.selected.saturating_sub(1);
+            }
         }
         KeyCode::Down => {
             let max = app.filtered_file_indices().len().saturating_sub(1);
-            app.file_picker_selected = (app.file_picker_selected + 1).min(max);
+            if let Some(ref mut picker) = app.file_picker {
+                picker.selected = (picker.selected + 1).min(max);
+            }
         }
         KeyCode::Backspace => {
-            app.file_picker_query.pop();
-            app.file_picker_selected = 0;
+            if let Some(ref mut picker) = app.file_picker {
+                picker.query.pop();
+                picker.selected = 0;
+            }
         }
         KeyCode::Char(c) => {
-            app.file_picker_query.push(c);
-            app.file_picker_selected = 0;
+            if let Some(ref mut picker) = app.file_picker {
+                picker.query.push(c);
+                picker.selected = 0;
+            }
         }
         _ => {}
     }
@@ -201,40 +205,50 @@ pub fn handle_file_picker_key(app: &mut App, key: event::KeyEvent) {
 
 /// Returns indices of newly added repos (empty if none).
 pub fn handle_repo_adder_key(app: &mut App, key: event::KeyEvent) -> Vec<usize> {
+    if app.repo_adder.is_none() {
+        return Vec::new();
+    }
     match key.code {
         KeyCode::Esc => {
-            app.show_repo_adder = false;
+            app.repo_adder = None;
         }
         KeyCode::Up => {
-            app.repo_adder_cursor = app.repo_adder_cursor.saturating_sub(1);
+            if let Some(ref mut adder) = app.repo_adder {
+                adder.cursor = adder.cursor.saturating_sub(1);
+            }
         }
         KeyCode::Down => {
-            let max = app.repo_adder_results.len().saturating_sub(1);
-            app.repo_adder_cursor = (app.repo_adder_cursor + 1).min(max);
+            if let Some(ref mut adder) = app.repo_adder {
+                let max = adder.results.len().saturating_sub(1);
+                adder.cursor = (adder.cursor + 1).min(max);
+            }
         }
         KeyCode::Char(' ') => {
-            let idx = app.repo_adder_cursor;
-            if idx < app.repo_adder_results.len() {
-                if app.repo_adder_checked.contains(&idx) {
-                    app.repo_adder_checked.remove(&idx);
-                } else {
-                    app.repo_adder_checked.insert(idx);
+            if let Some(ref mut adder) = app.repo_adder {
+                let idx = adder.cursor;
+                if idx < adder.results.len() {
+                    if adder.checked.contains(&idx) {
+                        adder.checked.remove(&idx);
+                    } else {
+                        adder.checked.insert(idx);
+                    }
                 }
             }
         }
         KeyCode::Enter => {
-            let to_add: Vec<PathBuf> = if app.repo_adder_checked.is_empty() {
-                if let Some((_, path)) = app.repo_adder_results.get(app.repo_adder_cursor) {
+            let adder = app.repo_adder.as_ref().unwrap();
+            let to_add: Vec<PathBuf> = if adder.checked.is_empty() {
+                if let Some((_, path)) = adder.results.get(adder.cursor) {
                     vec![path.clone()]
                 } else {
                     return Vec::new();
                 }
             } else {
-                let mut indices: Vec<usize> = app.repo_adder_checked.iter().copied().collect();
+                let mut indices: Vec<usize> = adder.checked.iter().copied().collect();
                 indices.sort();
                 indices
                     .iter()
-                    .filter_map(|&i| app.repo_adder_results.get(i).map(|(_, p)| p.clone()))
+                    .filter_map(|&i| adder.results.get(i).map(|(_, p)| p.clone()))
                     .collect()
             };
 
@@ -244,21 +258,27 @@ pub fn handle_repo_adder_key(app: &mut App, key: event::KeyEvent) -> Vec<usize> 
                 match app.add_repo(&path_str) {
                     Ok(idx) => added.push(idx),
                     Err(e) => {
-                        app.repo_adder_error = Some(e);
+                        if let Some(ref mut adder) = app.repo_adder {
+                            adder.error = Some(e);
+                        }
                     }
                 }
             }
             if !added.is_empty() {
-                app.show_repo_adder = false;
+                app.repo_adder = None;
             }
             return added;
         }
         KeyCode::Backspace => {
-            app.repo_adder_query.pop();
+            if let Some(ref mut adder) = app.repo_adder {
+                adder.query.pop();
+            }
             app.refresh_repo_adder_results();
         }
         KeyCode::Char(c) => {
-            app.repo_adder_query.push(c);
+            if let Some(ref mut adder) = app.repo_adder {
+                adder.query.push(c);
+            }
             app.refresh_repo_adder_results();
         }
         _ => {}

@@ -1,5 +1,5 @@
 use anyhow::Result;
-use changes::app;
+use changes::runtime;
 use clap::Parser;
 use std::path::PathBuf;
 
@@ -15,5 +15,5 @@ struct Cli {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = cli.path.canonicalize()?;
-    app::run(path).await
+    runtime::run(path).await
 }
