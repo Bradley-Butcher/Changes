@@ -7,6 +7,7 @@ A fast, live-updating terminal UI for visualizing git diffs. Watches your repo f
 - **Live reload** — file watcher triggers instant diff refresh on save
 - **Three diff modes** — unstaged (modified), staged, and branch diff (vs base branch)
 - **Unified and side-by-side views** — toggle with `v`
+- **Word-level inline diff** — highlights exactly which words changed within modified lines
 - **Syntax highlighting** — language-aware coloring via syntect
 - **Multi-repo support** — watch multiple repos in tabs, add/remove dynamically
 - **Hunk expansion** — click gap indicators to reveal surrounding context
@@ -17,13 +18,37 @@ A fast, live-updating terminal UI for visualizing git diffs. Watches your repo f
 
 ## Install
 
+### Homebrew (macOS)
+
+```sh
+brew install Bradley-Butcher/tap/changes
+```
+
+### Pre-built binaries
+
+Download from [GitHub Releases](https://github.com/Bradley-Butcher/Changes/releases):
+
+```sh
+# macOS (Apple Silicon)
+curl -sSL https://github.com/Bradley-Butcher/Changes/releases/latest/download/changes-aarch64-apple-darwin.tar.gz | tar xz
+sudo mv changes /usr/local/bin/
+
+# macOS (Intel)
+curl -sSL https://github.com/Bradley-Butcher/Changes/releases/latest/download/changes-x86_64-apple-darwin.tar.gz | tar xz
+sudo mv changes /usr/local/bin/
+
+# Linux (x86_64)
+curl -sSL https://github.com/Bradley-Butcher/Changes/releases/latest/download/changes-x86_64-unknown-linux-gnu.tar.gz | tar xz
+sudo mv changes /usr/local/bin/
+```
+
 ### From source
 
 ```sh
 cargo install --path .
 ```
 
-### Usage
+## Usage
 
 ```sh
 # Watch the current directory
