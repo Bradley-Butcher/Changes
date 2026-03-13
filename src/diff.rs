@@ -55,7 +55,6 @@ pub enum FileStatus {
 #[derive(Debug, Clone)]
 pub struct FileDiff {
     pub path: String,
-    #[allow(dead_code)]
     pub old_path: Option<String>,
     pub status: FileStatus,
     pub hunks: Vec<Hunk>,

@@ -385,7 +385,7 @@ impl App {
         }
     }
 
-    pub fn apply_diff_result(&mut self, idx: usize, result: Result<Vec<FileDiff>, String>) {
+    pub fn apply_diff_result(&mut self, idx: usize, result: anyhow::Result<Vec<FileDiff>>) {
         match result {
             Ok(files) => {
                 let old_collapsed: std::collections::HashMap<String, bool> = self.repos[idx]
@@ -421,7 +421,7 @@ impl App {
         let base = repo.base_branch.clone();
         let tx = diff_tx.clone();
         std::thread::spawn(move || {
-            let result = git::compute_diff(&path, mode, base.as_deref()).map_err(|e| e.to_string());
+            let result = git::compute_diff(&path, mode, base.as_deref());
             let _ = tx.send(DiffResult {
                 repo_id: id,
                 mode,
@@ -435,7 +435,7 @@ impl App {
         let mode = repo.mode;
         let base = repo.base_branch.clone();
         let path = repo.info.path.clone();
-        let result = git::compute_diff(&path, mode, base.as_deref()).map_err(|e| e.to_string());
+        let result = git::compute_diff(&path, mode, base.as_deref());
         self.apply_diff_result(idx, result);
     }
 
@@ -594,7 +594,7 @@ impl App {
 pub struct DiffResult {
     pub repo_id: u64,
     pub mode: DiffMode,
-    pub result: Result<Vec<FileDiff>, String>,
+    pub result: anyhow::Result<Vec<FileDiff>>,
 }
 
 pub struct BaseBranchResult {

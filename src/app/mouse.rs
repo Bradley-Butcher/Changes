@@ -37,8 +37,10 @@ pub fn handle_mouse(
             };
             app.last_click = Some((click_row, click_col, now));
 
-            if is_double_click && click_row >= 4 {
-                let content_row = (click_row as usize).saturating_sub(4) + app.scroll_offset;
+            if is_double_click && click_row >= app.layout.content_y {
+                let content_row = (click_row as usize)
+                    .saturating_sub(app.layout.content_y as usize)
+                    + app.scroll_offset;
                 if let Some(text) = app.copy_hunk_at_row(content_row)
                     && let Ok(mut clipboard) = Clipboard::new()
                 {
@@ -80,7 +82,8 @@ pub fn handle_mouse(
             }
 
             // Content area click
-            let content_row = (click_row as usize).saturating_sub(4) + app.scroll_offset;
+            let content_row = (click_row as usize).saturating_sub(app.layout.content_y as usize)
+                + app.scroll_offset;
 
             // Check for expand row click (gap between hunks)
             if let Some((file_idx, gap_idx)) = find_expand_gap(app, content_row) {

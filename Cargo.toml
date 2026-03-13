@@ -2,6 +2,11 @@
 name = "changes"
 version = "0.1.0"
 edition = "2024"
+description = "A live-updating terminal UI for visualizing git diffs"
+license = "MIT"
+repository = "https://github.com/bradjasper/changes"
+keywords = ["git", "diff", "tui", "terminal"]
+categories = ["command-line-utilities", "development-tools"]
 
 [dependencies]
 ratatui = { version = "0.30", features = ["crossterm", "underline-color"] }

@@ -33,6 +33,7 @@ pub struct LayoutHints {
     pub mode_badge_pos: (u16, u16),
     pub view_badge_pos: (u16, u16),
     pub status_bar_row: u16,
+    pub content_y: u16,
 }
 
 pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut LayoutHints) {
@@ -44,6 +45,10 @@ pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut
             Constraint::Length(1), // status bar
         ])
         .split(frame.area());
+
+    // Compute content area top for mouse hit-testing
+    let diff_inner = Block::default().borders(Borders::ALL).inner(chunks[1]);
+    hints.content_y = diff_inner.y;
 
     draw_tab_bar(frame, app, hints, chunks[0]);
     draw_diff_area(frame, app, highlighter, chunks[1]);
@@ -571,6 +576,15 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
         None => ("", file.path.as_str()),
     };
 
+    // For renames where old_path differs, show "old_path → new_path"
+    let is_rename = file.status == FileStatus::Renamed
+        && file.old_path.as_deref().is_some_and(|old| old != file.path);
+    let old_path_str = if is_rename {
+        file.old_path.as_deref().unwrap_or("")
+    } else {
+        ""
+    };
+
     let adds = format!("+{}", file.additions);
     let dels = format!("-{}", file.deletions);
 
@@ -599,30 +613,64 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
         Span::styled("  ", Style::default().bg(bg)),
     ];
 
-    if !dir.is_empty() {
+    // Track path display width for padding calculation
+    let path_display_len = if is_rename {
+        // Show: old_path → dir/filename
+        let arrow = " → ";
         spans.push(Span::styled(
-            dir.to_string(),
+            old_path_str.to_string(),
             Style::default()
                 .fg(FG_PATH_DIR)
                 .bg(bg)
                 .add_modifier(underline),
         ));
-    }
-    spans.push(Span::styled(
-        filename.to_string(),
-        Style::default()
-            .fg(FG_PATH_FILE)
-            .bg(bg)
-            .add_modifier(Modifier::BOLD | underline),
-    ));
+        spans.push(Span::styled(
+            arrow.to_string(),
+            Style::default().fg(FG_MUTED).bg(bg),
+        ));
+        if !dir.is_empty() {
+            spans.push(Span::styled(
+                dir.to_string(),
+                Style::default()
+                    .fg(FG_PATH_DIR)
+                    .bg(bg)
+                    .add_modifier(underline),
+            ));
+        }
+        spans.push(Span::styled(
+            filename.to_string(),
+            Style::default()
+                .fg(FG_PATH_FILE)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD | underline),
+        ));
+        old_path_str.len() + arrow.len() + dir.len() + filename.len()
+    } else {
+        if !dir.is_empty() {
+            spans.push(Span::styled(
+                dir.to_string(),
+                Style::default()
+                    .fg(FG_PATH_DIR)
+                    .bg(bg)
+                    .add_modifier(underline),
+            ));
+        }
+        spans.push(Span::styled(
+            filename.to_string(),
+            Style::default()
+                .fg(FG_PATH_FILE)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD | underline),
+        ));
+        dir.len() + filename.len()
+    };
     spans.push(Span::styled("  ", Style::default().bg(bg)));
     let used = 1
         + collapse.len()
         + 1
         + status_char.len()
         + 2
-        + dir.len()
-        + filename.len()
+        + path_display_len
         + 2
         + adds.len()
         + 2
