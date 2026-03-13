@@ -2,9 +2,13 @@
 
 See what your AI agent is actually doing to your code — in real time.
 
+![changes showing a live diff alongside an AI agent](assets/screenshot-diff.png)
+
 `changes` is a terminal UI for reviewing git diffs live. It watches your repos and refreshes instantly as files change. No IDE required, no re-running commands. Just run `changes` and watch.
 
 Built for the workflow where your agent writes code and you audit it. Think of it as a better `lazygit` where the focus is purely on *what changed* — not staging, committing, or pushing. You do that through your agent. This is your review pane.
+
+![changes empty state with multi-repo tabs](assets/screenshot-empty.png)
 
 ## Why
 
