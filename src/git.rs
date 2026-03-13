@@ -20,10 +20,10 @@ impl DiffMode {
         match self {
             DiffMode::Unstaged => Cow::Borrowed("Modified"),
             DiffMode::Staged => Cow::Borrowed("Staged"),
-            DiffMode::Branch => {
-                let base = base_branch.unwrap_or("main");
-                Cow::Owned(format!("vs {}", base))
-            }
+            DiffMode::Branch => match base_branch {
+                Some(base) => Cow::Owned(format!("vs {}", base)),
+                None => Cow::Borrowed("Branch"),
+            },
         }
     }
 
@@ -106,9 +106,9 @@ pub fn compute_diff(
             repo.diff_tree_to_index(head.as_ref(), None, Some(&mut diff_opts))?
         }
         DiffMode::Branch => {
-            let branch = base_branch
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| find_base_branch(repo_path));
+            let Some(branch) = resolve_base_branch(&repo, repo_path, base_branch) else {
+                return Ok(Vec::new());
+            };
             compute_branch_diff(&repo, &branch, &mut diff_opts)?
         }
     };
@@ -272,21 +272,22 @@ pub fn compute_diff(
         }
     }
 
-    // Compute total_new_lines for expand indicators
+    // Compute total_new_lines for expand indicators (line count only, no full read)
     for file in &mut files {
         if file.status == FileStatus::Deleted {
             continue;
         }
         let path = repo_path.join(&file.path);
-        if let Ok(content) = std::fs::read_to_string(&path) {
-            file.total_new_lines = content.lines().count();
+        if let Ok(f) = std::fs::File::open(&path) {
+            use std::io::BufRead;
+            file.total_new_lines = std::io::BufReader::new(f).lines().count();
         }
     }
 
     Ok(files)
 }
 
-pub fn find_base_branch(repo_path: &Path) -> String {
+pub fn find_base_branch(repo_path: &Path) -> Option<String> {
     // Try Graphite first (with timeout so it can't hang the UI)
     if let Ok(mut child) = Command::new("gt")
         .arg("parent")
@@ -308,7 +309,7 @@ pub fn find_base_branch(repo_path: &Path) -> String {
                         if std::io::Read::read_to_string(&mut stdout, &mut buf).is_ok() {
                             let parent = buf.trim().to_string();
                             if !parent.is_empty() {
-                                return parent;
+                                return Some(parent);
                             }
                         }
                     }
@@ -326,19 +327,54 @@ pub fn find_base_branch(repo_path: &Path) -> String {
         }
     }
 
-    // Fall back to main, then master
     let repo = match Repository::open(repo_path) {
         Ok(r) => r,
-        Err(_) => return "main".to_string(),
+        Err(_) => return None,
     };
 
-    if repo.find_branch("main", git2::BranchType::Local).is_ok() {
-        "main".to_string()
-    } else if repo.find_branch("master", git2::BranchType::Local).is_ok() {
-        "master".to_string()
-    } else {
-        "main".to_string()
+    if let Some(branch) = remote_default_branch(&repo) {
+        return Some(branch);
     }
+
+    find_common_base_branch(&repo)
+}
+
+fn resolve_base_branch(
+    repo: &Repository,
+    repo_path: &Path,
+    preferred: Option<&str>,
+) -> Option<String> {
+    if let Some(branch) = preferred
+        && branch_exists(repo, branch)
+    {
+        return Some(branch.to_string());
+    }
+
+    find_base_branch(repo_path)
+}
+
+fn remote_default_branch(repo: &Repository) -> Option<String> {
+    let reference = repo.find_reference("refs/remotes/origin/HEAD").ok()?;
+    let target = reference.symbolic_target()?;
+    target
+        .strip_prefix("refs/remotes/origin/")
+        .map(std::string::ToString::to_string)
+}
+
+fn find_common_base_branch(repo: &Repository) -> Option<String> {
+    const COMMON_BASE_BRANCHES: &[&str] = &["main", "master", "develop", "trunk", "dev"];
+
+    COMMON_BASE_BRANCHES
+        .iter()
+        .find(|branch| branch_exists(repo, branch))
+        .map(|branch| (*branch).to_string())
+}
+
+fn branch_exists(repo: &Repository, branch: &str) -> bool {
+    repo.find_branch(branch, git2::BranchType::Local).is_ok()
+        || repo
+            .find_branch(&format!("origin/{}", branch), git2::BranchType::Remote)
+            .is_ok()
 }
 
 fn compute_branch_diff<'a>(
@@ -370,10 +406,16 @@ fn compute_branch_diff<'a>(
             }
         }
     } else {
-        let base_ref = repo
-            .find_branch(base_branch, git2::BranchType::Local)
-            .with_context(|| format!("Branch '{}' not found", base_branch))?;
-        base_ref.get().peel_to_commit()?
+        match repo.find_branch(base_branch, git2::BranchType::Local) {
+            Ok(base_ref) => base_ref.get().peel_to_commit()?,
+            Err(_) => {
+                let remote_name = format!("origin/{}", base_branch);
+                let remote_ref = repo
+                    .find_branch(&remote_name, git2::BranchType::Remote)
+                    .with_context(|| format!("Branch '{}' not found", base_branch))?;
+                remote_ref.get().peel_to_commit()?
+            }
+        }
     };
 
     let merge_base = repo.merge_base(base_commit.id(), head.id())?;

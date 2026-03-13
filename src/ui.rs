@@ -787,6 +787,11 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
             format!(" │ {}", err),
             Style::default().fg(Color::Red),
         ));
+    } else if app.current_mode() == crate::git::DiffMode::Branch && base.is_none() {
+        spans.push(Span::styled(
+            " │ base branch not detected",
+            Style::default().fg(Color::Yellow),
+        ));
     }
 
     // Mode and view as highlighted badges — track positions for click handling

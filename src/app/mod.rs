@@ -174,94 +174,75 @@ impl App {
             return;
         }
 
-        let file_path = repo_path.join(&file.path);
-        let content = match std::fs::read_to_string(&file_path) {
-            Ok(c) => c,
-            Err(_) => return,
-        };
-        let file_lines: Vec<&str> = content.lines().collect();
-
         const EXPAND_AMOUNT: usize = 20;
 
-        if gap_idx == 0 {
+        // Compute the line range we need (1-based) without reading the file yet
+        let (gap_start, gap_end, old_offset) = if gap_idx == 0 {
             let first_new = file.hunks[0].first_new_lineno().unwrap_or(1) as usize;
             let first_old = file.hunks[0].first_old_lineno().unwrap_or(1) as usize;
             if first_new <= 1 {
                 return;
             }
-            let old_offset = first_old as i64 - first_new as i64;
-            let gap_end = first_new - 1;
-            let gap_start = gap_end.saturating_sub(EXPAND_AMOUNT - 1).max(1);
-
-            let mut new_lines = Vec::new();
-            for i in gap_start..=gap_end {
-                let line_content = file_lines
-                    .get(i - 1)
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                new_lines.push(DiffLine {
-                    kind: LineKind::Context,
-                    content: line_content,
-                    old_lineno: Some((i as i64 + old_offset) as u32),
-                    new_lineno: Some(i as u32),
-                });
-            }
-            let mut existing = std::mem::take(&mut file.hunks[0].lines);
-            new_lines.append(&mut existing);
-            file.hunks[0].lines = new_lines;
+            let end = first_new - 1;
+            let start = end.saturating_sub(EXPAND_AMOUNT - 1).max(1);
+            (start, end, first_old as i64 - first_new as i64)
         } else if gap_idx < file.hunks.len() {
             let prev_idx = gap_idx - 1;
             let prev_last_new = file.hunks[prev_idx].last_new_lineno().unwrap_or(0) as usize;
             let prev_last_old = file.hunks[prev_idx].last_old_lineno().unwrap_or(0) as usize;
             let next_first_new = file.hunks[gap_idx].first_new_lineno().unwrap_or(0) as usize;
-
             if prev_last_new >= next_first_new.saturating_sub(1) {
                 return;
             }
-
-            let gap_start = prev_last_new + 1;
-            let gap_end = (next_first_new - 1).min(gap_start + EXPAND_AMOUNT - 1);
-            let old_offset = prev_last_old as i64 - prev_last_new as i64;
-
-            let prev_hunk = &mut file.hunks[prev_idx];
-            for i in gap_start..=gap_end {
-                let line_content = file_lines
-                    .get(i - 1)
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                prev_hunk.lines.push(DiffLine {
-                    kind: LineKind::Context,
-                    content: line_content,
-                    old_lineno: Some((i as i64 + old_offset) as u32),
-                    new_lineno: Some(i as u32),
-                });
-            }
+            let start = prev_last_new + 1;
+            let end = (next_first_new - 1).min(start + EXPAND_AMOUNT - 1);
+            (start, end, prev_last_old as i64 - prev_last_new as i64)
         } else {
             let last_idx = file.hunks.len() - 1;
             let last_new = file.hunks[last_idx].last_new_lineno().unwrap_or(0) as usize;
             let last_old = file.hunks[last_idx].last_old_lineno().unwrap_or(0) as usize;
-
-            if last_new >= file_lines.len() {
+            if last_new >= file.total_new_lines {
                 return;
             }
+            let start = last_new + 1;
+            let end = file.total_new_lines.min(start + EXPAND_AMOUNT - 1);
+            (start, end, last_old as i64 - last_new as i64)
+        };
 
-            let gap_start = last_new + 1;
-            let gap_end = file_lines.len().min(gap_start + EXPAND_AMOUNT - 1);
-            let old_offset = last_old as i64 - last_new as i64;
-
-            let last_hunk = &mut file.hunks[last_idx];
-            for i in gap_start..=gap_end {
-                let line_content = file_lines
-                    .get(i - 1)
-                    .map(|s| s.to_string())
-                    .unwrap_or_default();
-                last_hunk.lines.push(DiffLine {
+        // Read only the lines we need via BufRead (skip + take)
+        let file_path = repo_path.join(&file.path);
+        let f = match std::fs::File::open(&file_path) {
+            Ok(f) => f,
+            Err(_) => return,
+        };
+        use std::io::BufRead;
+        let context_lines: Vec<DiffLine> = std::io::BufReader::new(f)
+            .lines()
+            .skip(gap_start - 1)
+            .take(gap_end - gap_start + 1)
+            .enumerate()
+            .map(|(offset, line)| {
+                let lineno = gap_start + offset;
+                DiffLine {
                     kind: LineKind::Context,
-                    content: line_content,
-                    old_lineno: Some((i as i64 + old_offset) as u32),
-                    new_lineno: Some(i as u32),
-                });
-            }
+                    content: line.unwrap_or_default(),
+                    old_lineno: Some((lineno as i64 + old_offset) as u32),
+                    new_lineno: Some(lineno as u32),
+                }
+            })
+            .collect();
+
+        // Apply to the appropriate hunk
+        if gap_idx == 0 {
+            let mut existing = std::mem::take(&mut file.hunks[0].lines);
+            let mut new_lines = context_lines;
+            new_lines.append(&mut existing);
+            file.hunks[0].lines = new_lines;
+        } else if gap_idx < file.hunks.len() {
+            file.hunks[gap_idx - 1].lines.extend(context_lines);
+        } else {
+            let last_idx = file.hunks.len() - 1;
+            file.hunks[last_idx].lines.extend(context_lines);
         }
 
         // Invalidate SBS cache — will be recomputed on demand before next draw
@@ -447,7 +428,7 @@ impl App {
 
     pub fn total_display_lines(&self) -> usize {
         self.current_files()
-            .map(|files| files.iter().map(|f| f.total_display_lines() + 1).sum())
+            .map(|files| files.iter().map(|f| self.file_display_lines(f) + 1).sum())
             .unwrap_or(0)
     }
 
@@ -457,10 +438,19 @@ impl App {
         if let Some(files) = self.current_files() {
             for file in files {
                 positions.push(pos);
-                pos += file.total_display_lines() + 1;
+                pos += self.file_display_lines(file) + 1;
             }
         }
         positions
+    }
+
+    /// Returns the display line count for a file, accounting for SBS mode.
+    fn file_display_lines(&self, file: &FileDiff) -> usize {
+        if self.side_by_side {
+            file.total_sbs_display_lines()
+        } else {
+            file.total_display_lines()
+        }
     }
 
     pub fn focused_file_from_scroll(&self) -> Option<usize> {
@@ -509,7 +499,16 @@ impl App {
 
         let mut line_count = 0;
         for (i, hunk) in file.hunks.iter().enumerate() {
-            let hunk_size = 1 + hunk.lines.len();
+            let hunk_lines = if self.side_by_side {
+                file.sbs_cache
+                    .as_ref()
+                    .and_then(|c| c.get(i))
+                    .map(|h| h.len())
+                    .unwrap_or(hunk.lines.len())
+            } else {
+                hunk.lines.len()
+            };
+            let hunk_size = 1 + hunk_lines;
             if row_in_file < line_count + hunk_size {
                 return Some((file_idx, i));
             }
@@ -599,7 +598,7 @@ pub struct DiffResult {
 
 pub struct BaseBranchResult {
     pub repo_id: u64,
-    pub branch: String,
+    pub branch: Option<String>,
     pub branch_name: Option<String>,
 }
 
@@ -854,9 +853,8 @@ async fn run_loop(
             }
             AppEvent::BaseBranch(result) => {
                 if let Some(idx) = app.find_repo(result.repo_id) {
-                    let base_changed =
-                        app.repos[idx].base_branch.as_deref() != Some(&result.branch);
-                    app.repos[idx].base_branch = Some(result.branch);
+                    let base_changed = app.repos[idx].base_branch != result.branch;
+                    app.repos[idx].base_branch = result.branch;
                     app.repos[idx].branch_name = result.branch_name;
                     needs_redraw = true;
                     if base_changed && app.repos[idx].mode == DiffMode::Branch {
