@@ -14,7 +14,7 @@ Built for the workflow where your agent writes code and you audit it. Think of i
 
 I built this because I use lazygit — and it's great for git operations, but not great for *reviewing* agent changes. The diff pane is small, copying hunks is clunky, and it only handles one repo at a time. When you've got agents working across multiple repos simultaneously, you need something that gives all the screen real estate to the diff and makes it easy to copy code back to your agent.
 
-If you're terminal-first with Claude Code, Cursor, Codex, or similar — and you haven't opened your IDE in a while — you're missing the ability to see all changes at a glance as they happen. `changes` fills that gap.
+It's also agent-agnostic. You shouldn't have to use a specific app or IDE just to get a good diff viewer — reviewing changes and running agents are two separate concerns. `changes` works with whatever you use: Claude Code, Codex, Cursor, Copilot, aider, or a shell script that calls `sed`. If it writes to files in a git repo, you can see the diff.
 
 - **Full-screen diffs** — all the real estate goes to the code, not git operations
 - Watch agent changes across **multiple repos** in tabs
