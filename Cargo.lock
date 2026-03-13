@@ -238,7 +238,6 @@ dependencies = [
  "similar",
  "syntect",
  "tokio",
- "unicode-width",
 ]
 
 [[package]]

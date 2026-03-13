@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
 pub struct WatchEvent {
-    pub repo_index: usize,
+    pub repo_path: PathBuf,
 }
 
 pub fn start_watching(
@@ -23,7 +23,7 @@ pub fn start_watching(
                 Err(_) => return,
             };
 
-            let repo_paths = repo_paths.read().unwrap();
+            let repo_paths = repo_paths.read().unwrap_or_else(|e| e.into_inner());
             let mut seen = HashSet::new();
 
             for event in events {
@@ -35,9 +35,9 @@ pub fn start_watching(
                     continue;
                 }
 
-                if let Some(idx) = find_repo_index(&repo_paths, &event.path) {
-                    if seen.insert(idx) {
-                        let _ = tx.send(WatchEvent { repo_index: idx });
+                if let Some(repo_path) = find_repo_path(&repo_paths, &event.path) {
+                    if seen.insert(repo_path.clone()) {
+                        let _ = tx.send(WatchEvent { repo_path });
                     }
                 }
             }
@@ -82,8 +82,9 @@ fn is_git_internal_path(path: &Path) -> bool {
     }
 }
 
-fn find_repo_index(repo_paths: &[PathBuf], event_path: &Path) -> Option<usize> {
+fn find_repo_path(repo_paths: &[PathBuf], event_path: &Path) -> Option<PathBuf> {
     repo_paths
         .iter()
-        .position(|repo_path| event_path.starts_with(repo_path))
+        .find(|repo_path| event_path.starts_with(repo_path))
+        .cloned()
 }

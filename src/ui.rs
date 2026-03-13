@@ -63,7 +63,7 @@ fn draw_tab_bar(frame: &mut Frame, app: &mut App, area: Rect) {
         }
 
         let start = col;
-        let label = format!(" {} ", repo.name);
+        let label = format!(" {} ", repo.info.name);
         let width = label.len() as u16;
 
         if i == app.active_tab {
@@ -617,14 +617,14 @@ fn format_expand_indicator(gap: usize, width: usize) -> String {
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &mut App, area: Rect) {
-    let total_files: usize = app.file_diffs.iter().map(|f| f.len()).sum();
-    let base = app.base_branches.get(app.active_tab).and_then(|b| b.as_deref());
+    let total_files: usize = app.repos.iter().map(|r| r.files.len()).sum();
+    let base = app.repos.get(app.active_tab).and_then(|r| r.base_branch.as_deref());
     let mode = app.current_mode().label(base);
     let view = if app.side_by_side { "side-by-side" } else { "unified" };
     let repo_count = app.repos.len();
 
-    let branch_name = app.branch_names.get(app.active_tab)
-        .and_then(|b| b.as_deref())
+    let branch_name = app.repos.get(app.active_tab)
+        .and_then(|r| r.branch_name.as_deref())
         .unwrap_or("HEAD");
 
     let left = format!(
