@@ -13,11 +13,10 @@ mod watcher_tests {
             return true;
         }
         let first = remaining[0].as_os_str().to_string_lossy();
-        match first.as_ref() {
-            "HEAD" | "index" | "MERGE_HEAD" | "REBASE_HEAD" | "CHERRY_PICK_HEAD" => false,
-            "refs" => false,
-            _ => true,
-        }
+        !matches!(
+            first.as_ref(),
+            "HEAD" | "index" | "MERGE_HEAD" | "REBASE_HEAD" | "CHERRY_PICK_HEAD" | "refs"
+        )
     }
 
     #[test]
@@ -58,9 +57,7 @@ mod watcher_tests {
 
     #[test]
     fn test_git_logs_filtered() {
-        assert!(is_git_internal_path(&PathBuf::from(
-            "/repo/.git/logs/HEAD"
-        )));
+        assert!(is_git_internal_path(&PathBuf::from("/repo/.git/logs/HEAD")));
     }
 
     #[test]
@@ -89,19 +86,12 @@ mod hunk_context_tests {
         let rest = header.strip_prefix("@@")?;
         let end = rest.find("@@")?;
         let after = rest[end + 2..].trim();
-        if after.is_empty() {
-            None
-        } else {
-            Some(after)
-        }
+        if after.is_empty() { None } else { Some(after) }
     }
 
     #[test]
     fn test_extracts_function_name() {
-        assert_eq!(
-            hunk_context("@@ -10,5 +10,7 @@ fn foo()"),
-            Some("fn foo()")
-        );
+        assert_eq!(hunk_context("@@ -10,5 +10,7 @@ fn foo()"), Some("fn foo()"));
     }
 
     #[test]
@@ -116,10 +106,7 @@ mod hunk_context_tests {
 
     #[test]
     fn test_impl_block() {
-        assert_eq!(
-            hunk_context("@@ -1,3 +1,5 @@ impl Foo"),
-            Some("impl Foo")
-        );
+        assert_eq!(hunk_context("@@ -1,3 +1,5 @@ impl Foo"), Some("impl Foo"));
     }
 
     #[test]

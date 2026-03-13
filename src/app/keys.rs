@@ -1,11 +1,15 @@
-use super::{App, DiffResult};
+use super::{App, DiffResult, PAGE_SCROLL};
 use crate::git::DiffMode;
 use arboard::Clipboard;
 use crossterm::event::{self, KeyCode, KeyModifiers};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
-pub fn handle_key(app: &mut App, key: event::KeyEvent, diff_tx: &mpsc::UnboundedSender<DiffResult>) -> bool {
+pub fn handle_key(
+    app: &mut App,
+    key: event::KeyEvent,
+    diff_tx: &mpsc::UnboundedSender<DiffResult>,
+) -> bool {
     match key.code {
         KeyCode::Char('q') => return true,
         KeyCode::Esc => {
@@ -33,7 +37,7 @@ pub fn handle_key(app: &mut App, key: event::KeyEvent, diff_tx: &mpsc::Unbounded
             app.scroll_offset = 0;
             app.focused_file = None;
         }
-        KeyCode::Char(c) if c >= '1' && c <= '9' => {
+        KeyCode::Char(c) if ('1'..='9').contains(&c) => {
             let idx = (c as usize) - ('1' as usize);
             if idx < app.repos.len() {
                 app.active_tab = idx;
@@ -97,22 +101,21 @@ pub fn handle_key(app: &mut App, key: event::KeyEvent, diff_tx: &mpsc::Unbounded
             app.focused_file = app.focused_file_from_scroll();
         }
         KeyCode::PageDown => {
-            app.scroll_offset = app.scroll_offset.saturating_add(20);
+            app.scroll_offset = app.scroll_offset.saturating_add(PAGE_SCROLL);
             app.focused_file = app.focused_file_from_scroll();
         }
         KeyCode::PageUp => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(20);
+            app.scroll_offset = app.scroll_offset.saturating_sub(PAGE_SCROLL);
             app.focused_file = app.focused_file_from_scroll();
         }
 
         // Collapse
         KeyCode::Enter => {
-            if let Some(idx) = app.focused_file {
-                if let Some(files) = app.current_files_mut() {
-                    if let Some(file) = files.get_mut(idx) {
-                        file.collapsed = !file.collapsed;
-                    }
-                }
+            if let Some(idx) = app.focused_file
+                && let Some(files) = app.current_files_mut()
+                && let Some(file) = files.get_mut(idx)
+            {
+                file.collapsed = !file.collapsed;
             }
         }
         KeyCode::Char('c') => {
@@ -132,10 +135,10 @@ pub fn handle_key(app: &mut App, key: event::KeyEvent, diff_tx: &mpsc::Unbounded
 
         // Copy
         KeyCode::Char('y') => {
-            if let Some(text) = app.copy_hunk_at_focus() {
-                if let Ok(mut clipboard) = Clipboard::new() {
-                    let _ = clipboard.set_text(text);
-                }
+            if let Some(text) = app.copy_hunk_at_focus()
+                && let Ok(mut clipboard) = Clipboard::new()
+            {
+                let _ = clipboard.set_text(text);
             }
         }
 
@@ -169,10 +172,10 @@ pub fn handle_file_picker_key(app: &mut App, key: event::KeyEvent) {
             let filtered = app.filtered_file_indices();
             if let Some(&file_idx) = filtered.get(app.file_picker_selected) {
                 app.jump_to_file(file_idx);
-                if let Some(files) = app.current_files_mut() {
-                    if let Some(file) = files.get_mut(file_idx) {
-                        file.collapsed = false;
-                    }
+                if let Some(files) = app.current_files_mut()
+                    && let Some(file) = files.get_mut(file_idx)
+                {
+                    file.collapsed = false;
                 }
             }
             app.show_file_picker = false;

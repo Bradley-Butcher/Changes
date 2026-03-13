@@ -1,4 +1,4 @@
-use super::{App, DiffResult};
+use super::{App, DOUBLE_CLICK_MS, DiffResult, SCROLL_SPEED};
 use crate::diff;
 use arboard::Clipboard;
 use crossterm::event::{self, MouseButton, MouseEventKind};
@@ -6,15 +6,19 @@ use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
 /// Returns true if the event changed state (needs redraw).
-pub fn handle_mouse(app: &mut App, mouse: event::MouseEvent, diff_tx: &mpsc::UnboundedSender<DiffResult>) -> bool {
+pub fn handle_mouse(
+    app: &mut App,
+    mouse: event::MouseEvent,
+    diff_tx: &mpsc::UnboundedSender<DiffResult>,
+) -> bool {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
-            app.scroll_offset = app.scroll_offset.saturating_sub(3);
+            app.scroll_offset = app.scroll_offset.saturating_sub(SCROLL_SPEED);
             app.focused_file = app.focused_file_from_scroll();
             true
         }
         MouseEventKind::ScrollDown => {
-            app.scroll_offset = app.scroll_offset.saturating_add(3);
+            app.scroll_offset = app.scroll_offset.saturating_add(SCROLL_SPEED);
             app.focused_file = app.focused_file_from_scroll();
             true
         }
@@ -27,7 +31,7 @@ pub fn handle_mouse(app: &mut App, mouse: event::MouseEvent, diff_tx: &mpsc::Unb
             let is_double_click = if let Some((prev_row, prev_col, prev_time)) = app.last_click {
                 prev_row == click_row
                     && prev_col == click_col
-                    && now.duration_since(prev_time) < Duration::from_millis(400)
+                    && now.duration_since(prev_time) < Duration::from_millis(DOUBLE_CLICK_MS)
             } else {
                 false
             };
@@ -35,19 +39,19 @@ pub fn handle_mouse(app: &mut App, mouse: event::MouseEvent, diff_tx: &mpsc::Unb
 
             if is_double_click && click_row >= 4 {
                 let content_row = (click_row as usize).saturating_sub(4) + app.scroll_offset;
-                if let Some(text) = app.copy_hunk_at_row(content_row) {
-                    if let Ok(mut clipboard) = Clipboard::new() {
-                        let _ = clipboard.set_text(text);
-                    }
+                if let Some(text) = app.copy_hunk_at_row(content_row)
+                    && let Ok(mut clipboard) = Clipboard::new()
+                {
+                    let _ = clipboard.set_text(text);
                 }
                 app.last_click = None;
                 return true;
             }
 
             // Status bar badges
-            if click_row == app.status_bar_row {
-                let (ms, me) = app.mode_badge_pos;
-                let (vs, ve) = app.view_badge_pos;
+            if click_row == app.layout.status_bar_row {
+                let (ms, me) = app.layout.mode_badge_pos;
+                let (vs, ve) = app.layout.view_badge_pos;
                 if click_col >= ms && click_col < me {
                     let next = app.repos[app.active_tab].mode.next();
                     app.repos[app.active_tab].mode = next;
@@ -64,7 +68,7 @@ pub fn handle_mouse(app: &mut App, mouse: event::MouseEvent, diff_tx: &mpsc::Unb
 
             // Tab bar (rows 0-2)
             if click_row <= 2 {
-                for (i, &(start, end)) in app.tab_positions.iter().enumerate() {
+                for (i, &(start, end)) in app.layout.tab_positions.iter().enumerate() {
                     if click_col >= start && click_col < end {
                         app.active_tab = i;
                         app.scroll_offset = 0;
@@ -90,10 +94,10 @@ pub fn handle_mouse(app: &mut App, mouse: event::MouseEvent, diff_tx: &mpsc::Unb
             for (i, &pos) in positions.iter().enumerate() {
                 if content_row == pos {
                     app.focused_file = Some(i);
-                    if let Some(files) = app.current_files_mut() {
-                        if let Some(file) = files.get_mut(i) {
-                            file.collapsed = !file.collapsed;
-                        }
+                    if let Some(files) = app.current_files_mut()
+                        && let Some(file) = files.get_mut(i)
+                    {
+                        file.collapsed = !file.collapsed;
                     }
                     return true;
                 }
@@ -103,10 +107,10 @@ pub fn handle_mouse(app: &mut App, mouse: event::MouseEvent, diff_tx: &mpsc::Unb
             true
         }
         MouseEventKind::Down(MouseButton::Middle) => {
-            if let Some(text) = app.copy_hunk_at_focus() {
-                if let Ok(mut clipboard) = Clipboard::new() {
-                    let _ = clipboard.set_text(text);
-                }
+            if let Some(text) = app.copy_hunk_at_focus()
+                && let Ok(mut clipboard) = Clipboard::new()
+            {
+                let _ = clipboard.set_text(text);
             }
             true
         }
@@ -161,7 +165,11 @@ fn find_expand_gap(app: &App, content_row: usize) -> Option<(usize, usize)> {
 
         // Trailing row — bottom gap
         if content_row == pos && !file.hunks.is_empty() && file.total_new_lines > 0 {
-            let last_new = file.hunks.last().and_then(|h| h.last_new_lineno()).unwrap_or(0) as usize;
+            let last_new = file
+                .hunks
+                .last()
+                .and_then(|h| h.last_new_lineno())
+                .unwrap_or(0) as usize;
             if file.total_new_lines > last_new {
                 return Some((file_idx, file.hunks.len()));
             }

@@ -4,7 +4,7 @@ mod mouse;
 use crate::diff::{DiffLine, FileDiff, LineKind};
 use crate::git::{self, DiffMode, RepoInfo};
 use crate::highlight::Highlighter;
-use crate::ui;
+use crate::ui::{self, LayoutHints};
 use crate::watcher::{self, WatchEvent};
 use anyhow::Result;
 use crossterm::event::{
@@ -13,13 +13,21 @@ use crossterm::event::{
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
-use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
+use ratatui::backend::CrosstermBackend;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
+
+// Tunable constants
+const FLASH_DURATION: Duration = Duration::from_millis(300);
+const FLASH_TICK: Duration = Duration::from_millis(50);
+const IDLE_TICK: Duration = Duration::from_secs(60);
+pub(crate) const SCROLL_SPEED: usize = 3;
+pub(crate) const PAGE_SCROLL: usize = 20;
+pub(crate) const DOUBLE_CLICK_MS: u64 = 400;
 
 pub struct RepoState {
     pub id: u64,
@@ -51,11 +59,8 @@ pub struct App {
     pub repo_adder_results: Vec<(String, PathBuf)>,
     pub repo_adder_cursor: usize,
     pub repo_adder_checked: std::collections::HashSet<usize>,
-    pub tab_positions: Vec<(u16, u16)>,
+    pub layout: LayoutHints,
     pub last_click: Option<(u16, u16, Instant)>,
-    pub mode_badge_pos: (u16, u16),
-    pub view_badge_pos: (u16, u16),
-    pub status_bar_row: u16,
 }
 
 impl App {
@@ -94,11 +99,8 @@ impl App {
             repo_adder_results: Vec::new(),
             repo_adder_cursor: 0,
             repo_adder_checked: std::collections::HashSet::new(),
-            tab_positions: Vec::new(),
+            layout: LayoutHints::default(),
             last_click: None,
-            mode_badge_pos: (0, 0),
-            view_badge_pos: (0, 0),
-            status_bar_row: 0,
         }
     }
 
@@ -160,7 +162,9 @@ impl App {
 
     pub fn expand_gap(&mut self, file_idx: usize, gap_idx: usize) {
         let repo_path = self.repos[self.active_tab].info.path.clone();
-        let file = match self.repos.get_mut(self.active_tab)
+        let file = match self
+            .repos
+            .get_mut(self.active_tab)
             .and_then(|r| r.files.get_mut(file_idx))
         {
             Some(f) => f,
@@ -191,7 +195,10 @@ impl App {
 
             let mut new_lines = Vec::new();
             for i in gap_start..=gap_end {
-                let line_content = file_lines.get(i - 1).map(|s| s.to_string()).unwrap_or_default();
+                let line_content = file_lines
+                    .get(i - 1)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
                 new_lines.push(DiffLine {
                     kind: LineKind::Context,
                     content: line_content,
@@ -218,7 +225,10 @@ impl App {
 
             let prev_hunk = &mut file.hunks[prev_idx];
             for i in gap_start..=gap_end {
-                let line_content = file_lines.get(i - 1).map(|s| s.to_string()).unwrap_or_default();
+                let line_content = file_lines
+                    .get(i - 1)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
                 prev_hunk.lines.push(DiffLine {
                     kind: LineKind::Context,
                     content: line_content,
@@ -241,7 +251,10 @@ impl App {
 
             let last_hunk = &mut file.hunks[last_idx];
             for i in gap_start..=gap_end {
-                let line_content = file_lines.get(i - 1).map(|s| s.to_string()).unwrap_or_default();
+                let line_content = file_lines
+                    .get(i - 1)
+                    .map(|s| s.to_string())
+                    .unwrap_or_default();
                 last_hunk.lines.push(DiffLine {
                     kind: LineKind::Context,
                     content: line_content,
@@ -251,9 +264,11 @@ impl App {
             }
         }
 
-        // Invalidate SBS cache
+        // Invalidate SBS cache — will be recomputed on demand before next draw
         file.sbs_cache = None;
-        file.ensure_sbs_cache();
+        if self.side_by_side {
+            file.ensure_sbs_cache();
+        }
     }
 
     pub fn refresh_repo_adder_results(&mut self) {
@@ -319,7 +334,9 @@ impl App {
                 .map_err(|e| e.to_string())?
                 .join(path)
         };
-        let canonical = resolved.canonicalize().map_err(|_| format!("Path not found: {}", input))?;
+        let canonical = resolved
+            .canonicalize()
+            .map_err(|_| format!("Path not found: {}", input))?;
 
         if !canonical.join(".git").exists() {
             return Err(format!("Not a git repo: {}", canonical.display()));
@@ -339,7 +356,10 @@ impl App {
         let idx = self.repos.len();
         self.repos.push(RepoState {
             id,
-            info: git::RepoInfo { name, path: canonical },
+            info: git::RepoInfo {
+                name,
+                path: canonical,
+            },
             mode: DiffMode::Unstaged,
             files: Vec::new(),
             base_branch: None,
@@ -352,11 +372,24 @@ impl App {
         Ok(idx)
     }
 
+    /// Ensure side-by-side caches exist for the active tab's files.
+    /// Called before each draw; no-op when caches already exist or unified mode is active.
+    pub fn ensure_sbs_caches(&mut self) {
+        if !self.side_by_side {
+            return;
+        }
+        if let Some(files) = self.current_files_mut() {
+            for file in files {
+                file.ensure_sbs_cache();
+            }
+        }
+    }
+
     pub fn apply_diff_result(&mut self, idx: usize, result: Result<Vec<FileDiff>, String>) {
         match result {
             Ok(files) => {
-                let old_collapsed: std::collections::HashMap<String, bool> = self
-                    .repos[idx].files
+                let old_collapsed: std::collections::HashMap<String, bool> = self.repos[idx]
+                    .files
                     .iter()
                     .map(|f| (f.path.clone(), f.collapsed))
                     .collect();
@@ -366,7 +399,9 @@ impl App {
                     if let Some(&collapsed) = old_collapsed.get(&file.path) {
                         file.collapsed = collapsed;
                     }
-                    file.ensure_sbs_cache();
+                    if self.side_by_side {
+                        file.ensure_sbs_cache();
+                    }
                 }
 
                 self.repos[idx].files = new_files;
@@ -386,9 +421,12 @@ impl App {
         let base = repo.base_branch.clone();
         let tx = diff_tx.clone();
         std::thread::spawn(move || {
-            let result = git::compute_diff(&path, mode, base.as_deref())
-                .map_err(|e| e.to_string());
-            let _ = tx.send(DiffResult { repo_id: id, mode, result });
+            let result = git::compute_diff(&path, mode, base.as_deref()).map_err(|e| e.to_string());
+            let _ = tx.send(DiffResult {
+                repo_id: id,
+                mode,
+                result,
+            });
         });
     }
 
@@ -397,8 +435,7 @@ impl App {
         let mode = repo.mode;
         let base = repo.base_branch.clone();
         let path = repo.info.path.clone();
-        let result = git::compute_diff(&path, mode, base.as_deref())
-            .map_err(|e| e.to_string());
+        let result = git::compute_diff(&path, mode, base.as_deref()).map_err(|e| e.to_string());
         self.apply_diff_result(idx, result);
     }
 
@@ -540,12 +577,11 @@ impl App {
                 LineKind::Addition => "+",
                 LineKind::Deletion => "-",
                 LineKind::Context => " ",
-                _ => " ",
             };
             result.push_str(&format!("{} {}\n", prefix, line.content));
         }
 
-        self.flash_until = Some(Instant::now() + Duration::from_millis(300));
+        self.flash_until = Some(Instant::now() + FLASH_DURATION);
         self.flash_file_idx = Some(file_idx);
         self.flash_hunk_idx = Some(target_hunk);
 
@@ -575,13 +611,18 @@ enum AppEvent {
     Tick,
 }
 
+/// Bundles the event channels used by the run loop.
+struct Channels {
+    watch_rx: mpsc::UnboundedReceiver<WatchEvent>,
+    diff_rx: mpsc::UnboundedReceiver<DiffResult>,
+    diff_tx: mpsc::UnboundedSender<DiffResult>,
+    base_rx: mpsc::UnboundedReceiver<BaseBranchResult>,
+    base_tx: mpsc::UnboundedSender<BaseBranchResult>,
+}
+
 fn restore_terminal() {
     let _ = disable_raw_mode();
-    let _ = crossterm::execute!(
-        io::stdout(),
-        LeaveAlternateScreen,
-        DisableMouseCapture
-    );
+    let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
     let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
 }
 
@@ -592,11 +633,15 @@ pub async fn run(path: PathBuf) -> Result<()> {
     app.refresh_all_sync();
 
     // Set up file watcher with shared repo paths
-    let (watch_tx, mut watch_rx) = mpsc::unbounded_channel::<WatchEvent>();
+    let (watch_tx, watch_rx) = mpsc::unbounded_channel::<WatchEvent>();
     let repo_paths: Vec<PathBuf> = app.repos.iter().map(|r| r.info.path.clone()).collect();
     let shared_paths = Arc::new(RwLock::new(repo_paths));
     let mut debouncer = watcher::start_watching(shared_paths.clone(), watch_tx)?;
-    for p in shared_paths.read().unwrap_or_else(|e| e.into_inner()).iter() {
+    for p in shared_paths
+        .read()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+    {
         watcher::watch_repo(&mut debouncer, p)?;
     }
 
@@ -627,14 +672,31 @@ pub async fn run(path: PathBuf) -> Result<()> {
         std::thread::spawn(move || {
             let branch = git::find_base_branch(&path);
             let branch_name = git::current_branch(&path);
-            let _ = tx.send(BaseBranchResult { repo_id: id, branch, branch_name });
+            let _ = tx.send(BaseBranchResult {
+                repo_id: id,
+                branch,
+                branch_name,
+            });
         });
     }
 
+    let mut channels = Channels {
+        watch_rx,
+        diff_rx,
+        diff_tx,
+        base_rx,
+        base_tx,
+    };
+
     let result = run_loop(
-        &mut terminal, &mut app, &mut watch_rx, diff_rx, &diff_tx,
-        base_rx, &base_tx, &highlighter, &mut debouncer, &shared_paths,
-    ).await;
+        &mut terminal,
+        &mut app,
+        &mut channels,
+        &highlighter,
+        &mut debouncer,
+        &shared_paths,
+    )
+    .await;
 
     restore_terminal();
 
@@ -644,11 +706,7 @@ pub async fn run(path: PathBuf) -> Result<()> {
 async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
-    watch_rx: &mut mpsc::UnboundedReceiver<WatchEvent>,
-    mut diff_rx: mpsc::UnboundedReceiver<DiffResult>,
-    diff_tx: &mpsc::UnboundedSender<DiffResult>,
-    mut base_rx: mpsc::UnboundedReceiver<BaseBranchResult>,
-    base_tx: &mpsc::UnboundedSender<BaseBranchResult>,
+    ch: &mut Channels,
     highlighter: &Highlighter,
     debouncer: &mut notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>,
     shared_paths: &Arc<RwLock<Vec<PathBuf>>>,
@@ -671,23 +729,26 @@ async fn run_loop(
 
     loop {
         if needs_redraw {
-            terminal.draw(|f| ui::draw(f, app, highlighter))?;
+            app.ensure_sbs_caches();
+            let mut hints = LayoutHints::default();
+            terminal.draw(|f| ui::draw(f, app, highlighter, &mut hints))?;
+            app.layout = hints;
             needs_redraw = false;
         }
 
         let tick_dur = if app.flash_until.is_some() {
-            Duration::from_millis(50)
+            FLASH_TICK
         } else {
-            Duration::from_secs(60)
+            IDLE_TICK
         };
         let tick_sleep = tokio::time::sleep(tick_dur);
         tokio::pin!(tick_sleep);
 
         let event = tokio::select! {
             Some(ev) = term_rx.recv() => AppEvent::Terminal(ev),
-            Some(ev) = watch_rx.recv() => AppEvent::FileChange(ev),
-            Some(ev) = diff_rx.recv() => AppEvent::DiffDone(ev),
-            Some(ev) = base_rx.recv() => AppEvent::BaseBranch(ev),
+            Some(ev) = ch.watch_rx.recv() => AppEvent::FileChange(ev),
+            Some(ev) = ch.diff_rx.recv() => AppEvent::DiffDone(ev),
+            Some(ev) = ch.base_rx.recv() => AppEvent::BaseBranch(ev),
             () = &mut tick_sleep => AppEvent::Tick,
         };
 
@@ -707,14 +768,21 @@ async fn run_loop(
                         let repo = &app.repos[new_idx];
                         let id = repo.id;
                         let path = repo.info.path.clone();
-                        shared_paths.write().unwrap_or_else(|e| e.into_inner()).push(path.clone());
+                        shared_paths
+                            .write()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .push(path.clone());
                         let _ = watcher::watch_repo(debouncer, &path);
-                        app.refresh_repo_async(new_idx, diff_tx);
-                        let btx = base_tx.clone();
+                        app.refresh_repo_async(new_idx, &ch.diff_tx);
+                        let btx = ch.base_tx.clone();
                         std::thread::spawn(move || {
                             let branch = git::find_base_branch(&path);
                             let branch_name = git::current_branch(&path);
-                            let _ = btx.send(BaseBranchResult { repo_id: id, branch, branch_name });
+                            let _ = btx.send(BaseBranchResult {
+                                repo_id: id,
+                                branch,
+                                branch_name,
+                            });
                         });
                     }
                     needs_redraw = true;
@@ -741,13 +809,13 @@ async fn run_loop(
                     needs_redraw = true;
                     continue;
                 }
-                if keys::handle_key(app, key, diff_tx) {
+                if keys::handle_key(app, key, &ch.diff_tx) {
                     return Ok(());
                 }
                 needs_redraw = true;
             }
             AppEvent::Terminal(Event::Mouse(m)) => {
-                if mouse::handle_mouse(app, m, diff_tx) {
+                if mouse::handle_mouse(app, m, &ch.diff_tx) {
                     needs_redraw = true;
                 }
             }
@@ -756,45 +824,54 @@ async fn run_loop(
             }
             AppEvent::Terminal(_) => {}
             AppEvent::FileChange(event) => {
-                if let Some(idx) = app.repos.iter().position(|r| r.info.path == event.repo_path) {
-                    app.refresh_repo_async(idx, diff_tx);
+                if let Some(idx) = app
+                    .repos
+                    .iter()
+                    .position(|r| r.info.path == event.repo_path)
+                {
+                    app.refresh_repo_async(idx, &ch.diff_tx);
                     let id = app.repos[idx].id;
                     let path = event.repo_path;
-                    let btx = base_tx.clone();
+                    let btx = ch.base_tx.clone();
                     std::thread::spawn(move || {
                         let branch_name = git::current_branch(&path);
                         let base = git::find_base_branch(&path);
-                        let _ = btx.send(BaseBranchResult { repo_id: id, branch: base, branch_name });
+                        let _ = btx.send(BaseBranchResult {
+                            repo_id: id,
+                            branch: base,
+                            branch_name,
+                        });
                     });
                 }
             }
             AppEvent::DiffDone(result) => {
-                if let Some(idx) = app.find_repo(result.repo_id) {
-                    if result.mode == app.repos[idx].mode {
-                        app.apply_diff_result(idx, result.result);
-                        needs_redraw = true;
-                    }
+                if let Some(idx) = app.find_repo(result.repo_id)
+                    && result.mode == app.repos[idx].mode
+                {
+                    app.apply_diff_result(idx, result.result);
+                    needs_redraw = true;
                 }
             }
             AppEvent::BaseBranch(result) => {
                 if let Some(idx) = app.find_repo(result.repo_id) {
-                    let base_changed = app.repos[idx].base_branch.as_deref() != Some(&result.branch);
+                    let base_changed =
+                        app.repos[idx].base_branch.as_deref() != Some(&result.branch);
                     app.repos[idx].base_branch = Some(result.branch);
                     app.repos[idx].branch_name = result.branch_name;
                     needs_redraw = true;
                     if base_changed && app.repos[idx].mode == DiffMode::Branch {
-                        app.refresh_repo_async(idx, diff_tx);
+                        app.refresh_repo_async(idx, &ch.diff_tx);
                     }
                 }
             }
             AppEvent::Tick => {
-                if let Some(until) = app.flash_until {
-                    if Instant::now() >= until {
-                        app.flash_until = None;
-                        app.flash_file_idx = None;
-                        app.flash_hunk_idx = None;
-                        needs_redraw = true;
-                    }
+                if let Some(until) = app.flash_until
+                    && Instant::now() >= until
+                {
+                    app.flash_until = None;
+                    app.flash_file_idx = None;
+                    app.flash_hunk_idx = None;
+                    needs_redraw = true;
                 }
             }
         }

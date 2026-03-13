@@ -5,10 +5,6 @@ pub enum LineKind {
     Context,
     Addition,
     Deletion,
-    #[allow(dead_code)]
-    HunkHeader,
-    #[allow(dead_code)]
-    FileHeader,
 }
 
 #[derive(Debug, Clone)]
@@ -32,7 +28,6 @@ impl Hunk {
     pub fn last_new_lineno(&self) -> Option<u32> {
         self.lines.iter().rev().find_map(|l| l.new_lineno)
     }
-    #[allow(dead_code)]
     pub fn first_old_lineno(&self) -> Option<u32> {
         self.lines.iter().find_map(|l| l.old_lineno)
     }

@@ -1,10 +1,12 @@
 use anyhow::Result;
-use notify_debouncer_mini::{new_debouncer, DebouncedEventKind};
+use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
+
+const DEBOUNCE_DURATION: Duration = Duration::from_millis(300);
 
 #[derive(Debug, Clone)]
 pub struct WatchEvent {
@@ -16,7 +18,7 @@ pub fn start_watching(
     tx: mpsc::UnboundedSender<WatchEvent>,
 ) -> Result<notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>> {
     let debouncer = new_debouncer(
-        Duration::from_millis(300),
+        DEBOUNCE_DURATION,
         move |result: Result<Vec<notify_debouncer_mini::DebouncedEvent>, notify::Error>| {
             let events = match result {
                 Ok(events) => events,
@@ -35,10 +37,10 @@ pub fn start_watching(
                     continue;
                 }
 
-                if let Some(repo_path) = find_repo_path(&repo_paths, &event.path) {
-                    if seen.insert(repo_path.clone()) {
-                        let _ = tx.send(WatchEvent { repo_path });
-                    }
+                if let Some(repo_path) = find_repo_path(&repo_paths, &event.path)
+                    && seen.insert(repo_path.clone())
+                {
+                    let _ = tx.send(WatchEvent { repo_path });
                 }
             }
         },

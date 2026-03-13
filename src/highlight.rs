@@ -23,17 +23,13 @@ impl Highlighter {
 
     fn get_syntax(&self, file_path: &str) -> &SyntaxReference {
         // Extract extension for cache key
-        let ext = file_path
-            .rsplit('.')
-            .next()
-            .unwrap_or("")
-            .to_string();
+        let ext = file_path.rsplit('.').next().unwrap_or("").to_string();
 
         let cache = self.syntax_cache.borrow();
-        if let Some(name) = cache.get(&ext) {
-            if let Some(syn) = self.syntax_set.find_syntax_by_name(name) {
-                return syn;
-            }
+        if let Some(name) = cache.get(&ext)
+            && let Some(syn) = self.syntax_set.find_syntax_by_name(name)
+        {
+            return syn;
         }
         drop(cache);
 
@@ -75,7 +71,14 @@ impl Highlighter {
                 let mut ratatui_style = Style::default().fg(fg);
                 if let Some(bg) = bg_override {
                     ratatui_style = ratatui_style.bg(bg);
-                } else if style.background != (highlighting::Color { r: 0, g: 0, b: 0, a: 0 }) {
+                } else if style.background
+                    != (highlighting::Color {
+                        r: 0,
+                        g: 0,
+                        b: 0,
+                        a: 0,
+                    })
+                {
                     ratatui_style = ratatui_style.bg(syntect_color_to_ratatui(style.background));
                 }
                 if style.font_style.contains(highlighting::FontStyle::BOLD) {
