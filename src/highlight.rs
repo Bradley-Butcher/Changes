@@ -12,6 +12,12 @@ pub struct Highlighter {
     syntax_cache: std::cell::RefCell<HashMap<String, String>>,
 }
 
+impl Default for Highlighter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Highlighter {
     pub fn new() -> Self {
         Self {

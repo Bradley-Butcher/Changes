@@ -1,11 +1,5 @@
-mod app;
-mod diff;
-mod git;
-mod highlight;
-mod ui;
-mod watcher;
-
 use anyhow::Result;
+use changes::app;
 use clap::Parser;
 use std::path::PathBuf;
 

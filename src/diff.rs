@@ -171,3 +171,90 @@ pub fn compute_side_by_side(hunks: &[Hunk]) -> Vec<Vec<SideBySideLine>> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{DiffLine, Hunk, gap_between_hunks};
+
+    #[test]
+    fn adjacent_hunks_have_no_gap() {
+        let prev = Hunk {
+            header: String::new(),
+            lines: vec![DiffLine {
+                kind: super::LineKind::Context,
+                content: String::new(),
+                old_lineno: Some(10),
+                new_lineno: Some(10),
+            }],
+        };
+        let next = Hunk {
+            header: String::new(),
+            lines: vec![DiffLine {
+                kind: super::LineKind::Context,
+                content: String::new(),
+                old_lineno: Some(11),
+                new_lineno: Some(11),
+            }],
+        };
+        assert_eq!(gap_between_hunks(&prev, &next), 0);
+    }
+
+    #[test]
+    fn gap_of_five() {
+        let prev = Hunk {
+            header: String::new(),
+            lines: vec![DiffLine {
+                kind: super::LineKind::Context,
+                content: String::new(),
+                old_lineno: Some(10),
+                new_lineno: Some(10),
+            }],
+        };
+        let next = Hunk {
+            header: String::new(),
+            lines: vec![DiffLine {
+                kind: super::LineKind::Context,
+                content: String::new(),
+                old_lineno: Some(16),
+                new_lineno: Some(16),
+            }],
+        };
+        assert_eq!(gap_between_hunks(&prev, &next), 5);
+    }
+
+    #[test]
+    fn overlapping_hunks_have_no_gap() {
+        let prev = Hunk {
+            header: String::new(),
+            lines: vec![DiffLine {
+                kind: super::LineKind::Context,
+                content: String::new(),
+                old_lineno: Some(15),
+                new_lineno: Some(15),
+            }],
+        };
+        let next = Hunk {
+            header: String::new(),
+            lines: vec![DiffLine {
+                kind: super::LineKind::Context,
+                content: String::new(),
+                old_lineno: Some(10),
+                new_lineno: Some(10),
+            }],
+        };
+        assert_eq!(gap_between_hunks(&prev, &next), 0);
+    }
+
+    #[test]
+    fn empty_hunks_have_no_gap() {
+        let prev = Hunk {
+            header: String::new(),
+            lines: vec![],
+        };
+        let next = Hunk {
+            header: String::new(),
+            lines: vec![],
+        };
+        assert_eq!(gap_between_hunks(&prev, &next), 0);
+    }
+}

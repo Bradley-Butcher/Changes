@@ -90,3 +90,69 @@ fn find_repo_path(repo_paths: &[PathBuf], event_path: &Path) -> Option<PathBuf> 
         .find(|repo_path| event_path.starts_with(repo_path))
         .cloned()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::is_git_internal_path;
+    use std::path::PathBuf;
+
+    #[test]
+    fn non_git_path_passes_through() {
+        assert!(!is_git_internal_path(&PathBuf::from("/repo/src/main.rs")));
+    }
+
+    #[test]
+    fn git_head_allowed() {
+        assert!(!is_git_internal_path(&PathBuf::from("/repo/.git/HEAD")));
+    }
+
+    #[test]
+    fn git_index_allowed() {
+        assert!(!is_git_internal_path(&PathBuf::from("/repo/.git/index")));
+    }
+
+    #[test]
+    fn git_refs_allowed() {
+        assert!(!is_git_internal_path(&PathBuf::from(
+            "/repo/.git/refs/heads/main"
+        )));
+    }
+
+    #[test]
+    fn git_merge_head_allowed() {
+        assert!(!is_git_internal_path(&PathBuf::from(
+            "/repo/.git/MERGE_HEAD"
+        )));
+    }
+
+    #[test]
+    fn git_objects_filtered() {
+        assert!(is_git_internal_path(&PathBuf::from(
+            "/repo/.git/objects/pack/abc123"
+        )));
+    }
+
+    #[test]
+    fn git_logs_filtered() {
+        assert!(is_git_internal_path(&PathBuf::from("/repo/.git/logs/HEAD")));
+    }
+
+    #[test]
+    fn git_hooks_filtered() {
+        assert!(is_git_internal_path(&PathBuf::from(
+            "/repo/.git/hooks/pre-commit"
+        )));
+    }
+
+    #[test]
+    fn bare_git_dir_filtered() {
+        assert!(is_git_internal_path(&PathBuf::from("/repo/.git")));
+    }
+
+    #[test]
+    fn commit_editmsg_filtered() {
+        assert!(is_git_internal_path(&PathBuf::from(
+            "/repo/.git/COMMIT_EDITMSG"
+        )));
+    }
+}

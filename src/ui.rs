@@ -1111,3 +1111,33 @@ fn draw_help_overlay(frame: &mut Frame) {
 
     frame.render_widget(help, popup_area);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::hunk_context;
+
+    #[test]
+    fn extracts_function_name() {
+        assert_eq!(hunk_context("@@ -10,5 +10,7 @@ fn foo()"), Some("fn foo()"));
+    }
+
+    #[test]
+    fn no_function_context() {
+        assert_eq!(hunk_context("@@ -10,5 +10,7 @@"), None);
+    }
+
+    #[test]
+    fn whitespace_only_after_returns_none() {
+        assert_eq!(hunk_context("@@ -10,5 +10,7 @@   "), None);
+    }
+
+    #[test]
+    fn impl_block_context() {
+        assert_eq!(hunk_context("@@ -1,3 +1,5 @@ impl Foo"), Some("impl Foo"));
+    }
+
+    #[test]
+    fn non_hunk_header_returns_none() {
+        assert_eq!(hunk_context("not a header"), None);
+    }
+}

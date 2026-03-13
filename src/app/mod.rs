@@ -875,3 +875,74 @@ async fn run_loop(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::App;
+    use crate::diff::{FileDiff, FileStatus};
+    use crate::git::RepoInfo;
+    use std::path::PathBuf;
+
+    fn test_app_with_files(paths: &[&str]) -> App {
+        let mut app = App::new(vec![RepoInfo {
+            name: "repo".to_string(),
+            path: PathBuf::from("/repo"),
+        }]);
+        app.repos[0].files = paths
+            .iter()
+            .map(|path| FileDiff {
+                path: (*path).to_string(),
+                old_path: None,
+                status: FileStatus::Modified,
+                hunks: Vec::new(),
+                additions: 0,
+                deletions: 0,
+                collapsed: false,
+                total_new_lines: 0,
+                sbs_cache: None,
+            })
+            .collect();
+        app
+    }
+
+    #[test]
+    fn fuzzy_match_exact_match() {
+        let mut app = test_app_with_files(&["src/main.rs"]);
+        app.file_picker_query = "src/main.rs".to_string();
+        assert_eq!(app.filtered_file_indices(), vec![0]);
+    }
+
+    #[test]
+    fn fuzzy_match_subsequence() {
+        let mut app = test_app_with_files(&["src/main.rs"]);
+        app.file_picker_query = "smr".to_string();
+        assert_eq!(app.filtered_file_indices(), vec![0]);
+    }
+
+    #[test]
+    fn fuzzy_match_no_match() {
+        let mut app = test_app_with_files(&["src/main.rs"]);
+        app.file_picker_query = "xyz".to_string();
+        assert!(app.filtered_file_indices().is_empty());
+    }
+
+    #[test]
+    fn fuzzy_match_empty_query_matches_all() {
+        let app = test_app_with_files(&["anything.rs", "src/main.rs"]);
+        assert_eq!(app.filtered_file_indices(), vec![0, 1]);
+    }
+
+    #[test]
+    fn fuzzy_match_case_insensitive() {
+        let mut app = test_app_with_files(&["src/Main.RS"]);
+        app.file_picker_query = "main".to_string();
+        assert_eq!(app.filtered_file_indices(), vec![0]);
+    }
+
+    #[test]
+    fn fuzzy_match_query_longer_than_path() {
+        let mut app = test_app_with_files(&["ab"]);
+        app.file_picker_query = "abc".to_string();
+        assert!(app.filtered_file_indices().is_empty());
+    }
+}
