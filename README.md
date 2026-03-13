@@ -6,9 +6,7 @@ See what your AI agent is actually doing to your code — in real time.
 
 `changes` is a terminal UI for reviewing git diffs live. It watches your repos and refreshes instantly as files change. No IDE required, no re-running commands. Just run `changes` and watch.
 
-Built for the workflow where your agent writes code and you audit it. Think of it as a better `lazygit` where the focus is purely on *what changed* — not staging, committing, or pushing. You do that through your agent. This is your review pane.
-
-![changes empty state with multi-repo tabs](assets/screenshot-empty.png)
+Built for the workflow where your agent writes code and you audit it. All the screen real estate goes to the diff — not staging, committing, or pushing. You do that through your agent. This is your review pane.
 
 ## Why
 
@@ -16,12 +14,13 @@ I built this because I use lazygit — and it's great for git operations, but no
 
 It's also agent-agnostic. You shouldn't have to use a specific app or IDE just to get a good diff viewer — reviewing changes and running agents are two separate concerns. `changes` works with whatever you use: Claude Code, Codex, Cursor, Copilot, aider, or a shell script that calls `sed`. If it writes to files in a git repo, you can see the diff.
 
-- **Full-screen diffs** — all the real estate goes to the code, not git operations
-- Watch agent changes across **multiple repos** in tabs
-- See **unstaged**, **staged**, or **branch diff** (vs main / parent branch)
-- **Copy hunks** with a double-click and paste them back to your agent
-- **Expand context** around changes — like GitHub, but better
+- **Multi-repo tabs** — watch agent changes across repos simultaneously
+- **Three diff modes** — unstaged, staged, or branch diff (vs main / parent branch)
+- **Copy hunks** — double-click or press `y`, then paste back to your agent
+- **Expand context** — click gap indicators to reveal surrounding lines
 - **Graphite-compatible** — auto-detects parent branch via `gt parent`
+
+![changes empty state with multi-repo tabs](assets/screenshot-empty.png)
 
 ## Install
 
