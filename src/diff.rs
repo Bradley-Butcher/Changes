@@ -5,7 +5,9 @@ pub enum LineKind {
     Context,
     Addition,
     Deletion,
+    #[allow(dead_code)]
     HunkHeader,
+    #[allow(dead_code)]
     FileHeader,
 }
 
@@ -23,6 +25,29 @@ pub struct Hunk {
     pub lines: Vec<DiffLine>,
 }
 
+impl Hunk {
+    pub fn first_new_lineno(&self) -> Option<u32> {
+        self.lines.iter().find_map(|l| l.new_lineno)
+    }
+    pub fn last_new_lineno(&self) -> Option<u32> {
+        self.lines.iter().rev().find_map(|l| l.new_lineno)
+    }
+    #[allow(dead_code)]
+    pub fn first_old_lineno(&self) -> Option<u32> {
+        self.lines.iter().find_map(|l| l.old_lineno)
+    }
+    pub fn last_old_lineno(&self) -> Option<u32> {
+        self.lines.iter().rev().find_map(|l| l.old_lineno)
+    }
+}
+
+/// Number of hidden lines between two adjacent hunks.
+pub fn gap_between_hunks(prev: &Hunk, next: &Hunk) -> usize {
+    let prev_end = prev.last_new_lineno().unwrap_or(0) as usize;
+    let next_start = next.first_new_lineno().unwrap_or(0) as usize;
+    next_start.saturating_sub(prev_end + 1)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileStatus {
     Modified,
@@ -35,12 +60,17 @@ pub enum FileStatus {
 #[derive(Debug, Clone)]
 pub struct FileDiff {
     pub path: String,
+    #[allow(dead_code)]
     pub old_path: Option<String>,
     pub status: FileStatus,
     pub hunks: Vec<Hunk>,
     pub additions: usize,
     pub deletions: usize,
     pub collapsed: bool,
+    /// Total lines in the new version of the file (for bottom expand indicator).
+    pub total_new_lines: usize,
+    /// Pre-computed side-by-side data, cached to avoid recomputing on every frame.
+    pub sbs_cache: Option<Vec<Vec<SideBySideLine>>>,
 }
 
 impl FileDiff {
@@ -48,7 +78,26 @@ impl FileDiff {
         if self.collapsed {
             return 1; // just the header
         }
-        1 + self.hunks.iter().map(|h| h.lines.len()).sum::<usize>()
+        // file header + (hunk header + lines) per hunk
+        1 + self.hunks.iter().map(|h| 1 + h.lines.len()).sum::<usize>()
+    }
+
+    /// Total lines in side-by-side mode (may differ from unified due to alignment).
+    pub fn total_sbs_display_lines(&self) -> usize {
+        if self.collapsed {
+            return 1;
+        }
+        let sbs_lines: usize = match &self.sbs_cache {
+            Some(hunks) => hunks.iter().map(|h| 1 + h.len()).sum(),
+            None => self.hunks.iter().map(|h| 1 + h.lines.len()).sum(),
+        };
+        1 + sbs_lines
+    }
+
+    pub fn ensure_sbs_cache(&mut self) {
+        if self.sbs_cache.is_none() {
+            self.sbs_cache = Some(compute_side_by_side(&self.hunks));
+        }
     }
 }
 

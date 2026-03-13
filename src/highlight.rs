@@ -1,12 +1,15 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::collections::HashMap;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{self, ThemeSet};
-use syntect::parsing::SyntaxSet;
+use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 pub struct Highlighter {
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
+    /// Maps file extensions to syntax name to avoid repeated find_syntax_for_file calls
+    syntax_cache: std::cell::RefCell<HashMap<String, String>>,
 }
 
 impl Highlighter {
@@ -14,7 +17,38 @@ impl Highlighter {
         Self {
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
+            syntax_cache: std::cell::RefCell::new(HashMap::new()),
         }
+    }
+
+    fn get_syntax(&self, file_path: &str) -> &SyntaxReference {
+        // Extract extension for cache key
+        let ext = file_path
+            .rsplit('.')
+            .next()
+            .unwrap_or("")
+            .to_string();
+
+        let cache = self.syntax_cache.borrow();
+        if let Some(name) = cache.get(&ext) {
+            if let Some(syn) = self.syntax_set.find_syntax_by_name(name) {
+                return syn;
+            }
+        }
+        drop(cache);
+
+        let syntax = self
+            .syntax_set
+            .find_syntax_for_file(file_path)
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
+
+        self.syntax_cache
+            .borrow_mut()
+            .insert(ext, syntax.name.clone());
+
+        syntax
     }
 
     pub fn highlight_line_content<'a>(
@@ -23,13 +57,7 @@ impl Highlighter {
         file_path: &str,
         bg_override: Option<Color>,
     ) -> Line<'a> {
-        let syntax = self
-            .syntax_set
-            .find_syntax_for_file(file_path)
-            .ok()
-            .flatten()
-            .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
-
+        let syntax = self.get_syntax(file_path);
         let theme = &self.theme_set.themes["base16-ocean.dark"];
         let mut h = HighlightLines::new(syntax, theme);
 

@@ -19,6 +19,14 @@ impl DiffMode {
             DiffMode::Branch => "Branch",
         }
     }
+
+    pub fn next(&self) -> Self {
+        match self {
+            DiffMode::Unstaged => DiffMode::Staged,
+            DiffMode::Staged => DiffMode::Branch,
+            DiffMode::Branch => DiffMode::Unstaged,
+        }
+    }
 }
 
 pub struct RepoInfo {
@@ -68,7 +76,13 @@ pub fn discover_repos(root: &Path) -> Result<Vec<RepoInfo>> {
     Ok(repos)
 }
 
-pub fn compute_diff(repo_path: &Path, mode: DiffMode) -> Result<Vec<FileDiff>> {
+pub fn current_branch(repo_path: &Path) -> Option<String> {
+    let repo = Repository::open(repo_path).ok()?;
+    let head = repo.head().ok()?;
+    head.shorthand().map(|s| s.to_string())
+}
+
+pub fn compute_diff(repo_path: &Path, mode: DiffMode, base_branch: Option<&str>) -> Result<Vec<FileDiff>> {
     let repo = Repository::open(repo_path)
         .with_context(|| format!("Failed to open repo: {}", repo_path.display()))?;
 
@@ -86,14 +100,17 @@ pub fn compute_diff(repo_path: &Path, mode: DiffMode) -> Result<Vec<FileDiff>> {
             repo.diff_tree_to_index(head.as_ref(), None, Some(&mut diff_opts))?
         }
         DiffMode::Branch => {
-            let base_branch = find_base_branch(repo_path);
-            compute_branch_diff(&repo, &base_branch, &mut diff_opts)?
+            let branch = base_branch
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| find_base_branch(repo_path));
+            compute_branch_diff(&repo, &branch, &mut diff_opts)?
         }
     };
 
     let mut files: Vec<FileDiff> = Vec::new();
     let mut current_file: Option<FileDiff> = None;
     let mut current_hunk: Option<Hunk> = None;
+    let mut current_hunk_header: String = String::new();
 
     diff.print(git2::DiffFormat::Patch, |delta: git2::DiffDelta<'_>, hunk_opt: Option<git2::DiffHunk<'_>>, line: git2::DiffLine<'_>| {
         let file_path = delta
@@ -139,22 +156,29 @@ pub fn compute_diff(repo_path: &Path, mode: DiffMode) -> Result<Vec<FileDiff>> {
                 additions: 0,
                 deletions: 0,
                 collapsed: false,
+                total_new_lines: 0,
+                sbs_cache: None,
             });
+            current_hunk_header.clear();
         }
 
-        // Handle hunk header
+        // Handle hunk header — git2 passes hunk_opt on every line in the hunk,
+        // so only create a new Hunk when the header actually changes.
         if let Some(hunk_info) = hunk_opt {
-            // Save previous hunk
-            if let Some(hunk) = current_hunk.take() {
-                if let Some(ref mut file) = current_file {
-                    file.hunks.push(hunk);
-                }
-            }
             let header = String::from_utf8_lossy(hunk_info.header()).trim().to_string();
-            current_hunk = Some(Hunk {
-                header,
-                lines: Vec::new(),
-            });
+            if header != current_hunk_header {
+                // New hunk — save the previous one
+                if let Some(hunk) = current_hunk.take() {
+                    if let Some(ref mut file) = current_file {
+                        file.hunks.push(hunk);
+                    }
+                }
+                current_hunk_header = header.clone();
+                current_hunk = Some(Hunk {
+                    header,
+                    lines: Vec::new(),
+                });
+            }
         }
 
         let content = String::from_utf8_lossy(line.content()).trim_end().to_string();
@@ -232,20 +256,56 @@ pub fn compute_diff(repo_path: &Path, mode: DiffMode) -> Result<Vec<FileDiff>> {
         }
     }
 
+    // Compute total_new_lines for expand indicators
+    for file in &mut files {
+        if file.status == FileStatus::Deleted {
+            continue;
+        }
+        let path = repo_path.join(&file.path);
+        if let Ok(content) = std::fs::read_to_string(&path) {
+            file.total_new_lines = content.lines().count();
+        }
+    }
+
     Ok(files)
 }
 
-fn find_base_branch(repo_path: &Path) -> String {
-    // Try Graphite first
-    if let Ok(output) = Command::new("gt")
+pub fn find_base_branch(repo_path: &Path) -> String {
+    // Try Graphite first (with timeout so it can't hang the UI)
+    if let Ok(mut child) = Command::new("gt")
         .arg("parent")
         .current_dir(repo_path)
-        .output()
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .stdin(std::process::Stdio::null())
+        .spawn()
     {
-        if output.status.success() {
-            let parent = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !parent.is_empty() {
-                return parent;
+        // Poll with a 2-second deadline
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if status.success() {
+                        if let Some(mut stdout) = child.stdout.take() {
+                            let mut buf = String::new();
+                            if std::io::Read::read_to_string(&mut stdout, &mut buf).is_ok() {
+                                let parent = buf.trim().to_string();
+                                if !parent.is_empty() {
+                                    return parent;
+                                }
+                            }
+                        }
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    if std::time::Instant::now() >= deadline {
+                        let _ = child.kill();
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(_) => break,
             }
         }
     }
@@ -270,12 +330,32 @@ fn compute_branch_diff<'a>(
     base_branch: &str,
     opts: &mut DiffOptions,
 ) -> Result<git2::Diff<'a>> {
-    let base_ref = repo
-        .find_branch(base_branch, git2::BranchType::Local)
-        .with_context(|| format!("Branch '{}' not found", base_branch))?;
-    let base_commit = base_ref.get().peel_to_commit()?;
-
     let head = repo.head()?.peel_to_commit()?;
+    let head_branch = repo.head().ok()
+        .and_then(|h| h.shorthand().map(|s| s.to_string()));
+
+    // If we're on the same branch as the base (e.g. on master, base=master),
+    // try diffing against the remote tracking branch to show unpushed commits.
+    let is_same_branch = head_branch.as_deref() == Some(base_branch);
+
+    let base_commit = if is_same_branch {
+        // Try remote tracking branch (e.g. origin/master)
+        let remote_name = format!("origin/{}", base_branch);
+        match repo.find_branch(&remote_name, git2::BranchType::Remote) {
+            Ok(remote_ref) => remote_ref.get().peel_to_commit()?,
+            Err(_) => {
+                // No remote — nothing meaningful to diff against
+                let head_tree = head.tree()?;
+                let diff = repo.diff_tree_to_tree(Some(&head_tree), Some(&head_tree), Some(opts))?;
+                return Ok(diff);
+            }
+        }
+    } else {
+        let base_ref = repo
+            .find_branch(base_branch, git2::BranchType::Local)
+            .with_context(|| format!("Branch '{}' not found", base_branch))?;
+        base_ref.get().peel_to_commit()?
+    };
 
     let merge_base = repo.merge_base(base_commit.id(), head.id())?;
     let merge_base_commit = repo.find_commit(merge_base)?;
