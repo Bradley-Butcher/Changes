@@ -16,7 +16,8 @@ It's also agent-agnostic. You shouldn't have to use a specific app or IDE just t
 
 - **Multi-repo tabs** — watch agent changes across repos simultaneously
 - **Three diff modes** — unstaged, staged, or branch diff (vs main / parent branch)
-- **Copy hunks** — double-click or press `y`, then paste back to your agent
+- **Annotate hunks** — right-click to add review comments, `Y` to copy all as markdown for your agent
+- **Copy hunks** — double-click or press `y`, includes any attached comments
 - **Expand context** — click gap indicators to reveal surrounding lines
 - **Graphite-compatible** — auto-detects parent branch via `gt parent`
 
@@ -69,6 +70,34 @@ changes /path/to/projects
 
 If you point it at a directory with multiple git repos, it opens them all in tabs. You can also add repos on the fly with `a`.
 
+## Example workflow
+
+1. Your agent is working across two repos. Run `changes /path/to/projects` — both open in tabs
+2. Scroll through the diff. See something wrong — right-click the hunk, type your feedback, `Ctrl+D` to save
+3. Keep reviewing. Add more comments to other hunks across files
+4. When you're done, press `Y` — all your comments get copied as markdown with the relevant code blocks
+5. Paste into your agent. It gets something like:
+
+```markdown
+### src/auth.rs:42-58
+> use env var instead of hardcoded API key
+
+\`\`\`diff
++  let key = "sk-1234567890";
++  client.set_api_key(key);
+\`\`\`
+
+### src/handler.rs:115-130
+> don't remove the try/catch, the API can 500
+
+\`\`\`diff
+-  let resp = client.call(req).await?;
++  let resp = client.call(req).await;
+\`\`\`
+```
+
+6. Your agent fixes the issues. `changes` live-reloads. Comments are cleared. Review again.
+
 ## Keybindings
 
 | Key | Action |
@@ -81,6 +110,11 @@ If you point it at a directory with multiple git repos, it opens them all in tab
 | `Enter` / Click header | Collapse / expand file |
 | `c` / `e` | Collapse / expand all |
 | `y` / Double-click | Copy hunk to clipboard |
+| Right-click / `n` | Add comment to hunk |
+| `N` | Remove comment from hunk |
+| `Y` | Copy all comments + hunks as markdown |
+| `C` | Open comments browser |
+| `D` | Clear all comments |
 | `a` / `x` | Add / remove repo tab |
 | `Tab` / `1`-`9` | Switch tabs |
 | Click gap indicator | Expand context |

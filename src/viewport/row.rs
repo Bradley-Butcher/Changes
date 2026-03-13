@@ -29,6 +29,12 @@ pub enum RowRef {
         gap_idx: usize,
         gap_after: usize,
     },
+    Comment {
+        file_idx: usize,
+        hunk_idx: usize,
+        /// Index within the wrapped comment text lines.
+        wrap_idx: usize,
+    },
     Blank {
         file_idx: usize,
     },
@@ -42,6 +48,7 @@ impl RowRef {
             | RowRef::UnifiedLine { file_idx, .. }
             | RowRef::SideBySideLine { file_idx, .. }
             | RowRef::GapTail { file_idx, .. }
+            | RowRef::Comment { file_idx, .. }
             | RowRef::Blank { file_idx } => file_idx,
         }
     }

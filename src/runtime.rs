@@ -172,7 +172,7 @@ async fn run_loop(
             needs_redraw = false;
         }
 
-        let tick_dur = if app.flash.is_some() {
+        let tick_dur = if !app.flash.is_empty() || app.status_message.is_some() {
             FLASH_TICK
         } else {
             IDLE_TICK
@@ -192,6 +192,16 @@ async fn run_loop(
         match event {
             AppEvent::Terminal(Event::Key(key)) => {
                 if key.kind != KeyEventKind::Press {
+                    continue;
+                }
+                if app.comment_input.is_some() {
+                    keys::handle_comment_input_key(app, key);
+                    needs_redraw = true;
+                    continue;
+                }
+                if app.comment_browser.is_some() {
+                    keys::handle_comment_browser_key(app, key);
+                    needs_redraw = true;
                     continue;
                 }
                 if app.file_picker.is_some() {
@@ -307,10 +317,15 @@ async fn run_loop(
             }
             AppEvent::Tick => {
                 let now = Instant::now();
-                if let Some(ref flash) = app.flash
-                    && now >= flash.until
+                let before = app.flash.len();
+                app.flash.retain(|f| now < f.until);
+                if app.flash.len() != before {
+                    needs_redraw = true;
+                }
+                if let Some((_, until)) = app.status_message
+                    && now >= until
                 {
-                    app.flash = None;
+                    app.status_message = None;
                     needs_redraw = true;
                 }
             }

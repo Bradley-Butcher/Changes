@@ -1,4 +1,4 @@
-use super::{App, DOUBLE_CLICK_MS, DiffResult, GapExpandResult, SCROLL_SPEED};
+use super::{App, CommentInputState, DOUBLE_CLICK_MS, DiffResult, GapExpandResult, SCROLL_SPEED};
 use crate::viewport::RowRef;
 use arboard::Clipboard;
 use crossterm::event::{self, MouseButton, MouseEventKind};
@@ -121,6 +121,46 @@ pub fn handle_mouse(
             {
                 let _ = clipboard.set_text(text);
             }
+            true
+        }
+        MouseEventKind::Down(MouseButton::Right) => {
+            // Right-click on a hunk to add/edit a comment
+            if app.comment_input.is_some()
+                || app.file_picker.is_some()
+                || app.repo_adder.is_some()
+                || app.comment_browser.is_some()
+            {
+                return false;
+            }
+            if mouse.row < app.layout.content_y {
+                return false;
+            }
+            let content_row = (mouse.row as usize).saturating_sub(app.layout.content_y as usize)
+                + app.current_scroll_offset();
+
+            app.prepare_active_layout();
+            let Some((file_idx, hunk_idx)) = app
+                .current_layout()
+                .and_then(|layout| layout.hunk_at_row(content_row))
+            else {
+                return false;
+            };
+
+            let anchor_row = content_row;
+
+            let existing_text = app
+                .find_comment(file_idx, hunk_idx)
+                .map(|c| c.text.clone())
+                .unwrap_or_default();
+            let cursor_pos = existing_text.len();
+
+            app.comment_input = Some(CommentInputState {
+                file_idx,
+                hunk_idx,
+                text: existing_text,
+                cursor_pos,
+                anchor_row,
+            });
             true
         }
         // Ignore move/release/drag — no state change, no redraw
