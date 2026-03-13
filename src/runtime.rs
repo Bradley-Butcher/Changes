@@ -1,4 +1,4 @@
-use crate::app::{App, BaseBranchResult, DiffResult};
+use crate::app::{App, BaseBranchResult, DiffResult, GapExpandResult};
 use crate::git::{self, DiffMode};
 use crate::highlight::Highlighter;
 use crate::ui::{self, LayoutHints};
@@ -29,6 +29,7 @@ enum AppEvent {
     FileChange(WatchEvent),
     DiffDone(DiffResult),
     BaseBranch(BaseBranchResult),
+    GapExpanded(GapExpandResult),
     Tick,
 }
 
@@ -39,6 +40,8 @@ struct Channels {
     diff_tx: mpsc::UnboundedSender<DiffResult>,
     base_rx: mpsc::UnboundedReceiver<BaseBranchResult>,
     base_tx: mpsc::UnboundedSender<BaseBranchResult>,
+    gap_rx: mpsc::UnboundedReceiver<GapExpandResult>,
+    gap_tx: mpsc::UnboundedSender<GapExpandResult>,
 }
 
 fn restore_terminal() {
@@ -96,6 +99,7 @@ pub async fn run(path: PathBuf) -> Result<()> {
 
     let (diff_tx, diff_rx) = mpsc::unbounded_channel::<DiffResult>();
     let (base_tx, base_rx) = mpsc::unbounded_channel::<BaseBranchResult>();
+    let (gap_tx, gap_rx) = mpsc::unbounded_channel::<GapExpandResult>();
 
     // Resolve base branches + branch names in background at startup
     for repo in app.repos.iter() {
@@ -119,6 +123,8 @@ pub async fn run(path: PathBuf) -> Result<()> {
         diff_tx,
         base_rx,
         base_tx,
+        gap_rx,
+        gap_tx,
     };
 
     run_loop(
@@ -179,6 +185,7 @@ async fn run_loop(
             Some(ev) = ch.watch_rx.recv() => AppEvent::FileChange(ev),
             Some(ev) = ch.diff_rx.recv() => AppEvent::DiffDone(ev),
             Some(ev) = ch.base_rx.recv() => AppEvent::BaseBranch(ev),
+            Some(ev) = ch.gap_rx.recv() => AppEvent::GapExpanded(ev),
             () = &mut tick_sleep => AppEvent::Tick,
         };
 
@@ -245,7 +252,7 @@ async fn run_loop(
                 needs_redraw = true;
             }
             AppEvent::Terminal(Event::Mouse(m)) => {
-                if mouse::handle_mouse(app, m, &ch.diff_tx) {
+                if mouse::handle_mouse(app, m, &ch.diff_tx, &ch.gap_tx) {
                     needs_redraw = true;
                 }
             }
@@ -293,6 +300,10 @@ async fn run_loop(
                         app.refresh_repo_async(idx, &ch.diff_tx);
                     }
                 }
+            }
+            AppEvent::GapExpanded(result) => {
+                app.apply_gap_expand(result);
+                needs_redraw = true;
             }
             AppEvent::Tick => {
                 let now = Instant::now();

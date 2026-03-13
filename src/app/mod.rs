@@ -386,28 +386,22 @@ impl App {
         }
     }
 
-    pub fn expand_gap(&mut self, file_idx: usize, gap_idx: usize) {
-        let repo_path = self.repos[self.active_tab].info.path.clone();
-        let file = match self
-            .repos
-            .get_mut(self.active_tab)
-            .and_then(|r| r.files.get_mut(file_idx))
-        {
-            Some(f) => f,
-            None => return,
-        };
+    /// Start an async gap expansion. Returns parameters for the background file read,
+    /// or None if the gap is already closed or the indices are invalid.
+    pub fn start_expand_gap(&self, file_idx: usize, gap_idx: usize) -> Option<GapExpandRequest> {
+        let repo = self.repos.get(self.active_tab)?;
+        let file = repo.files.get(file_idx)?;
         if file.hunks.is_empty() {
-            return;
+            return None;
         }
 
         const EXPAND_AMOUNT: usize = 20;
 
-        // Compute the line range we need (1-based) without reading the file yet
         let (gap_start, gap_end, old_offset) = if gap_idx == 0 {
             let first_new = file.hunks[0].first_new_lineno().unwrap_or(1) as usize;
             let first_old = file.hunks[0].first_old_lineno().unwrap_or(1) as usize;
             if first_new <= 1 {
-                return;
+                return None;
             }
             let end = first_new - 1;
             let start = end.saturating_sub(EXPAND_AMOUNT - 1).max(1);
@@ -418,7 +412,7 @@ impl App {
             let prev_last_old = file.hunks[prev_idx].last_old_lineno().unwrap_or(0) as usize;
             let next_first_new = file.hunks[gap_idx].first_new_lineno().unwrap_or(0) as usize;
             if prev_last_new >= next_first_new.saturating_sub(1) {
-                return;
+                return None;
             }
             let start = prev_last_new + 1;
             let end = (next_first_new - 1).min(start + EXPAND_AMOUNT - 1);
@@ -428,37 +422,42 @@ impl App {
             let last_new = file.hunks[last_idx].last_new_lineno().unwrap_or(0) as usize;
             let last_old = file.hunks[last_idx].last_old_lineno().unwrap_or(0) as usize;
             if last_new >= file.total_new_lines {
-                return;
+                return None;
             }
             let start = last_new + 1;
             let end = file.total_new_lines.min(start + EXPAND_AMOUNT - 1);
             (start, end, last_old as i64 - last_new as i64)
         };
 
-        // Read only the lines we need via BufRead (skip + take)
-        let file_path = repo_path.join(&file.path);
-        let f = match std::fs::File::open(&file_path) {
-            Ok(f) => f,
-            Err(_) => return,
-        };
-        use std::io::BufRead;
-        let context_lines: Vec<DiffLine> = std::io::BufReader::new(f)
-            .lines()
-            .skip(gap_start - 1)
-            .take(gap_end - gap_start + 1)
-            .enumerate()
-            .map(|(offset, line)| {
-                let lineno = gap_start + offset;
-                DiffLine {
-                    kind: LineKind::Context,
-                    content: line.unwrap_or_default(),
-                    old_lineno: Some((lineno as i64 + old_offset) as u32),
-                    new_lineno: Some(lineno as u32),
-                }
-            })
-            .collect();
+        Some(GapExpandRequest {
+            repo_id: repo.id,
+            file_idx,
+            gap_idx,
+            file_path: repo.info.path.join(&file.path),
+            gap_start,
+            gap_end,
+            old_offset,
+        })
+    }
 
-        // Apply to the appropriate hunk
+    /// Apply the result of a background gap expansion.
+    pub fn apply_gap_expand(&mut self, result: GapExpandResult) {
+        let idx = match self.find_repo(result.repo_id) {
+            Some(i) => i,
+            None => return,
+        };
+        let file = match self
+            .repos
+            .get_mut(idx)
+            .and_then(|r| r.files.get_mut(result.file_idx))
+        {
+            Some(f) => f,
+            None => return,
+        };
+
+        let context_lines = result.lines;
+        let gap_idx = result.gap_idx;
+
         if gap_idx == 0 {
             let mut existing = std::mem::take(&mut file.hunks[0].lines);
             let mut new_lines = context_lines;
@@ -471,11 +470,12 @@ impl App {
             file.hunks[last_idx].lines.extend(context_lines);
         }
 
-        // Invalidate SBS cache — will be recomputed on demand before next draw
         file.sbs_cache = None;
-        self.invalidate_layouts(self.active_tab);
-        self.prepare_active_layout();
-        self.clamp_active_viewport();
+        self.invalidate_layouts(idx);
+        if idx == self.active_tab {
+            self.prepare_active_layout();
+            self.clamp_active_viewport();
+        }
     }
 
     pub fn refresh_repo_adder_results(&mut self) {
@@ -791,6 +791,54 @@ pub struct BaseBranchResult {
     pub repo_id: u64,
     pub branch: Option<String>,
     pub branch_name: Option<String>,
+}
+
+pub struct GapExpandRequest {
+    pub repo_id: u64,
+    pub file_idx: usize,
+    pub gap_idx: usize,
+    pub file_path: PathBuf,
+    pub gap_start: usize,
+    pub gap_end: usize,
+    pub old_offset: i64,
+}
+
+pub struct GapExpandResult {
+    pub repo_id: u64,
+    pub file_idx: usize,
+    pub gap_idx: usize,
+    pub lines: Vec<DiffLine>,
+}
+
+impl GapExpandRequest {
+    /// Read the file lines in a background thread. This is the blocking part.
+    pub fn execute(self) -> GapExpandResult {
+        use std::io::BufRead;
+        let lines = match std::fs::File::open(&self.file_path) {
+            Ok(f) => std::io::BufReader::new(f)
+                .lines()
+                .skip(self.gap_start - 1)
+                .take(self.gap_end - self.gap_start + 1)
+                .enumerate()
+                .map(|(offset, line)| {
+                    let lineno = self.gap_start + offset;
+                    DiffLine {
+                        kind: LineKind::Context,
+                        content: line.unwrap_or_default(),
+                        old_lineno: Some((lineno as i64 + self.old_offset) as u32),
+                        new_lineno: Some(lineno as u32),
+                    }
+                })
+                .collect(),
+            Err(_) => Vec::new(),
+        };
+        GapExpandResult {
+            repo_id: self.repo_id,
+            file_idx: self.file_idx,
+            gap_idx: self.gap_idx,
+            lines,
+        }
+    }
 }
 
 #[cfg(test)]

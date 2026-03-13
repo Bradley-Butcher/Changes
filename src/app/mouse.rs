@@ -1,4 +1,4 @@
-use super::{App, DOUBLE_CLICK_MS, DiffResult, SCROLL_SPEED};
+use super::{App, DOUBLE_CLICK_MS, DiffResult, GapExpandResult, SCROLL_SPEED};
 use crate::viewport::RowRef;
 use arboard::Clipboard;
 use crossterm::event::{self, MouseButton, MouseEventKind};
@@ -10,6 +10,7 @@ pub fn handle_mouse(
     app: &mut App,
     mouse: event::MouseEvent,
     diff_tx: &mpsc::UnboundedSender<DiffResult>,
+    gap_tx: &mpsc::UnboundedSender<GapExpandResult>,
 ) -> bool {
     match mouse.kind {
         MouseEventKind::ScrollUp => {
@@ -83,13 +84,18 @@ pub fn handle_mouse(
             let content_row = (click_row as usize).saturating_sub(app.layout.content_y as usize)
                 + app.current_scroll_offset();
 
-            // Check for expand row click (gap between hunks)
+            // Check for expand row click (gap between hunks) — async
             app.prepare_active_layout();
             if let Some((file_idx, gap_idx)) = app
                 .current_layout()
                 .and_then(|layout| layout.expand_gap_at_row(content_row))
             {
-                app.expand_gap(file_idx, gap_idx);
+                if let Some(req) = app.start_expand_gap(file_idx, gap_idx) {
+                    let tx = gap_tx.clone();
+                    std::thread::spawn(move || {
+                        let _ = tx.send(req.execute());
+                    });
+                }
                 return true;
             }
 

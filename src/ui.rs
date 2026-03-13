@@ -12,6 +12,8 @@ use ratatui::widgets::{
 
 const BG_ADD: Color = Color::Rgb(30, 60, 30);
 const BG_DEL: Color = Color::Rgb(60, 30, 30);
+const BG_ADD_EMPH: Color = Color::Rgb(40, 90, 40);
+const BG_DEL_EMPH: Color = Color::Rgb(90, 40, 40);
 const FG_ADD: Color = Color::Rgb(100, 220, 100);
 const FG_DEL: Color = Color::Rgb(220, 100, 100);
 const FG_HUNK: Color = Color::Rgb(130, 170, 220);
@@ -397,11 +399,13 @@ fn draw_side_by_side(
                 };
                 left_lines.push(build_sbs_line(
                     &sbs_line.left,
+                    &sbs_line.left_changed,
                     &file.path,
                     highlighter,
                 ));
                 right_lines.push(build_sbs_line(
                     &sbs_line.right,
+                    &sbs_line.right_changed,
                     &file.path,
                     highlighter,
                 ));
@@ -480,6 +484,7 @@ fn build_unified_line<'a>(
 
 fn build_sbs_line<'a>(
     line_opt: &Option<crate::diff::DiffLine>,
+    changed_ranges: &Option<crate::diff::ChangedRanges>,
     file_path: &str,
     highlighter: &Highlighter,
 ) -> Line<'a> {
@@ -504,8 +509,24 @@ fn build_sbs_line<'a>(
             };
 
             let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
+
+            // Always syntax-highlight first
             let mut highlighted =
                 highlighter.highlight_line_content(&line.content, file_path, bg);
+
+            // If we have inline diff ranges, overlay emphasized bg on changed characters
+            if let Some(ranges) = changed_ranges {
+                let emph_bg = match line.kind {
+                    LineKind::Addition => BG_ADD_EMPH,
+                    LineKind::Deletion => BG_DEL_EMPH,
+                    _ => {
+                        spans.append(&mut highlighted.spans);
+                        return Line::from(spans);
+                    }
+                };
+                apply_inline_emphasis(&mut highlighted.spans, ranges, emph_bg);
+            }
+
             spans.append(&mut highlighted.spans);
             Line::from(spans)
         }
@@ -637,6 +658,63 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
     spans.push(Span::styled(" ".repeat(right_pad), Style::default().bg(bg)));
 
     Line::from(spans)
+}
+
+/// Overlay emphasized background on syntax-highlighted spans at the given byte ranges.
+/// Splits spans at range boundaries so only the changed characters get the brighter bg.
+fn apply_inline_emphasis(spans: &mut Vec<Span<'_>>, ranges: &[(usize, usize)], emph_bg: Color) {
+    let mut new_spans: Vec<Span<'_>> = Vec::new();
+    let mut byte_offset = 0usize;
+
+    for span in spans.drain(..) {
+        let span_start = byte_offset;
+        let span_len = span.content.len();
+        let span_end = span_start + span_len;
+        let base_style = span.style;
+
+        let mut pos = 0; // position within this span's content
+
+        for &(range_start, range_end) in ranges {
+            // Skip ranges that don't overlap this span
+            if range_end <= span_start || range_start >= span_end {
+                continue;
+            }
+
+            // Clamp range to this span
+            let local_start = range_start.saturating_sub(span_start).min(span_len);
+            let local_end = range_end.saturating_sub(span_start).min(span_len);
+
+            // Emit normal portion before this range
+            if pos < local_start {
+                new_spans.push(Span::styled(
+                    span.content[pos..local_start].to_string(),
+                    base_style,
+                ));
+            }
+
+            // Emit emphasized portion
+            if local_start < local_end {
+                new_spans.push(Span::styled(
+                    span.content[local_start..local_end].to_string(),
+                    base_style.bg(emph_bg),
+                ));
+            }
+
+            pos = local_end;
+        }
+
+        // Emit remaining normal portion
+        if pos < span_len {
+            new_spans.push(Span::styled(
+                span.content[pos..].to_string(),
+                base_style,
+            ));
+        }
+
+        byte_offset = span_end;
+    }
+
+    *spans = new_spans;
 }
 
 /// Extract the function context from a hunk header like `@@ -10,5 +10,7 @@ fn foo()`.
