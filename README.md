@@ -1,20 +1,20 @@
 # changes
 
-A fast, live-updating terminal UI for visualizing git diffs. Watches your repo for changes and refreshes instantly — no need to re-run commands.
+See what your AI agent is actually doing to your code — in real time.
 
-## Features
+`changes` is a terminal UI for reviewing git diffs live. It watches your repos and refreshes instantly as files change. No IDE required, no re-running commands. Just run `changes` and watch.
 
-- **Live reload** — file watcher triggers instant diff refresh on save
-- **Three diff modes** — unstaged (modified), staged, and branch diff (vs base branch)
-- **Unified and side-by-side views** — toggle with `v`
-- **Word-level inline diff** — highlights exactly which words changed within modified lines
-- **Syntax highlighting** — language-aware coloring via syntect
-- **Multi-repo support** — watch multiple repos in tabs, add/remove dynamically
-- **Hunk expansion** — click gap indicators to reveal surrounding context
-- **Fuzzy file picker** — press `f` to jump to any changed file
-- **Graphite integration** — auto-detects parent branch via `gt parent`
-- **Copy hunks** — press `y` to copy the focused hunk to clipboard
-- **Collapse/expand** — toggle individual files or collapse/expand all
+Built for the workflow where your agent writes code and you audit it. Think of it as a better `lazygit` where the focus is purely on *what changed* — not staging, committing, or pushing. You do that through your agent. This is your review pane.
+
+## Why
+
+If you're terminal-first with Claude Code, Cursor, Copilot, or similar — and you haven't opened your IDE in a while — you're missing the ability to see all changes at a glance as they happen. `changes` fills that gap.
+
+- Watch agent changes across **multiple repos** in tabs
+- See **unstaged**, **staged**, or **branch diff** (vs main / parent branch)
+- **Copy hunks** with a double-click and paste them back to your agent
+- **Expand context** around changes — like GitHub, but better
+- **Graphite-compatible** — auto-detects parent branch via `gt parent`
 
 ## Install
 
@@ -51,7 +51,7 @@ cargo install --path .
 ## Usage
 
 ```sh
-# Watch the current directory
+# Watch the current directory (auto-discovers repos)
 changes
 
 # Watch a specific repo
@@ -61,62 +61,33 @@ changes /path/to/repo
 changes /path/to/projects
 ```
 
+If you point it at a directory with multiple git repos, it opens them all in tabs. You can also add repos on the fly with `a`.
+
 ## Keybindings
 
-### Navigation
-
 | Key | Action |
 |-----|--------|
-| `j` / `k` / `Up` / `Down` | Scroll line by line |
-| `J` / `K` | Jump to previous / next file |
-| `g` / `G` | Jump to top / bottom |
-| `PgUp` / `PgDn` | Scroll by page |
-| Mouse scroll | Scroll |
-
-### Tabs
-
-| Key | Action |
-|-----|--------|
-| `1`-`9` | Switch to tab N |
-| `Tab` / `Shift+Tab` | Cycle tabs |
-| Click tab | Switch to tab |
-
-### Modes & Views
-
-| Key | Action |
-|-----|--------|
-| `m` | Modified (unstaged) diff |
-| `s` | Staged diff |
-| `b` | Branch diff (vs base) |
-| `v` | Toggle unified / side-by-side |
-
-### Actions
-
-| Key | Action |
-|-----|--------|
-| `a` | Add a repo to watch |
-| `x` | Remove current repo tab |
+| `m` / `s` / `b` | Switch mode: modified, staged, branch diff |
+| `v` | Toggle unified / side-by-side view |
+| `j` / `k` | Scroll |
+| `J` / `K` | Jump to next / previous file |
 | `f` | Fuzzy file picker |
-| `Enter` / Click header | Toggle collapse file |
-| `c` / `e` | Collapse / expand all files |
-| `y` | Copy focused hunk to clipboard |
-| `?` | Toggle help overlay |
-| `q` / `Esc` | Quit |
+| `Enter` / Click header | Collapse / expand file |
+| `c` / `e` | Collapse / expand all |
+| `y` / Double-click | Copy hunk to clipboard |
+| `a` / `x` | Add / remove repo tab |
+| `Tab` / `1`-`9` | Switch tabs |
+| Click gap indicator | Expand context |
+| `?` | Help |
+| `q` | Quit |
 
 ## Development
 
 ```sh
-# Run all checks (fmt, clippy, test, build)
-make check
-
-# Auto-fix formatting and lint issues
-make fix
-
-# Run tests only
-make test
-
-# Build release binary
-make release
+make check   # fmt, clippy, test, build
+make fix     # auto-fix formatting and lint
+make test    # tests only
+make release # optimized build
 ```
 
 ## License

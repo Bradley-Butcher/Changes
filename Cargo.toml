@@ -2,7 +2,7 @@
 name = "changes"
 version = "0.1.0"
 edition = "2024"
-description = "A live-updating terminal UI for visualizing git diffs"
+description = "See what your AI agent is doing to your code — live git diff viewer"
 license = "MIT"
 repository = "https://github.com/Bradley-Butcher/Changes"
 keywords = ["git", "diff", "tui", "terminal"]
