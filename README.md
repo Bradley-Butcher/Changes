@@ -70,6 +70,34 @@ changes /path/to/projects
 
 If you point it at a directory with multiple git repos, it opens them all in tabs. You can also add repos on the fly with `a`.
 
+## Example workflow
+
+1. Your agent is working across two repos. Run `changes /path/to/projects` — both open in tabs
+2. Scroll through the diff. See something wrong — right-click the hunk, type your feedback, `Ctrl+D` to save
+3. Keep reviewing. Add more comments to other hunks across files
+4. When you're done, press `Y` — all your comments get copied as markdown with the relevant code blocks
+5. Paste into your agent. It gets something like:
+
+```markdown
+### src/auth.rs:42-58
+> use env var instead of hardcoded API key
+
+\`\`\`diff
++  let key = "sk-1234567890";
++  client.set_api_key(key);
+\`\`\`
+
+### src/handler.rs:115-130
+> don't remove the try/catch, the API can 500
+
+\`\`\`diff
+-  let resp = client.call(req).await?;
++  let resp = client.call(req).await;
+\`\`\`
+```
+
+6. Your agent fixes the issues. `changes` live-reloads. Comments are cleared. Review again.
+
 ## Keybindings
 
 | Key | Action |
