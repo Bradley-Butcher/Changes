@@ -338,7 +338,6 @@ impl App {
         self.focused_file = self.focused_file_from_scroll();
     }
 
-
     /// Returns indices of files matching the picker query (case-insensitive fuzzy substring).
     pub fn filtered_file_indices(&self) -> Vec<usize> {
         let files = match self.current_files() {
@@ -705,9 +704,7 @@ impl App {
 
     pub fn is_hunk_flashing(&self, file_idx: usize, hunk_idx: usize) -> bool {
         if let Some(ref flash) = self.flash {
-            Instant::now() < flash.until
-                && flash.file_idx == file_idx
-                && flash.hunk_idx == hunk_idx
+            Instant::now() < flash.until && flash.file_idx == file_idx && flash.hunk_idx == hunk_idx
         } else {
             false
         }

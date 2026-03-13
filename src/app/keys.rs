@@ -1,4 +1,4 @@
-use super::{App, DiffResult, FilePickerState, RepoAdderState, PAGE_SCROLL};
+use super::{App, DiffResult, FilePickerState, PAGE_SCROLL, RepoAdderState};
 use crate::git::DiffMode;
 use arboard::Clipboard;
 use crossterm::event::{self, KeyCode, KeyModifiers};

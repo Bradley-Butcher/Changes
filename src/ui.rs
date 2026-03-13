@@ -211,7 +211,6 @@ fn draw_unified(
     let visible_rows = app.visible_row_range(total_lines, visible_height);
     let mut lines: Vec<Line> = Vec::new();
 
-
     for row in visible_rows {
         let Some(row_ref) = layout.row(row) else {
             continue;
@@ -328,7 +327,6 @@ fn draw_side_by_side(
     let visible_height = inner_area.height as usize;
     let total_lines = layout.total_lines();
     let visible_rows = app.visible_row_range(total_lines, visible_height);
-
 
     let mut left_lines: Vec<Line> = Vec::new();
     let mut right_lines: Vec<Line> = Vec::new();
@@ -511,8 +509,7 @@ fn build_sbs_line<'a>(
             let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
 
             // Always syntax-highlight first
-            let mut highlighted =
-                highlighter.highlight_line_content(&line.content, file_path, bg);
+            let mut highlighted = highlighter.highlight_line_content(&line.content, file_path, bg);
 
             // If we have inline diff ranges, overlay emphasized bg on changed characters
             if let Some(ranges) = changed_ranges {
@@ -705,10 +702,7 @@ fn apply_inline_emphasis(spans: &mut Vec<Span<'_>>, ranges: &[(usize, usize)], e
 
         // Emit remaining normal portion
         if pos < span_len {
-            new_spans.push(Span::styled(
-                span.content[pos..].to_string(),
-                base_style,
-            ));
+            new_spans.push(Span::styled(span.content[pos..].to_string(), base_style));
         }
 
         byte_offset = span_end;

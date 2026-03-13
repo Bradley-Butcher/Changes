@@ -127,8 +127,14 @@ fn align_hunk_lines(hunk: &Hunk) -> Vec<SideBySideLine> {
         .filter(|l| l.kind == LineKind::Context || l.kind == LineKind::Addition)
         .collect();
 
-    let old_text: String = old_lines.iter().map(|l| format!("{}\n", l.content)).collect();
-    let new_text: String = new_lines.iter().map(|l| format!("{}\n", l.content)).collect();
+    let old_text: String = old_lines
+        .iter()
+        .map(|l| format!("{}\n", l.content))
+        .collect();
+    let new_text: String = new_lines
+        .iter()
+        .map(|l| format!("{}\n", l.content))
+        .collect();
 
     let diff = TextDiff::from_lines(&old_text, &new_text);
     let mut result = Vec::new();
@@ -137,28 +143,27 @@ fn align_hunk_lines(hunk: &Hunk) -> Vec<SideBySideLine> {
     let mut pending_dels: Vec<&DiffLine> = Vec::new();
     let mut pending_adds: Vec<&DiffLine> = Vec::new();
 
-    let flush_pending = |result: &mut Vec<SideBySideLine>,
-                         dels: &mut Vec<&DiffLine>,
-                         adds: &mut Vec<&DiffLine>| {
-        let max_len = dels.len().max(adds.len());
-        for j in 0..max_len {
-            let left = dels.get(j).map(|l| (*l).clone());
-            let right = adds.get(j).map(|l| (*l).clone());
-            let (left_changed, right_changed) = if let (Some(l), Some(r)) = (&left, &right) {
-                compute_inline_diff(&l.content, &r.content)
-            } else {
-                (None, None)
-            };
-            result.push(SideBySideLine {
-                left,
-                right,
-                left_changed,
-                right_changed,
-            });
-        }
-        dels.clear();
-        adds.clear();
-    };
+    let flush_pending =
+        |result: &mut Vec<SideBySideLine>, dels: &mut Vec<&DiffLine>, adds: &mut Vec<&DiffLine>| {
+            let max_len = dels.len().max(adds.len());
+            for j in 0..max_len {
+                let left = dels.get(j).map(|l| (*l).clone());
+                let right = adds.get(j).map(|l| (*l).clone());
+                let (left_changed, right_changed) = if let (Some(l), Some(r)) = (&left, &right) {
+                    compute_inline_diff(&l.content, &r.content)
+                } else {
+                    (None, None)
+                };
+                result.push(SideBySideLine {
+                    left,
+                    right,
+                    left_changed,
+                    right_changed,
+                });
+            }
+            dels.clear();
+            adds.clear();
+        };
 
     for change in diff.iter_all_changes() {
         match change.tag() {
@@ -190,10 +195,7 @@ fn align_hunk_lines(hunk: &Hunk) -> Vec<SideBySideLine> {
 
 /// Compute word-level diff between two lines.
 /// Returns byte ranges of changed words in each line.
-fn compute_inline_diff(
-    old: &str,
-    new: &str,
-) -> (Option<ChangedRanges>, Option<ChangedRanges>) {
+fn compute_inline_diff(old: &str, new: &str) -> (Option<ChangedRanges>, Option<ChangedRanges>) {
     if old == new {
         return (None, None);
     }
