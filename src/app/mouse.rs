@@ -135,8 +135,7 @@ pub fn handle_mouse(
             if mouse.row < app.layout.content_y {
                 return false;
             }
-            let content_row = (mouse.row as usize)
-                .saturating_sub(app.layout.content_y as usize)
+            let content_row = (mouse.row as usize).saturating_sub(app.layout.content_y as usize)
                 + app.current_scroll_offset();
 
             app.prepare_active_layout();

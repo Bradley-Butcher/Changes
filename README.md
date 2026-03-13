@@ -16,7 +16,8 @@ It's also agent-agnostic. You shouldn't have to use a specific app or IDE just t
 
 - **Multi-repo tabs** — watch agent changes across repos simultaneously
 - **Three diff modes** — unstaged, staged, or branch diff (vs main / parent branch)
-- **Copy hunks** — double-click or press `y`, then paste back to your agent
+- **Annotate hunks** — right-click to add review comments, `Y` to copy all as markdown for your agent
+- **Copy hunks** — double-click or press `y`, includes any attached comments
 - **Expand context** — click gap indicators to reveal surrounding lines
 - **Graphite-compatible** — auto-detects parent branch via `gt parent`
 
@@ -81,6 +82,11 @@ If you point it at a directory with multiple git repos, it opens them all in tab
 | `Enter` / Click header | Collapse / expand file |
 | `c` / `e` | Collapse / expand all |
 | `y` / Double-click | Copy hunk to clipboard |
+| Right-click / `n` | Add comment to hunk |
+| `N` | Remove comment from hunk |
+| `Y` | Copy all comments + hunks as markdown |
+| `C` | Open comments browser |
+| `D` | Clear all comments |
 | `a` / `x` | Add / remove repo tab |
 | `Tab` / `1`-`9` | Switch tabs |
 | Click gap indicator | Expand context |

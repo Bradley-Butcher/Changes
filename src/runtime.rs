@@ -323,10 +323,11 @@ async fn run_loop(
                     needs_redraw = true;
                 }
                 if let Some((_, until)) = app.status_message
-                    && now >= until {
-                        app.status_message = None;
-                        needs_redraw = true;
-                    }
+                    && now >= until
+                {
+                    app.status_message = None;
+                    needs_redraw = true;
+                }
             }
         }
     }

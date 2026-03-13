@@ -1427,9 +1427,7 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
                     .bg(FG_COMMENT)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default()
-                    .fg(FG_COMMENT)
-                    .bg(Color::Rgb(30, 30, 20))
+                Style::default().fg(FG_COMMENT).bg(Color::Rgb(30, 30, 20))
             };
 
             lines.push(Line::from(Span::styled(
@@ -1439,13 +1437,9 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
 
             // Show comment text
             let text_style = if is_selected {
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(40, 40, 30))
+                Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 30))
             } else {
-                Style::default()
-                    .fg(Color::White)
-                    .bg(Color::Rgb(30, 30, 20))
+                Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 20))
             };
 
             for text_line in c.text.lines() {
@@ -1472,10 +1466,11 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
                 break;
             }
             // Count comment headers (lines starting with checkbox)
-            if lines
-                .get(i)
-                .is_some_and(|l| l.spans.first().is_some_and(|s| s.content.contains("[x]") || s.content.contains("[ ]")))
-            {
+            if lines.get(i).is_some_and(|l| {
+                l.spans
+                    .first()
+                    .is_some_and(|s| s.content.contains("[x]") || s.content.contains("[ ]"))
+            }) {
                 comment_count += 1;
             }
         }

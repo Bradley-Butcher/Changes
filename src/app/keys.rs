@@ -185,8 +185,7 @@ pub fn handle_key(
                     let _ = clipboard.set_text(text);
                 }
                 // Flash all commented hunks
-                let now = std::time::Instant::now()
-                    + std::time::Duration::from_millis(300);
+                let now = std::time::Instant::now() + std::time::Duration::from_millis(300);
                 if let Some(repo) = app.repos.get(app.active_tab) {
                     let flashes: Vec<FlashState> = repo
                         .comments
@@ -205,11 +204,7 @@ pub fn handle_key(
                     .map(|r| r.comments.len())
                     .unwrap_or(0);
                 app.status_message = Some((
-                    format!(
-                        "Copied {} note{}",
-                        count,
-                        if count == 1 { "" } else { "s" }
-                    ),
+                    format!("Copied {} note{}", count, if count == 1 { "" } else { "s" }),
                     std::time::Instant::now() + std::time::Duration::from_millis(300),
                 ));
             }
@@ -398,10 +393,11 @@ pub fn handle_comment_input_key(app: &mut App, key: event::KeyEvent) {
         }
         KeyCode::Backspace => {
             if let Some(ref mut input) = app.comment_input
-                && input.cursor_pos > 0 {
-                    input.cursor_pos -= 1;
-                    input.text.remove(input.cursor_pos);
-                }
+                && input.cursor_pos > 0
+            {
+                input.cursor_pos -= 1;
+                input.text.remove(input.cursor_pos);
+            }
         }
         KeyCode::Left => {
             if let Some(ref mut input) = app.comment_input {

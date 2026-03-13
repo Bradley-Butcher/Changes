@@ -881,7 +881,11 @@ impl App {
         self.invalidate_layouts(self.active_tab);
         if count > 0 {
             self.status_message = Some((
-                format!("Cleared {} note{}", count, if count == 1 { "" } else { "s" }),
+                format!(
+                    "Cleared {} note{}",
+                    count,
+                    if count == 1 { "" } else { "s" }
+                ),
                 Instant::now() + FLASH_DURATION,
             ));
         }
@@ -966,9 +970,7 @@ impl App {
         files.get(file_idx)?;
 
         self.current_layout()
-            .and_then(|layout| {
-                layout.hunk_at_or_after_row(self.current_scroll_offset(), file_idx)
-            })
+            .and_then(|layout| layout.hunk_at_or_after_row(self.current_scroll_offset(), file_idx))
             .or_else(|| {
                 // If no hunk at scroll offset, try first hunk of focused file
                 let files = self.current_files()?;

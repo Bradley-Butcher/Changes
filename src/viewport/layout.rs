@@ -25,7 +25,10 @@ impl DiffLayout {
         let comment_width = content_width.saturating_sub(4).max(20);
         let mut comment_lines: HashMap<(usize, usize), Vec<String>> = HashMap::new();
         for c in comments {
-            comment_lines.insert((c.file_idx, c.hunk_idx), wrap_comment(&c.text, comment_width));
+            comment_lines.insert(
+                (c.file_idx, c.hunk_idx),
+                wrap_comment(&c.text, comment_width),
+            );
         }
 
         for (file_idx, file) in files.iter().enumerate() {
