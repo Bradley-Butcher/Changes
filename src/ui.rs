@@ -27,6 +27,7 @@ const FG_STATUS_D: Color = Color::Rgb(220, 100, 100);
 const FG_STATUS_R: Color = Color::Rgb(130, 170, 220);
 const FG_PATH_DIR: Color = Color::Rgb(140, 140, 160);
 const FG_PATH_FILE: Color = Color::Rgb(240, 240, 250);
+const FG_COMMENT: Color = Color::Rgb(220, 180, 60);
 
 /// Layout positions computed during rendering, needed for mouse hit-testing.
 /// Kept separate from App so `draw()` doesn't require `&mut App`.
@@ -38,6 +39,7 @@ pub struct LayoutHints {
     pub status_bar_row: u16,
     pub content_y: u16,
     pub content_height: u16,
+    pub content_width: u16,
 }
 
 pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut LayoutHints) {
@@ -54,12 +56,17 @@ pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut
     let diff_inner = Block::default().borders(Borders::ALL).inner(chunks[1]);
     hints.content_y = diff_inner.y;
     hints.content_height = diff_inner.height;
+    hints.content_width = diff_inner.width;
 
     draw_tab_bar(frame, app, hints, chunks[0]);
     draw_diff_area(frame, app, highlighter, chunks[1]);
     draw_status_bar(frame, app, hints, chunks[2]);
 
-    if app.repo_adder.is_some() {
+    if app.comment_input.is_some() {
+        draw_comment_input(frame, app);
+    } else if app.comment_browser.is_some() {
+        draw_comment_browser(frame, app);
+    } else if app.repo_adder.is_some() {
         draw_repo_adder(frame, app);
     } else if app.file_picker.is_some() {
         draw_file_picker(frame, app);
@@ -234,6 +241,7 @@ fn draw_unified(
                     continue;
                 };
                 let lno_w = lineno_width(file);
+                let has_comment = layout.hunk_has_comment(file_idx, hunk_idx);
                 if gap_before > 0 {
                     let mut spans = vec![Span::styled(
                         format_expand_indicator(gap_before, lno_w),
@@ -245,15 +253,47 @@ fn draw_unified(
                             Style::default().fg(FG_HUNK),
                         ));
                     }
+                    if has_comment {
+                        spans.push(Span::styled(" [!]", Style::default().fg(FG_COMMENT)));
+                    }
                     lines.push(Line::from(spans));
                 } else if hunk_idx > 0 {
-                    let gutter = " ".repeat(lno_w * 2 + 1) + " │";
+                    let mut gutter = " ".repeat(lno_w * 2 + 1) + " │";
+                    if has_comment {
+                        gutter.push_str(" [!]");
+                    }
                     lines.push(Line::from(Span::styled(
                         gutter,
-                        Style::default().fg(FG_MUTED),
+                        if has_comment {
+                            Style::default().fg(FG_COMMENT)
+                        } else {
+                            Style::default().fg(FG_MUTED)
+                        },
+                    )));
+                } else if has_comment {
+                    lines.push(Line::from(Span::styled(
+                        " [!]",
+                        Style::default().fg(FG_COMMENT),
                     )));
                 } else {
                     lines.push(Line::from(""));
+                }
+            }
+            RowRef::Comment {
+                file_idx,
+                hunk_idx,
+                wrap_idx,
+            } => {
+                if let Some(text) = layout.comment_line_text(file_idx, hunk_idx, wrap_idx) {
+                    let Some(file) = files.get(file_idx) else {
+                        continue;
+                    };
+                    let lno_w = lineno_width(file);
+                    let gutter = " ".repeat(lno_w * 2 + 1) + " ┃";
+                    lines.push(Line::from(vec![
+                        Span::styled(gutter, Style::default().fg(FG_COMMENT)),
+                        Span::styled(format!(" {}", text), Style::default().fg(FG_COMMENT)),
+                    ]));
                 }
             }
             RowRef::UnifiedLine {
@@ -359,6 +399,7 @@ fn draw_side_by_side(
                     .hunks
                     .get(hunk_idx)
                     .and_then(|hunk| hunk_context(&hunk.header));
+                let has_comment = layout.hunk_has_comment(file_idx, hunk_idx);
                 let hunk_line = if gap_before > 0 {
                     let mut spans = vec![Span::styled(
                         format!("  ↕ {}", gap_before),
@@ -370,9 +411,18 @@ fn draw_side_by_side(
                             Style::default().fg(FG_HUNK),
                         ));
                     }
+                    if has_comment {
+                        spans.push(Span::styled(" [!]", Style::default().fg(FG_COMMENT)));
+                    }
                     Line::from(spans)
                 } else if hunk_idx > 0 {
-                    Line::from(Span::styled("  ─", Style::default().fg(FG_MUTED)))
+                    if has_comment {
+                        Line::from(Span::styled("  ─ [!]", Style::default().fg(FG_COMMENT)))
+                    } else {
+                        Line::from(Span::styled("  ─", Style::default().fg(FG_MUTED)))
+                    }
+                } else if has_comment {
+                    Line::from(Span::styled(" [!]", Style::default().fg(FG_COMMENT)))
                 } else {
                     Line::from("")
                 };
@@ -415,6 +465,20 @@ fn draw_side_by_side(
                 ));
                 left_lines.push(expand_line.clone());
                 right_lines.push(expand_line);
+            }
+            RowRef::Comment {
+                file_idx,
+                hunk_idx,
+                wrap_idx,
+            } => {
+                if let Some(text) = layout.comment_line_text(file_idx, hunk_idx, wrap_idx) {
+                    let comment_line = Line::from(vec![
+                        Span::styled(" ┃", Style::default().fg(FG_COMMENT)),
+                        Span::styled(format!(" {}", text), Style::default().fg(FG_COMMENT)),
+                    ]);
+                    left_lines.push(comment_line);
+                    right_lines.push(Line::from(""));
+                }
             }
             RowRef::Blank { .. } | RowRef::GapTail { .. } => {
                 left_lines.push(Line::from(""));
@@ -809,7 +873,12 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
 
     let mut spans: Vec<Span> = vec![Span::styled(left, Style::default().fg(Color::White))];
 
-    if let Some(ref err) = app.last_error {
+    if let Some((ref msg, _)) = app.status_message {
+        spans.push(Span::styled(
+            format!(" │ {}", msg),
+            Style::default().fg(FG_COMMENT),
+        ));
+    } else if let Some(ref err) = app.last_error {
         spans.push(Span::styled(
             format!(" │ {}", err),
             Style::default().fg(Color::Red),
@@ -1147,6 +1216,277 @@ fn draw_help_overlay(frame: &mut Frame) {
         .style(Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 40)));
 
     frame.render_widget(help, popup_area);
+}
+
+fn draw_comment_input(frame: &mut Frame, app: &App) {
+    let input = match app.comment_input.as_ref() {
+        Some(i) => i,
+        None => return,
+    };
+
+    let area = frame.area();
+
+    // Get file name for context label
+    let file_label = app
+        .current_files()
+        .and_then(|f| f.get(input.file_idx))
+        .map(|f| {
+            let name = f.path.rsplit('/').next().unwrap_or(&f.path);
+            let lineno = f
+                .hunks
+                .get(input.hunk_idx)
+                .and_then(|h| h.first_new_lineno())
+                .unwrap_or(0);
+            format!("{} @{}", name, lineno)
+        })
+        .unwrap_or_default();
+
+    // Compute box dimensions
+    let text_lines: Vec<&str> = input.text.split('\n').collect();
+    let line_count = text_lines.len().max(1);
+    let box_height = (line_count as u16 + 2).clamp(3, 8); // +2 for borders
+    let box_width = (area.width / 2).max(40).min(area.width.saturating_sub(4));
+
+    // Position anchored near the hunk
+    let anchor_screen_y = (input.anchor_row as u16)
+        .saturating_sub(app.current_scroll_offset() as u16)
+        + app.layout.content_y
+        + 1;
+
+    let y = if anchor_screen_y + box_height < app.layout.content_y + app.layout.content_height {
+        anchor_screen_y
+    } else {
+        anchor_screen_y.saturating_sub(box_height + 1)
+    }
+    .clamp(app.layout.content_y, area.height.saturating_sub(box_height));
+
+    let x = (area.width.saturating_sub(box_width)) / 2;
+    let popup_area = Rect::new(x, y, box_width, box_height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let title = format!(" note ({}) — Ctrl+D save, Esc cancel ", file_label);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().bg(Color::Rgb(30, 30, 20)).fg(FG_COMMENT));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    // Render text with cursor
+    let mut display_lines: Vec<Line> = Vec::new();
+    let mut char_count = 0;
+    for (i, text_line) in text_lines.iter().enumerate() {
+        let line_start = char_count;
+        let line_end = line_start + text_line.len();
+
+        if input.cursor_pos >= line_start && input.cursor_pos <= line_end {
+            let cursor_col = input.cursor_pos - line_start;
+            let before = &text_line[..cursor_col.min(text_line.len())];
+            let after = &text_line[cursor_col.min(text_line.len())..];
+            let cursor_char = if after.is_empty() { " " } else { &after[..1] };
+            let after_cursor = if after.len() > 1 { &after[1..] } else { "" };
+            display_lines.push(Line::from(vec![
+                Span::styled(
+                    format!(" {}", before),
+                    Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 20)),
+                ),
+                Span::styled(
+                    cursor_char.to_string(),
+                    Style::default()
+                        .fg(Color::Black)
+                        .bg(FG_COMMENT)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    after_cursor.to_string(),
+                    Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 20)),
+                ),
+            ]));
+        } else {
+            display_lines.push(Line::from(Span::styled(
+                format!(" {}", text_line),
+                Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 20)),
+            )));
+        }
+
+        // +1 for the \n between lines
+        char_count = line_end + if i < text_lines.len() - 1 { 1 } else { 0 };
+    }
+
+    let para = Paragraph::new(display_lines).style(Style::default().bg(Color::Rgb(30, 30, 20)));
+    frame.render_widget(para, inner);
+}
+
+fn draw_comment_browser(frame: &mut Frame, app: &App) {
+    let browser = match app.comment_browser.as_ref() {
+        Some(b) => b,
+        None => return,
+    };
+
+    let comments = match app.repos.get(app.active_tab) {
+        Some(r) => &r.comments,
+        None => return,
+    };
+
+    let area = frame.area();
+    let width = 70u16.min(area.width.saturating_sub(4));
+    let max_height = area.height.saturating_sub(6);
+    let height = max_height.min(30);
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = area.height.saturating_sub(height) / 3;
+    let popup_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let title = format!(" Review notes ({}) — type to filter ", comments.len());
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().bg(Color::Rgb(30, 30, 20)).fg(FG_COMMENT));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    if inner.height < 3 {
+        return;
+    }
+
+    // Input line
+    let input_text = format!(" > {}_", browser.query);
+    let input_line = Paragraph::new(Line::from(Span::styled(
+        input_text,
+        Style::default().fg(FG_COMMENT),
+    )))
+    .style(Style::default().bg(Color::Rgb(30, 30, 20)));
+    let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
+    frame.render_widget(input_line, input_area);
+
+    // Hint bar at bottom
+    let hint_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
+    let hint = Paragraph::new(Line::from(Span::styled(
+        " ↵ jump  y copy  ␣ toggle  d del  esc close",
+        Style::default().fg(FG_MUTED),
+    )))
+    .style(Style::default().bg(Color::Rgb(30, 30, 20)));
+    frame.render_widget(hint, hint_area);
+
+    // Comment list
+    let list_area = Rect::new(
+        inner.x,
+        inner.y + 1,
+        inner.width,
+        inner.height.saturating_sub(2),
+    );
+
+    let files = match app.current_files() {
+        Some(f) => f,
+        None => return,
+    };
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    if comments.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No review notes yet — right-click a hunk to add one",
+            Style::default().fg(FG_MUTED).bg(Color::Rgb(30, 30, 20)),
+        )));
+    } else {
+        // Filter comments by query
+        let query_lower = browser.query.to_lowercase();
+        let filtered: Vec<usize> = (0..comments.len())
+            .filter(|&i| {
+                if query_lower.is_empty() {
+                    return true;
+                }
+                let c = &comments[i];
+                let file_path = files.get(c.file_idx).map(|f| f.path.as_str()).unwrap_or("");
+                let haystack = format!("{} {}", file_path, c.text).to_lowercase();
+                haystack.contains(&query_lower)
+            })
+            .collect();
+
+        for (display_idx, &comment_idx) in filtered.iter().enumerate() {
+            let c = &comments[comment_idx];
+            let is_selected = display_idx == browser.selected;
+            let is_checked = browser.checked.contains(&comment_idx);
+            let check = if is_checked { "[x]" } else { "[ ]" };
+
+            let file_name = files
+                .get(c.file_idx)
+                .map(|f| f.path.as_str())
+                .unwrap_or("?");
+            let lineno = files
+                .get(c.file_idx)
+                .and_then(|f| f.hunks.get(c.hunk_idx))
+                .and_then(|h| h.first_new_lineno())
+                .unwrap_or(0);
+
+            let header_style = if is_selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(FG_COMMENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+                    .fg(FG_COMMENT)
+                    .bg(Color::Rgb(30, 30, 20))
+            };
+
+            lines.push(Line::from(Span::styled(
+                format!(" {} {} @{}", check, file_name, lineno),
+                header_style,
+            )));
+
+            // Show comment text
+            let text_style = if is_selected {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(40, 40, 30))
+            } else {
+                Style::default()
+                    .fg(Color::White)
+                    .bg(Color::Rgb(30, 30, 20))
+            };
+
+            for text_line in c.text.lines() {
+                lines.push(Line::from(Span::styled(
+                    format!("     {}", text_line),
+                    text_style,
+                )));
+            }
+
+            // Blank separator
+            lines.push(Line::from(""));
+        }
+    }
+
+    // Scroll to keep selected visible
+    let visible_count = list_area.height as usize;
+    let scroll = if lines.len() > visible_count {
+        // Find the line index where the selected comment header is
+        let mut selected_line = 0;
+        let mut comment_count = 0;
+        for (i, _) in lines.iter().enumerate() {
+            if comment_count == browser.selected {
+                selected_line = i;
+                break;
+            }
+            // Count comment headers (lines starting with checkbox)
+            if lines
+                .get(i)
+                .is_some_and(|l| l.spans.first().is_some_and(|s| s.content.contains("[x]") || s.content.contains("[ ]")))
+            {
+                comment_count += 1;
+            }
+        }
+        selected_line.saturating_sub(visible_count / 2)
+    } else {
+        0
+    };
+
+    let display_lines: Vec<Line> = lines.into_iter().skip(scroll).take(visible_count).collect();
+    let list = Paragraph::new(display_lines);
+    frame.render_widget(list, list_area);
 }
 
 #[cfg(test)]

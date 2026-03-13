@@ -16,6 +16,27 @@ pub(crate) const SCROLL_SPEED: usize = 3;
 pub(crate) const PAGE_SCROLL: usize = 20;
 pub(crate) const DOUBLE_CLICK_MS: u64 = 400;
 
+pub struct HunkComment {
+    pub file_idx: usize,
+    pub hunk_idx: usize,
+    pub text: String,
+}
+
+pub struct CommentInputState {
+    pub file_idx: usize,
+    pub hunk_idx: usize,
+    pub text: String,
+    pub cursor_pos: usize,
+    /// Layout row for positioning the floating input
+    pub anchor_row: usize,
+}
+
+pub struct CommentBrowserState {
+    pub query: String,
+    pub selected: usize,
+    pub checked: std::collections::HashSet<usize>,
+}
+
 pub struct RepoState {
     pub id: u64,
     pub info: RepoInfo,
@@ -27,6 +48,7 @@ pub struct RepoState {
     pub sbs_layout: Option<DiffLayout>,
     pub unified_viewport: ViewportState,
     pub sbs_viewport: ViewportState,
+    pub comments: Vec<HunkComment>,
 }
 
 pub struct FlashState {
@@ -55,10 +77,13 @@ pub struct App {
     pub focused_file: Option<usize>,
     pub side_by_side: bool,
     pub last_error: Option<String>,
-    pub flash: Option<FlashState>,
+    pub flash: Vec<FlashState>,
+    pub status_message: Option<(String, Instant)>,
     pub show_help: bool,
     pub file_picker: Option<FilePickerState>,
     pub repo_adder: Option<RepoAdderState>,
+    pub comment_input: Option<CommentInputState>,
+    pub comment_browser: Option<CommentBrowserState>,
     pub layout: LayoutHints,
     pub last_click: Option<(u16, u16, Instant)>,
 }
@@ -79,6 +104,7 @@ impl App {
                 sbs_layout: None,
                 unified_viewport: ViewportState::default(),
                 sbs_viewport: ViewportState::default(),
+                comments: Vec::new(),
             })
             .collect();
         let next_repo_id = repos.len() as u64;
@@ -89,10 +115,13 @@ impl App {
             focused_file: None,
             side_by_side: false,
             last_error: None,
-            flash: None,
+            flash: Vec::new(),
+            status_message: None,
             show_help: false,
             file_picker: None,
             repo_adder: None,
+            comment_input: None,
+            comment_browser: None,
             layout: LayoutHints::default(),
             last_click: None,
         }
@@ -218,7 +247,9 @@ impl App {
                 file.ensure_sbs_cache();
             }
         }
-        *layout_slot = Some(DiffLayout::build(&repo.files, view));
+        let width = self.layout.content_width.max(1) as usize;
+        let width = if width <= 1 { 80 } else { width };
+        *layout_slot = Some(DiffLayout::build(&repo.files, view, &repo.comments, width));
         let total = layout_slot
             .as_ref()
             .map(DiffLayout::total_lines)
@@ -578,6 +609,7 @@ impl App {
             sbs_layout: None,
             unified_viewport: ViewportState::default(),
             sbs_viewport: ViewportState::default(),
+            comments: Vec::new(),
         });
         self.active_tab = idx;
         self.focused_file = None;
@@ -619,6 +651,9 @@ impl App {
                 }
 
                 self.repos[idx].files = new_files;
+                self.repos[idx].comments.clear();
+                self.comment_input = None;
+                self.comment_browser = None;
                 self.invalidate_layouts(idx);
                 self.ensure_layout(idx, ViewKind::Unified);
                 if self.side_by_side && idx == self.active_tab {
@@ -703,11 +738,10 @@ impl App {
     }
 
     pub fn is_hunk_flashing(&self, file_idx: usize, hunk_idx: usize) -> bool {
-        if let Some(ref flash) = self.flash {
-            Instant::now() < flash.until && flash.file_idx == file_idx && flash.hunk_idx == hunk_idx
-        } else {
-            false
-        }
+        let now = Instant::now();
+        self.flash
+            .iter()
+            .any(|f| now < f.until && f.file_idx == file_idx && f.hunk_idx == hunk_idx)
     }
 
     pub fn file_and_hunk_at_row(&self, content_row: usize) -> Option<(usize, usize)> {
@@ -758,7 +792,28 @@ impl App {
             .and_then(|l| l.new_lineno.or(l.old_lineno))
             .unwrap_or(0);
 
+        // Collect any comments attached to this hunk
+        let hunk_comments: Vec<&HunkComment> = self
+            .repos
+            .get(self.active_tab)
+            .map(|r| {
+                r.comments
+                    .iter()
+                    .filter(|c| c.file_idx == file_idx && c.hunk_idx == target_hunk)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         let mut result = format!("// {}:{}-{}\n", file.path, first_lineno, last_lineno);
+
+        if !hunk_comments.is_empty() {
+            for c in &hunk_comments {
+                for comment_line in c.text.lines() {
+                    result.push_str(&format!("// > {}\n", comment_line));
+                }
+            }
+        }
+
         for line in &hunk.lines {
             let prefix = match line.kind {
                 LineKind::Addition => "+",
@@ -768,13 +823,162 @@ impl App {
             result.push_str(&format!("{} {}\n", prefix, line.content));
         }
 
-        self.flash = Some(FlashState {
+        self.flash.push(FlashState {
             until: Instant::now() + FLASH_DURATION,
             file_idx,
             hunk_idx: target_hunk,
         });
 
         Some(result)
+    }
+
+    // -- Comment methods --
+
+    pub fn find_comment(&self, file_idx: usize, hunk_idx: usize) -> Option<&HunkComment> {
+        self.repos
+            .get(self.active_tab)?
+            .comments
+            .iter()
+            .find(|c| c.file_idx == file_idx && c.hunk_idx == hunk_idx)
+    }
+
+    pub fn add_or_update_comment(&mut self, file_idx: usize, hunk_idx: usize, text: String) {
+        if let Some(repo) = self.repos.get_mut(self.active_tab) {
+            if let Some(existing) = repo
+                .comments
+                .iter_mut()
+                .find(|c| c.file_idx == file_idx && c.hunk_idx == hunk_idx)
+            {
+                existing.text = text;
+            } else {
+                repo.comments.push(HunkComment {
+                    file_idx,
+                    hunk_idx,
+                    text,
+                });
+            }
+        }
+        self.invalidate_layouts(self.active_tab);
+    }
+
+    pub fn remove_comment(&mut self, file_idx: usize, hunk_idx: usize) {
+        if let Some(repo) = self.repos.get_mut(self.active_tab) {
+            repo.comments
+                .retain(|c| !(c.file_idx == file_idx && c.hunk_idx == hunk_idx));
+        }
+        self.invalidate_layouts(self.active_tab);
+    }
+
+    pub fn clear_comments(&mut self) {
+        let count = self
+            .repos
+            .get(self.active_tab)
+            .map(|r| r.comments.len())
+            .unwrap_or(0);
+        if let Some(repo) = self.repos.get_mut(self.active_tab) {
+            repo.comments.clear();
+        }
+        self.invalidate_layouts(self.active_tab);
+        if count > 0 {
+            self.status_message = Some((
+                format!("Cleared {} note{}", count, if count == 1 { "" } else { "s" }),
+                Instant::now() + FLASH_DURATION,
+            ));
+        }
+    }
+
+    pub fn format_comments_markdown(&self, indices: Option<&[usize]>) -> Option<String> {
+        let repo = self.repos.get(self.active_tab)?;
+        let files = &repo.files;
+        let comments = &repo.comments;
+
+        if comments.is_empty() {
+            return None;
+        }
+
+        // Collect the comments to include, sorted by file then hunk position
+        let mut selected: Vec<&HunkComment> = match indices {
+            Some(idxs) => idxs.iter().filter_map(|&i| comments.get(i)).collect(),
+            None => comments.iter().collect(),
+        };
+
+        if selected.is_empty() {
+            return None;
+        }
+
+        selected.sort_by(|a, b| {
+            let file_cmp = files
+                .get(a.file_idx)
+                .map(|f| f.path.as_str())
+                .cmp(&files.get(b.file_idx).map(|f| f.path.as_str()));
+            file_cmp.then(a.hunk_idx.cmp(&b.hunk_idx))
+        });
+
+        let mut result = String::from("## Review comments\n");
+
+        for comment in &selected {
+            let Some(file) = files.get(comment.file_idx) else {
+                continue;
+            };
+            let Some(hunk) = file.hunks.get(comment.hunk_idx) else {
+                continue;
+            };
+
+            let first_lineno = hunk
+                .lines
+                .first()
+                .and_then(|l| l.new_lineno.or(l.old_lineno))
+                .unwrap_or(0);
+            let last_lineno = hunk
+                .lines
+                .last()
+                .and_then(|l| l.new_lineno.or(l.old_lineno))
+                .unwrap_or(0);
+
+            result.push_str(&format!(
+                "\n### {}:{}-{}\n",
+                file.path, first_lineno, last_lineno
+            ));
+
+            for line in comment.text.lines() {
+                result.push_str(&format!("> {}\n", line));
+            }
+
+            result.push_str("\n```diff\n");
+            for line in &hunk.lines {
+                let prefix = match line.kind {
+                    LineKind::Addition => "+",
+                    LineKind::Deletion => "-",
+                    LineKind::Context => " ",
+                };
+                result.push_str(&format!("{} {}\n", prefix, line.content));
+            }
+            result.push_str("```\n");
+        }
+
+        Some(result)
+    }
+
+    /// Resolve the hunk at the current focus for keyboard comment operations.
+    pub fn focused_hunk(&self) -> Option<(usize, usize)> {
+        let file_idx = self.focused_file?;
+        let files = self.current_files()?;
+        files.get(file_idx)?;
+
+        self.current_layout()
+            .and_then(|layout| {
+                layout.hunk_at_or_after_row(self.current_scroll_offset(), file_idx)
+            })
+            .or_else(|| {
+                // If no hunk at scroll offset, try first hunk of focused file
+                let files = self.current_files()?;
+                let file = files.get(file_idx)?;
+                if file.hunks.is_empty() {
+                    None
+                } else {
+                    Some((file_idx, 0))
+                }
+            })
     }
 }
 

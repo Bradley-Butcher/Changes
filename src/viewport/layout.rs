@@ -1,16 +1,32 @@
 use super::row::{RowRef, ViewKind};
+use crate::app::HunkComment;
 use crate::diff::{FileDiff, gap_between_hunks};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone)]
 pub struct DiffLayout {
     rows: Vec<RowRef>,
     file_header_rows: Vec<usize>,
+    /// Wrapped comment text lines, keyed by (file_idx, hunk_idx).
+    comment_lines: HashMap<(usize, usize), Vec<String>>,
 }
 
 impl DiffLayout {
-    pub fn build(files: &[FileDiff], view_kind: ViewKind) -> Self {
+    pub fn build(
+        files: &[FileDiff],
+        view_kind: ViewKind,
+        comments: &[HunkComment],
+        content_width: usize,
+    ) -> Self {
         let mut rows = Vec::new();
         let mut file_header_rows = Vec::with_capacity(files.len());
+
+        // Pre-compute wrapped comment lines keyed by (file_idx, hunk_idx)
+        let comment_width = content_width.saturating_sub(4).max(20);
+        let mut comment_lines: HashMap<(usize, usize), Vec<String>> = HashMap::new();
+        for c in comments {
+            comment_lines.insert((c.file_idx, c.hunk_idx), wrap_comment(&c.text, comment_width));
+        }
 
         for (file_idx, file) in files.iter().enumerate() {
             file_header_rows.push(rows.len());
@@ -32,6 +48,17 @@ impl DiffLayout {
                     hunk_idx,
                     gap_before,
                 });
+
+                // Emit comment rows after hunk header
+                if let Some(lines) = comment_lines.get(&(file_idx, hunk_idx)) {
+                    for wrap_idx in 0..lines.len() {
+                        rows.push(RowRef::Comment {
+                            file_idx,
+                            hunk_idx,
+                            wrap_idx,
+                        });
+                    }
+                }
 
                 let line_count = match view_kind {
                     ViewKind::Unified => hunk.lines.len(),
@@ -83,6 +110,7 @@ impl DiffLayout {
         Self {
             rows,
             file_header_rows,
+            comment_lines,
         }
     }
 
@@ -131,6 +159,9 @@ impl DiffLayout {
             }
             | RowRef::SideBySideLine {
                 file_idx, hunk_idx, ..
+            }
+            | RowRef::Comment {
+                file_idx, hunk_idx, ..
             } => Some((file_idx, hunk_idx)),
             _ => None,
         }
@@ -150,6 +181,11 @@ impl DiffLayout {
                     ..
                 }
                 | RowRef::SideBySideLine {
+                    file_idx: current_file,
+                    hunk_idx,
+                    ..
+                }
+                | RowRef::Comment {
                     file_idx: current_file,
                     hunk_idx,
                     ..
@@ -176,6 +212,54 @@ impl DiffLayout {
             _ => None,
         }
     }
+
+    /// Get the wrapped comment line text for a Comment row.
+    pub fn comment_line_text(
+        &self,
+        file_idx: usize,
+        hunk_idx: usize,
+        wrap_idx: usize,
+    ) -> Option<&str> {
+        self.comment_lines
+            .get(&(file_idx, hunk_idx))?
+            .get(wrap_idx)
+            .map(|s| s.as_str())
+    }
+
+    /// Check if a hunk has a comment.
+    pub fn hunk_has_comment(&self, file_idx: usize, hunk_idx: usize) -> bool {
+        self.comment_lines.contains_key(&(file_idx, hunk_idx))
+    }
+}
+
+/// Word-wrap a comment string to fit within `max_width` characters.
+fn wrap_comment(text: &str, max_width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    for raw_line in text.lines() {
+        if raw_line.is_empty() {
+            lines.push(String::new());
+            continue;
+        }
+        let mut current = String::new();
+        for word in raw_line.split_whitespace() {
+            if current.is_empty() {
+                current = word.to_string();
+            } else if current.len() + 1 + word.len() <= max_width {
+                current.push(' ');
+                current.push_str(word);
+            } else {
+                lines.push(current);
+                current = word.to_string();
+            }
+        }
+        if !current.is_empty() {
+            lines.push(current);
+        }
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 #[cfg(test)]
@@ -208,7 +292,7 @@ mod tests {
 
     #[test]
     fn unified_layout_tracks_gap_and_tail_rows() {
-        let layout = DiffLayout::build(&[sample_file()], ViewKind::Unified);
+        let layout = DiffLayout::build(&[sample_file()], ViewKind::Unified, &[], 80);
         assert_eq!(layout.total_lines(), 4);
         assert_eq!(layout.row(0), Some(RowRef::FileHeader { file_idx: 0 }));
         assert_eq!(
