@@ -62,7 +62,9 @@ pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut
     draw_diff_area(frame, app, highlighter, chunks[1]);
     draw_status_bar(frame, app, hints, chunks[2]);
 
-    if app.comment_input.is_some() {
+    if app.markdown_preview.is_some() {
+        draw_markdown_preview(frame, app);
+    } else if app.comment_input.is_some() {
         draw_comment_input(frame, app);
     } else if app.comment_browser.is_some() {
         draw_comment_browser(frame, app);
@@ -311,12 +313,13 @@ fn draw_unified(
                     continue;
                 };
                 let flashing = app.is_hunk_flashing(file_idx, hunk_idx);
-                lines.push(build_unified_line(
+                lines.extend(build_unified_line(
                     line,
                     &file.path,
                     highlighter,
                     flashing,
                     lineno_width(file),
+                    inner_area.width as usize,
                 ));
             }
             RowRef::GapTail { gap_after, .. } if gap_after > 0 => {
@@ -445,18 +448,30 @@ fn draw_side_by_side(
                 else {
                     continue;
                 };
-                left_lines.push(build_sbs_line(
+                let pane_w = halves[0].width as usize;
+                let mut left = build_sbs_line(
                     &sbs_line.left,
                     &sbs_line.left_changed,
                     &file.path,
                     highlighter,
-                ));
-                right_lines.push(build_sbs_line(
+                    pane_w,
+                );
+                let mut right = build_sbs_line(
                     &sbs_line.right,
                     &sbs_line.right_changed,
                     &file.path,
                     highlighter,
-                ));
+                    pane_w,
+                );
+                // Pad shorter side so both panes stay aligned
+                while left.len() < right.len() {
+                    left.push(Line::from(""));
+                }
+                while right.len() < left.len() {
+                    right.push(Line::from(""));
+                }
+                left_lines.extend(left);
+                right_lines.extend(right);
             }
             RowRef::GapTail { gap_after, .. } if gap_after > 0 => {
                 let expand_line = Line::from(Span::styled(
@@ -508,7 +523,8 @@ fn build_unified_line<'a>(
     highlighter: &Highlighter,
     is_flashing: bool,
     lno_width: usize,
-) -> Line<'a> {
+    content_width: usize,
+) -> Vec<Line<'a>> {
     let prefix = match line.kind {
         LineKind::Context => "  ",
         LineKind::Addition => "+ ",
@@ -533,15 +549,63 @@ fn build_unified_line<'a>(
         _ => Style::default().fg(FG_MUTED),
     };
 
-    let mut spans = vec![
-        Span::styled(lineno, Style::default().fg(FG_MUTED)),
-        Span::styled(prefix.to_string(), prefix_style),
-    ];
+    // Gutter width: line numbers + prefix
+    let gutter_width = lno_width * 2 + 2 + prefix.len(); // "NNNN NNNN │+ "
+    let available = content_width.saturating_sub(gutter_width);
 
-    let mut highlighted = highlighter.highlight_line_content(&line.content, file_path, bg);
-    spans.append(&mut highlighted.spans);
+    if available == 0 || line.content.len() <= available {
+        let mut spans = vec![
+            Span::styled(lineno, Style::default().fg(FG_MUTED)),
+            Span::styled(prefix.to_string(), prefix_style),
+        ];
+        let mut highlighted = highlighter.highlight_line_content(&line.content, file_path, bg);
+        spans.append(&mut highlighted.spans);
+        return vec![Line::from(spans)];
+    }
 
-    Line::from(spans)
+    // Split content into chunks that fit
+    let content = &line.content;
+    let padding = " ".repeat(gutter_width);
+    let mut result = Vec::new();
+    let mut pos = 0;
+
+    while pos < content.len() {
+        let end = (pos + available).min(content.len());
+        // Try to break at a word boundary
+        let chunk_end = if end < content.len() {
+            content[pos..end]
+                .rfind(' ')
+                .map(|i| pos + i + 1)
+                .unwrap_or(end)
+        } else {
+            end
+        };
+        let chunk = &content[pos..chunk_end];
+
+        if pos == 0 {
+            // First line: full gutter
+            let mut spans = vec![
+                Span::styled(lineno.clone(), Style::default().fg(FG_MUTED)),
+                Span::styled(prefix.to_string(), prefix_style),
+            ];
+            let mut highlighted = highlighter.highlight_line_content(chunk, file_path, bg);
+            spans.append(&mut highlighted.spans);
+            result.push(Line::from(spans));
+        } else {
+            // Continuation: padding where gutter would be
+            let mut spans = vec![Span::styled(
+                padding.clone(),
+                Style::default().fg(FG_MUTED),
+            )];
+            let mut highlighted = highlighter.highlight_line_content(chunk, file_path, bg);
+            spans.append(&mut highlighted.spans);
+            result.push(Line::from(spans));
+        }
+
+        pos = chunk_end;
+    }
+
+    result
 }
 
 fn build_sbs_line<'a>(
@@ -549,7 +613,8 @@ fn build_sbs_line<'a>(
     changed_ranges: &Option<crate::diff::ChangedRanges>,
     file_path: &str,
     highlighter: &Highlighter,
-) -> Line<'a> {
+    pane_width: usize,
+) -> Vec<Line<'a>> {
     match line_opt {
         Some(line) => {
             let bg = match line.kind {
@@ -570,28 +635,77 @@ fn build_sbs_line<'a>(
                 _ => Style::default().fg(FG_MUTED),
             };
 
-            let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
+            let gutter_width = prefix.len();
+            let available = pane_width.saturating_sub(gutter_width);
 
-            // Always syntax-highlight first
-            let mut highlighted = highlighter.highlight_line_content(&line.content, file_path, bg);
-
-            // If we have inline diff ranges, overlay emphasized bg on changed characters
-            if let Some(ranges) = changed_ranges {
-                let emph_bg = match line.kind {
-                    LineKind::Addition => BG_ADD_EMPH,
-                    LineKind::Deletion => BG_DEL_EMPH,
-                    _ => {
-                        spans.append(&mut highlighted.spans);
-                        return Line::from(spans);
-                    }
-                };
-                apply_inline_emphasis(&mut highlighted.spans, ranges, emph_bg);
+            if available == 0 || line.content.len() <= available {
+                let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
+                let mut highlighted =
+                    highlighter.highlight_line_content(&line.content, file_path, bg);
+                if let Some(ranges) = changed_ranges {
+                    let emph_bg = match line.kind {
+                        LineKind::Addition => BG_ADD_EMPH,
+                        LineKind::Deletion => BG_DEL_EMPH,
+                        _ => return vec![Line::from(spans)],
+                    };
+                    apply_inline_emphasis(&mut highlighted.spans, ranges, emph_bg);
+                }
+                spans.append(&mut highlighted.spans);
+                return vec![Line::from(spans)];
             }
 
-            spans.append(&mut highlighted.spans);
-            Line::from(spans)
+            // Wrap long content
+            let content = &line.content;
+            let padding = " ".repeat(gutter_width);
+            let mut result = Vec::new();
+            let mut pos = 0;
+
+            while pos < content.len() {
+                let end = (pos + available).min(content.len());
+                let chunk_end = if end < content.len() {
+                    content[pos..end]
+                        .rfind(' ')
+                        .map(|i| pos + i + 1)
+                        .unwrap_or(end)
+                } else {
+                    end
+                };
+                let chunk = &content[pos..chunk_end];
+
+                if pos == 0 {
+                    let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
+                    let mut highlighted =
+                        highlighter.highlight_line_content(chunk, file_path, bg);
+                    if let Some(ranges) = changed_ranges {
+                        let emph_bg = match line.kind {
+                            LineKind::Addition => BG_ADD_EMPH,
+                            LineKind::Deletion => BG_DEL_EMPH,
+                            _ => {
+                                spans.append(&mut highlighted.spans);
+                                result.push(Line::from(spans));
+                                pos = chunk_end;
+                                continue;
+                            }
+                        };
+                        apply_inline_emphasis(&mut highlighted.spans, ranges, emph_bg);
+                    }
+                    spans.append(&mut highlighted.spans);
+                    result.push(Line::from(spans));
+                } else {
+                    let mut spans =
+                        vec![Span::styled(padding.clone(), Style::default().fg(FG_MUTED))];
+                    let mut highlighted =
+                        highlighter.highlight_line_content(chunk, file_path, bg);
+                    spans.append(&mut highlighted.spans);
+                    result.push(Line::from(spans));
+                }
+
+                pos = chunk_end;
+            }
+
+            result
         }
-        None => Line::from(Span::styled("~", Style::default().fg(FG_MUTED))),
+        None => vec![Line::from(Span::styled("~", Style::default().fg(FG_MUTED)))],
     }
 }
 
@@ -1134,6 +1248,65 @@ fn draw_repo_adder(frame: &mut Frame, app: &App) {
 
     let list = Paragraph::new(lines);
     frame.render_widget(list, list_area);
+}
+
+fn draw_markdown_preview(frame: &mut Frame, app: &App) {
+    let preview = match app.markdown_preview.as_ref() {
+        Some(p) => p,
+        None => return,
+    };
+
+    let area = frame.area();
+    let width = area.width.saturating_sub(6).min(120);
+    let height = area.height.saturating_sub(4);
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = (area.height.saturating_sub(height)) / 2;
+    let popup_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let title = format!(" {} — j/k scroll, q/esc/p close ", preview.path);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
+        .style(Style::default().bg(Color::Rgb(25, 25, 35)));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let mut skin = termimad::MadSkin::default_dark();
+    // Clear backgrounds on paragraph text so it doesn't look highlighted
+    skin.paragraph.set_bg(termimad::crossterm::style::Color::Reset);
+    skin.bold.set_bg(termimad::crossterm::style::Color::Reset);
+    skin.italic.set_bg(termimad::crossterm::style::Color::Reset);
+    skin.strikeout.set_bg(termimad::crossterm::style::Color::Reset);
+    let fmt_text = skin.text(&preview.content, Some(inner.width as usize));
+    let rendered = format!("{fmt_text}");
+
+    // Convert ANSI-styled string to ratatui Text
+    let text: ratatui::text::Text = match ansi_to_tui::IntoText::into_text(&rendered) {
+        Ok(t) => t,
+        Err(_) => ratatui::text::Text::raw(&preview.content),
+    };
+
+    let total_lines = text.lines.len();
+    let scroll = preview
+        .scroll
+        .min(total_lines.saturating_sub(inner.height as usize));
+
+    let para = Paragraph::new(text)
+        .scroll((scroll as u16, 0))
+        .style(Style::default().bg(Color::Rgb(25, 25, 35)));
+
+    frame.render_widget(para, inner);
+
+    // Scrollbar
+    if total_lines > inner.height as usize {
+        let mut scrollbar_state =
+            ScrollbarState::new(total_lines.saturating_sub(inner.height as usize))
+                .position(scroll);
+        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
+        frame.render_stateful_widget(scrollbar, popup_area, &mut scrollbar_state);
+    }
 }
 
 fn draw_help_overlay(frame: &mut Frame) {

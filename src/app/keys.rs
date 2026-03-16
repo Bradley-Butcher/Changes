@@ -1,6 +1,6 @@
 use super::{
     App, CommentBrowserState, CommentInputState, DiffResult, FilePickerState, FlashState,
-    PAGE_SCROLL, RepoAdderState,
+    MarkdownPreviewState, PAGE_SCROLL, RepoAdderState,
 };
 use crate::git::DiffMode;
 use arboard::Clipboard;
@@ -210,6 +210,24 @@ pub fn handle_key(
             }
         }
 
+        // Markdown preview
+        KeyCode::Char('p') => {
+            if let Some(file_idx) = app.focused_file
+                && let Some(repo) = app.repos.get(app.active_tab)
+                && let Some(file) = repo.files.get(file_idx)
+                && file.path.ends_with(".md")
+            {
+                let full_path = repo.info.path.join(&file.path);
+                if let Ok(content) = std::fs::read_to_string(&full_path) {
+                    app.markdown_preview = Some(MarkdownPreviewState {
+                        content,
+                        path: file.path.clone(),
+                        scroll: 0,
+                    });
+                }
+            }
+        }
+
         // Comments browser
         KeyCode::Char('C') => {
             let count = app
@@ -365,6 +383,48 @@ pub fn handle_repo_adder_key(app: &mut App, key: event::KeyEvent) -> Vec<usize> 
         _ => {}
     }
     Vec::new()
+}
+
+pub fn handle_markdown_preview_key(app: &mut App, key: event::KeyEvent) {
+    if app.markdown_preview.is_none() {
+        return;
+    }
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('p') => {
+            app.markdown_preview = None;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            if let Some(ref mut preview) = app.markdown_preview {
+                preview.scroll = preview.scroll.saturating_add(1);
+            }
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            if let Some(ref mut preview) = app.markdown_preview {
+                preview.scroll = preview.scroll.saturating_sub(1);
+            }
+        }
+        KeyCode::PageDown => {
+            if let Some(ref mut preview) = app.markdown_preview {
+                preview.scroll = preview.scroll.saturating_add(20);
+            }
+        }
+        KeyCode::PageUp => {
+            if let Some(ref mut preview) = app.markdown_preview {
+                preview.scroll = preview.scroll.saturating_sub(20);
+            }
+        }
+        KeyCode::Char('g') => {
+            if let Some(ref mut preview) = app.markdown_preview {
+                preview.scroll = 0;
+            }
+        }
+        KeyCode::Char('G') => {
+            if let Some(ref mut preview) = app.markdown_preview {
+                preview.scroll = usize::MAX; // clamped at render time
+            }
+        }
+        _ => {}
+    }
 }
 
 pub fn handle_comment_input_key(app: &mut App, key: event::KeyEvent) {

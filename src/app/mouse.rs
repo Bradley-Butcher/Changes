@@ -12,6 +12,25 @@ pub fn handle_mouse(
     diff_tx: &mpsc::UnboundedSender<DiffResult>,
     gap_tx: &mpsc::UnboundedSender<GapExpandResult>,
 ) -> bool {
+    // Scroll wheel in markdown preview
+    if app.markdown_preview.is_some() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                if let Some(ref mut preview) = app.markdown_preview {
+                    preview.scroll = preview.scroll.saturating_sub(SCROLL_SPEED);
+                }
+                return true;
+            }
+            MouseEventKind::ScrollDown => {
+                if let Some(ref mut preview) = app.markdown_preview {
+                    preview.scroll = preview.scroll.saturating_add(SCROLL_SPEED);
+                }
+                return true;
+            }
+            _ => return false,
+        }
+    }
+
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             app.scroll_active_viewport(-(SCROLL_SPEED as isize));

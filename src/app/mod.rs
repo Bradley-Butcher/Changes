@@ -70,6 +70,12 @@ pub struct RepoAdderState {
     pub checked: std::collections::HashSet<usize>,
 }
 
+pub struct MarkdownPreviewState {
+    pub content: String,
+    pub path: String,
+    pub scroll: usize,
+}
+
 pub struct App {
     pub repos: Vec<RepoState>,
     next_repo_id: u64,
@@ -84,6 +90,7 @@ pub struct App {
     pub repo_adder: Option<RepoAdderState>,
     pub comment_input: Option<CommentInputState>,
     pub comment_browser: Option<CommentBrowserState>,
+    pub markdown_preview: Option<MarkdownPreviewState>,
     pub layout: LayoutHints,
     pub last_click: Option<(u16, u16, Instant)>,
 }
@@ -122,6 +129,7 @@ impl App {
             repo_adder: None,
             comment_input: None,
             comment_browser: None,
+            markdown_preview: None,
             layout: LayoutHints::default(),
             last_click: None,
         }

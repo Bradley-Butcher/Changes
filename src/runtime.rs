@@ -194,6 +194,11 @@ async fn run_loop(
                 if key.kind != KeyEventKind::Press {
                     continue;
                 }
+                if app.markdown_preview.is_some() {
+                    keys::handle_markdown_preview_key(app, key);
+                    needs_redraw = true;
+                    continue;
+                }
                 if app.comment_input.is_some() {
                     keys::handle_comment_input_key(app, key);
                     needs_redraw = true;
