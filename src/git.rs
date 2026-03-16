@@ -113,7 +113,32 @@ pub fn compute_diff(
         }
     };
 
+    // Pre-populate untracked files from deltas — diff.print(Patch) skips them
+    // because there's no patch content for untracked files.
     let mut files: Vec<FileDiff> = Vec::new();
+    if mode == DiffMode::Unstaged {
+        for delta in diff.deltas() {
+            if delta.status() == Delta::Untracked {
+                let file_path = delta
+                    .new_file()
+                    .path()
+                    .map(|p| p.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                files.push(FileDiff {
+                    path: file_path,
+                    old_path: None,
+                    status: FileStatus::Untracked,
+                    hunks: Vec::new(),
+                    additions: 0,
+                    deletions: 0,
+                    collapsed: false,
+                    total_new_lines: 0,
+                    sbs_cache: None,
+                });
+            }
+        }
+    }
+
     let mut current_file: Option<FileDiff> = None;
     let mut current_hunk: Option<Hunk> = None;
     let mut current_hunk_header: String = String::new();
