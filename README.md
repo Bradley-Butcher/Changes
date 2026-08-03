@@ -25,6 +25,20 @@ It's also agent-agnostic. You shouldn't have to use a specific app or IDE just t
 
 ## Install
 
+### Install script
+
+The installer downloads and verifies the latest binary from GitHub Releases:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Bradley-Butcher/Changes/main/install.sh | sh
+```
+
+It installs to `~/.local/bin` by default. Set `INSTALL_DIR` to use another directory:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/Bradley-Butcher/Changes/main/install.sh | INSTALL_DIR="$HOME/bin" sh
+```
+
 ### Homebrew (macOS)
 
 ```sh
