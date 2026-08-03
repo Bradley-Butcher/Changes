@@ -8,10 +8,48 @@ use crossterm::event::{self, KeyCode, KeyModifiers};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
+const MAX_MARKDOWN_PREVIEW_BYTES: u64 = 5 * 1024 * 1024;
+
+fn read_markdown_preview(path: &std::path::Path) -> Result<String, String> {
+    use std::io::Read;
+
+    let file = std::fs::File::open(path).map_err(|error| error.to_string())?;
+    if file.metadata().map_err(|error| error.to_string())?.len() > MAX_MARKDOWN_PREVIEW_BYTES {
+        return Err("Markdown preview is limited to 5 MiB".to_string());
+    }
+
+    let mut content = String::new();
+    file.take(MAX_MARKDOWN_PREVIEW_BYTES + 1)
+        .read_to_string(&mut content)
+        .map_err(|error| error.to_string())?;
+    if content.len() as u64 > MAX_MARKDOWN_PREVIEW_BYTES {
+        return Err("Markdown preview is limited to 5 MiB".to_string());
+    }
+    Ok(content)
+}
+
 pub fn handle_key(
     app: &mut App,
     key: event::KeyEvent,
     diff_tx: &mpsc::UnboundedSender<DiffResult>,
+) -> bool {
+    handle_key_with_set_mode(app, key, |app, mode| app.set_mode(mode, diff_tx))
+}
+
+pub(crate) fn handle_key_bounded(
+    app: &mut App,
+    key: event::KeyEvent,
+    diff_tx: &mpsc::Sender<DiffResult>,
+) -> bool {
+    handle_key_with_set_mode(app, key, |app, mode| {
+        app.set_mode_bounded(mode, diff_tx);
+    })
+}
+
+fn handle_key_with_set_mode(
+    app: &mut App,
+    key: event::KeyEvent,
+    mut set_mode: impl FnMut(&mut App, DiffMode),
 ) -> bool {
     match key.code {
         KeyCode::Char('q') => return true,
@@ -51,20 +89,18 @@ pub fn handle_key(
 
         // Mode switching
         KeyCode::Char('m') => {
-            app.set_mode(DiffMode::Unstaged, diff_tx);
+            set_mode(app, DiffMode::Unstaged);
         }
         KeyCode::Char('s') => {
-            app.set_mode(DiffMode::Staged, diff_tx);
+            set_mode(app, DiffMode::Staged);
         }
         KeyCode::Char('b') => {
-            app.set_mode(DiffMode::Branch, diff_tx);
+            set_mode(app, DiffMode::Branch);
         }
 
         // View toggle
         KeyCode::Char('v') => {
-            app.side_by_side = !app.side_by_side;
-            app.prepare_active_layout();
-            app.clamp_active_viewport();
+            app.toggle_view();
         }
 
         // Scrolling
@@ -217,13 +253,23 @@ pub fn handle_key(
                 && let Some(file) = repo.files.get(file_idx)
                 && file.path.ends_with(".md")
             {
-                let full_path = repo.info.path.join(&file.path);
-                if let Ok(content) = std::fs::read_to_string(&full_path) {
-                    app.markdown_preview = Some(MarkdownPreviewState {
-                        content,
-                        path: file.path.clone(),
-                        scroll: 0,
-                    });
+                let preview_path = file.path.clone();
+                let full_path = repo.info.path.join(&preview_path);
+                match read_markdown_preview(&full_path) {
+                    Ok(content) => {
+                        *app.markdown_render_cache.borrow_mut() = None;
+                        app.markdown_preview = Some(MarkdownPreviewState {
+                            content,
+                            path: preview_path,
+                            scroll: 0,
+                        });
+                    }
+                    Err(error) => {
+                        app.status_message = Some((
+                            error,
+                            std::time::Instant::now() + std::time::Duration::from_secs(2),
+                        ));
+                    }
                 }
             }
         }
@@ -392,6 +438,7 @@ pub fn handle_markdown_preview_key(app: &mut App, key: event::KeyEvent) {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Char('p') => {
             app.markdown_preview = None;
+            *app.markdown_render_cache.borrow_mut() = None;
         }
         KeyCode::Down | KeyCode::Char('j') => {
             if let Some(ref mut preview) = app.markdown_preview {
@@ -427,6 +474,30 @@ pub fn handle_markdown_preview_key(app: &mut App, key: event::KeyEvent) {
     }
 }
 
+fn previous_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index -= 1;
+    }
+    text[..index]
+        .char_indices()
+        .next_back()
+        .map(|(index, _)| index)
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(text: &str, index: usize) -> usize {
+    let mut index = index.min(text.len());
+    while !text.is_char_boundary(index) {
+        index += 1;
+    }
+    text[index..]
+        .chars()
+        .next()
+        .map(|character| index + character.len_utf8())
+        .unwrap_or(index)
+}
+
 pub fn handle_comment_input_key(app: &mut App, key: event::KeyEvent) {
     if app.comment_input.is_none() {
         return;
@@ -455,27 +526,29 @@ pub fn handle_comment_input_key(app: &mut App, key: event::KeyEvent) {
             if let Some(ref mut input) = app.comment_input
                 && input.cursor_pos > 0
             {
-                input.cursor_pos -= 1;
-                input.text.remove(input.cursor_pos);
+                let mut current = input.cursor_pos.min(input.text.len());
+                while !input.text.is_char_boundary(current) {
+                    current -= 1;
+                }
+                let previous = previous_char_boundary(&input.text, current);
+                input.text.drain(previous..current);
+                input.cursor_pos = previous;
             }
         }
         KeyCode::Left => {
             if let Some(ref mut input) = app.comment_input {
-                input.cursor_pos = input.cursor_pos.saturating_sub(1);
+                input.cursor_pos = previous_char_boundary(&input.text, input.cursor_pos);
             }
         }
         KeyCode::Right => {
             if let Some(ref mut input) = app.comment_input {
-                input.cursor_pos = input.cursor_pos.min(input.text.len()).min(input.text.len());
-                if input.cursor_pos < input.text.len() {
-                    input.cursor_pos += 1;
-                }
+                input.cursor_pos = next_char_boundary(&input.text, input.cursor_pos);
             }
         }
         KeyCode::Char(c) => {
             if let Some(ref mut input) = app.comment_input {
                 input.text.insert(input.cursor_pos, c);
-                input.cursor_pos += 1;
+                input.cursor_pos += c.len_utf8();
             }
         }
         _ => {}
@@ -602,5 +675,37 @@ pub fn handle_comment_browser_key(app: &mut App, key: event::KeyEvent) {
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        MAX_MARKDOWN_PREVIEW_BYTES, next_char_boundary, previous_char_boundary,
+        read_markdown_preview,
+    };
+
+    #[test]
+    fn cursor_navigation_uses_utf8_boundaries() {
+        let text = "aé界";
+        assert_eq!(next_char_boundary(text, 1), 3);
+        assert_eq!(next_char_boundary(text, 3), 6);
+        assert_eq!(previous_char_boundary(text, 6), 3);
+        assert_eq!(previous_char_boundary(text, 3), 1);
+    }
+
+    #[test]
+    fn markdown_preview_has_a_size_limit() {
+        let path =
+            std::env::temp_dir().join(format!("changes-markdown-preview-{}", std::process::id()));
+        std::fs::write(&path, "# small").unwrap();
+        assert_eq!(read_markdown_preview(&path).unwrap(), "# small");
+
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_MARKDOWN_PREVIEW_BYTES + 1)
+            .unwrap();
+        assert!(read_markdown_preview(&path).is_err());
+        std::fs::remove_file(path).unwrap();
     }
 }

@@ -27,6 +27,12 @@ jobs:
         run: cargo test
       - name: Build
         run: cargo build --release
+      - name: Test release installer
+        env:
+          INSTALL_DIR: ${{ runner.temp }}/bin
+        run: |
+          sh install.sh
+          "$INSTALL_DIR/changes" --version
 
   # Cross-compile check for common targets (no run)
   cross:

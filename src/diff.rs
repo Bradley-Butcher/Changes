@@ -74,22 +74,24 @@ pub struct FileDiff {
 impl FileDiff {
     pub fn total_display_lines(&self) -> usize {
         if self.collapsed {
-            return 1; // just the header
+            return 1;
         }
-        // file header + (hunk header + lines) per hunk
-        1 + self.hunks.iter().map(|h| 1 + h.lines.len()).sum::<usize>()
+        1 + self
+            .hunks
+            .iter()
+            .map(|hunk| 1 + hunk.lines.len())
+            .sum::<usize>()
     }
 
-    /// Total lines in side-by-side mode (may differ from unified due to alignment).
     pub fn total_sbs_display_lines(&self) -> usize {
         if self.collapsed {
             return 1;
         }
-        let sbs_lines: usize = match &self.sbs_cache {
-            Some(hunks) => hunks.iter().map(|h| 1 + h.len()).sum(),
-            None => self.hunks.iter().map(|h| 1 + h.lines.len()).sum(),
+        let hunk_lines: usize = match &self.sbs_cache {
+            Some(hunks) => hunks.iter().map(|hunk| 1 + hunk.len()).sum(),
+            None => self.hunks.iter().map(|hunk| 1 + hunk.lines.len()).sum(),
         };
-        1 + sbs_lines
+        1 + hunk_lines
     }
 
     pub fn ensure_sbs_cache(&mut self) {

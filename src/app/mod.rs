@@ -37,6 +37,29 @@ pub struct CommentBrowserState {
     pub checked: std::collections::HashSet<usize>,
 }
 
+#[derive(Default)]
+struct RefreshGate {
+    in_flight: bool,
+    pending: bool,
+}
+
+impl RefreshGate {
+    fn request(&mut self) -> bool {
+        if self.in_flight {
+            self.pending = true;
+            false
+        } else {
+            self.in_flight = true;
+            true
+        }
+    }
+
+    fn complete(&mut self) -> bool {
+        self.in_flight = false;
+        std::mem::take(&mut self.pending)
+    }
+}
+
 pub struct RepoState {
     pub id: u64,
     pub info: RepoInfo,
@@ -79,6 +102,8 @@ pub struct MarkdownPreviewState {
 pub struct App {
     pub repos: Vec<RepoState>,
     next_repo_id: u64,
+    diff_refreshes: std::collections::HashMap<u64, RefreshGate>,
+    base_refreshes: std::collections::HashMap<u64, RefreshGate>,
     pub active_tab: usize,
     pub focused_file: Option<usize>,
     pub side_by_side: bool,
@@ -91,6 +116,8 @@ pub struct App {
     pub comment_input: Option<CommentInputState>,
     pub comment_browser: Option<CommentBrowserState>,
     pub markdown_preview: Option<MarkdownPreviewState>,
+    pub(crate) markdown_render_cache:
+        std::cell::RefCell<Option<(u16, Vec<ratatui::text::Line<'static>>)>>,
     pub layout: LayoutHints,
     pub last_click: Option<(u16, u16, Instant)>,
 }
@@ -115,9 +142,19 @@ impl App {
             })
             .collect();
         let next_repo_id = repos.len() as u64;
+        let diff_refreshes = repos
+            .iter()
+            .map(|repo| (repo.id, RefreshGate::default()))
+            .collect();
+        let base_refreshes = repos
+            .iter()
+            .map(|repo| (repo.id, RefreshGate::default()))
+            .collect();
         Self {
             repos,
             next_repo_id,
+            diff_refreshes,
+            base_refreshes,
             active_tab: 0,
             focused_file: None,
             side_by_side: false,
@@ -130,6 +167,7 @@ impl App {
             comment_input: None,
             comment_browser: None,
             markdown_preview: None,
+            markdown_render_cache: std::cell::RefCell::new(None),
             layout: LayoutHints::default(),
             last_click: None,
         }
@@ -143,6 +181,26 @@ impl App {
         self.repos[self.active_tab].mode = mode;
         self.refresh_repo_async(self.active_tab, diff_tx);
         self.jump_active_viewport_top();
+    }
+
+    pub(crate) fn set_mode_bounded(&mut self, mode: DiffMode, diff_tx: &mpsc::Sender<DiffResult>) {
+        self.repos[self.active_tab].mode = mode;
+        self.refresh_repo_async_bounded(self.active_tab, diff_tx);
+        self.jump_active_viewport_top();
+    }
+
+    pub fn toggle_view(&mut self) {
+        self.side_by_side = !self.side_by_side;
+        if !self.side_by_side {
+            for repo in &mut self.repos {
+                repo.sbs_layout = None;
+                for file in &mut repo.files {
+                    file.sbs_cache = None;
+                }
+            }
+        }
+        self.prepare_active_layout();
+        self.clamp_active_viewport();
     }
 
     pub fn toggle_collapsed(&mut self, file_idx: usize) {
@@ -619,14 +677,32 @@ impl App {
             sbs_viewport: ViewportState::default(),
             comments: Vec::new(),
         });
+        self.diff_refreshes.insert(id, RefreshGate::default());
+        self.base_refreshes.insert(id, RefreshGate::default());
         self.active_tab = idx;
         self.focused_file = None;
 
         Ok(idx)
     }
 
-    /// Ensure side-by-side caches exist for the active tab's files.
-    /// Called before each draw; no-op when caches already exist or unified mode is active.
+    pub(crate) fn remove_repo_at(&mut self, idx: usize) -> Option<PathBuf> {
+        let repo = self.repos.get(idx)?;
+        let id = repo.id;
+        let path = repo.info.path.clone();
+        self.repos.remove(idx);
+        self.diff_refreshes.remove(&id);
+        self.base_refreshes.remove(&id);
+        if self.repos.is_empty() {
+            self.active_tab = 0;
+        } else {
+            self.active_tab = self.active_tab.min(self.repos.len() - 1);
+            self.jump_active_viewport_top();
+        }
+        self.focused_file = None;
+        Some(path)
+    }
+
+    /// Preserve the original public cache-preparation entry point.
     pub fn ensure_sbs_caches(&mut self) {
         if !self.side_by_side {
             return;
@@ -690,6 +766,30 @@ impl App {
         }
     }
 
+    pub(crate) fn refresh_repo_async_bounded(
+        &mut self,
+        idx: usize,
+        diff_tx: &mpsc::Sender<DiffResult>,
+    ) {
+        let repo = &self.repos[idx];
+        let id = repo.id;
+        if !self.diff_refreshes.entry(id).or_default().request() {
+            return;
+        }
+        let path = repo.info.path.clone();
+        let mode = repo.mode;
+        let base = repo.base_branch.clone();
+        let tx = diff_tx.clone();
+        std::thread::spawn(move || {
+            let result = git::compute_diff(&path, mode, base.as_deref());
+            let _ = tx.blocking_send(DiffResult {
+                repo_id: id,
+                mode,
+                result,
+            });
+        });
+    }
+
     pub fn refresh_repo_async(&self, idx: usize, diff_tx: &mpsc::UnboundedSender<DiffResult>) {
         let repo = &self.repos[idx];
         let id = repo.id;
@@ -705,6 +805,82 @@ impl App {
                 result,
             });
         });
+    }
+
+    pub(crate) fn apply_diff_refresh_result(
+        &mut self,
+        result: DiffResult,
+        diff_tx: &mpsc::Sender<DiffResult>,
+    ) -> bool {
+        let Some(idx) = self.find_repo(result.repo_id) else {
+            return false;
+        };
+
+        let pending = self
+            .diff_refreshes
+            .entry(result.repo_id)
+            .or_default()
+            .complete();
+        let applied = !pending && result.mode == self.repos[idx].mode;
+        if applied {
+            self.apply_diff_result(idx, result.result);
+        }
+
+        if pending {
+            self.refresh_repo_async_bounded(idx, diff_tx);
+        }
+        applied
+    }
+
+    pub(crate) fn refresh_base_async(
+        &mut self,
+        idx: usize,
+        base_tx: &mpsc::Sender<BaseBranchResult>,
+    ) {
+        let repo = &self.repos[idx];
+        let id = repo.id;
+        if !self.base_refreshes.entry(id).or_default().request() {
+            return;
+        }
+        let path = repo.info.path.clone();
+        let tx = base_tx.clone();
+        std::thread::spawn(move || {
+            let branch = git::find_base_branch(&path);
+            let branch_name = git::current_branch(&path);
+            let _ = tx.blocking_send(BaseBranchResult {
+                repo_id: id,
+                branch,
+                branch_name,
+            });
+        });
+    }
+
+    pub(crate) fn apply_base_refresh_result(
+        &mut self,
+        result: BaseBranchResult,
+        base_tx: &mpsc::Sender<BaseBranchResult>,
+        diff_tx: &mpsc::Sender<DiffResult>,
+    ) -> bool {
+        let Some(idx) = self.find_repo(result.repo_id) else {
+            return false;
+        };
+
+        let pending = self
+            .base_refreshes
+            .entry(result.repo_id)
+            .or_default()
+            .complete();
+        if !pending {
+            let changed = self.repos[idx].base_branch != result.branch;
+            self.repos[idx].base_branch = result.branch;
+            self.repos[idx].branch_name = result.branch_name;
+            if changed && self.repos[idx].mode == DiffMode::Branch {
+                self.refresh_repo_async_bounded(idx, diff_tx);
+            }
+        } else {
+            self.refresh_base_async(idx, base_tx);
+        }
+        !pending
     }
 
     pub fn refresh_repo_sync(&mut self, idx: usize) {
@@ -731,7 +907,7 @@ impl App {
     pub fn file_header_positions(&self) -> Vec<usize> {
         let mut positions = Vec::new();
         if let Some(layout) = self.current_layout() {
-            for file_idx in 0..self.current_files().map(|files| files.len()).unwrap_or(0) {
+            for file_idx in 0..self.current_files().map(Vec::len).unwrap_or(0) {
                 if let Some(row) = layout.file_header_row(file_idx) {
                     positions.push(row);
                 }
@@ -1054,7 +1230,7 @@ impl GapExpandRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::App;
+    use super::{App, DiffResult, RefreshGate};
     use crate::diff::{FileDiff, FileStatus};
     use crate::git::RepoInfo;
     use std::path::PathBuf;
@@ -1086,6 +1262,46 @@ mod tests {
             query: query.to_string(),
             selected: 0,
         });
+    }
+
+    #[test]
+    fn refresh_gate_coalesces_work() {
+        let mut gate = RefreshGate::default();
+        assert!(gate.request());
+        assert!(!gate.request());
+        assert!(gate.complete());
+        assert!(gate.request());
+    }
+
+    #[test]
+    fn pending_refresh_drops_the_old_result() {
+        let mut app = test_app_with_files(&["old.rs"]);
+        let repo_id = app.repos[0].id;
+        let gate = app.diff_refreshes.get_mut(&repo_id).unwrap();
+        assert!(gate.request());
+        assert!(!gate.request());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let mut stale = test_app_with_files(&["stale.rs"]);
+        let result = DiffResult {
+            repo_id: app.repos[0].id,
+            mode: app.repos[0].mode,
+            result: Ok(stale.repos.remove(0).files),
+        };
+
+        assert!(!app.apply_diff_refresh_result(result, &tx));
+        assert_eq!(app.repos[0].files[0].path, "old.rs");
+    }
+
+    #[test]
+    fn leaving_side_by_side_view_releases_its_cache() {
+        let mut app = test_app_with_files(&["src/main.rs"]);
+
+        app.toggle_view();
+        assert!(app.repos[0].files[0].sbs_cache.is_some());
+
+        app.toggle_view();
+        assert!(app.repos[0].files[0].sbs_cache.is_none());
+        assert!(app.repos[0].sbs_layout.is_none());
     }
 
     #[test]

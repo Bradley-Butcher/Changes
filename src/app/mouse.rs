@@ -5,12 +5,59 @@ use crossterm::event::{self, MouseButton, MouseEventKind};
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
+#[derive(Clone)]
+enum GapSender {
+    Bounded(mpsc::Sender<GapExpandResult>),
+    Unbounded(mpsc::UnboundedSender<GapExpandResult>),
+}
+
+impl GapSender {
+    fn send(self, result: GapExpandResult) {
+        match self {
+            Self::Bounded(tx) => {
+                let _ = tx.blocking_send(result);
+            }
+            Self::Unbounded(tx) => {
+                let _ = tx.send(result);
+            }
+        }
+    }
+}
+
 /// Returns true if the event changed state (needs redraw).
 pub fn handle_mouse(
     app: &mut App,
     mouse: event::MouseEvent,
     diff_tx: &mpsc::UnboundedSender<DiffResult>,
     gap_tx: &mpsc::UnboundedSender<GapExpandResult>,
+) -> bool {
+    handle_mouse_with_senders(
+        app,
+        mouse,
+        |app, mode| app.set_mode(mode, diff_tx),
+        GapSender::Unbounded(gap_tx.clone()),
+    )
+}
+
+pub(crate) fn handle_mouse_bounded(
+    app: &mut App,
+    mouse: event::MouseEvent,
+    diff_tx: &mpsc::Sender<DiffResult>,
+    gap_tx: &mpsc::Sender<GapExpandResult>,
+) -> bool {
+    handle_mouse_with_senders(
+        app,
+        mouse,
+        |app, mode| app.set_mode_bounded(mode, diff_tx),
+        GapSender::Bounded(gap_tx.clone()),
+    )
+}
+
+fn handle_mouse_with_senders(
+    app: &mut App,
+    mouse: event::MouseEvent,
+    mut set_mode: impl FnMut(&mut App, crate::git::DiffMode),
+    gap_tx: GapSender,
 ) -> bool {
     // Scroll wheel in markdown preview
     if app.markdown_preview.is_some() {
@@ -74,13 +121,11 @@ pub fn handle_mouse(
                 let (vs, ve) = app.layout.view_badge_pos;
                 if click_col >= ms && click_col < me {
                     let next = app.current_mode().next();
-                    app.set_mode(next, diff_tx);
+                    set_mode(app, next);
                     return true;
                 }
                 if click_col >= vs && click_col < ve {
-                    app.side_by_side = !app.side_by_side;
-                    app.prepare_active_layout();
-                    app.clamp_active_viewport();
+                    app.toggle_view();
                     return true;
                 }
                 return false;
@@ -112,7 +157,7 @@ pub fn handle_mouse(
                 if let Some(req) = app.start_expand_gap(file_idx, gap_idx) {
                     let tx = gap_tx.clone();
                     std::thread::spawn(move || {
-                        let _ = tx.send(req.execute());
+                        tx.send(req.execute());
                     });
                 }
                 return true;
