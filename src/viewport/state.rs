@@ -1,20 +1,8 @@
 use std::ops::Range;
 
-const DEFAULT_OVERSCAN: usize = 8;
-
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ViewportState {
     scroll_offset: usize,
-    overscan: usize,
-}
-
-impl Default for ViewportState {
-    fn default() -> Self {
-        Self {
-            scroll_offset: 0,
-            overscan: DEFAULT_OVERSCAN,
-        }
-    }
 }
 
 impl ViewportState {
@@ -29,13 +17,6 @@ impl ViewportState {
     pub fn visible_range(&self, total_lines: usize, viewport_height: usize) -> Range<usize> {
         let start = self.clamped_offset(self.scroll_offset, total_lines, viewport_height);
         let end = (start + viewport_height).min(total_lines);
-        start..end
-    }
-
-    pub fn warm_range(&self, total_lines: usize, viewport_height: usize) -> Range<usize> {
-        let visible = self.visible_range(total_lines, viewport_height);
-        let start = visible.start.saturating_sub(self.overscan);
-        let end = (visible.end + self.overscan).min(total_lines);
         start..end
     }
 

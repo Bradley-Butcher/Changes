@@ -1,5 +1,4 @@
 use super::row::{RowRef, ViewKind};
-use crate::app::HunkComment;
 use crate::diff::{FileDiff, gap_between_hunks};
 use std::collections::HashMap;
 use unicode_width::UnicodeWidthStr;
@@ -13,24 +12,12 @@ pub struct DiffLayout {
 }
 
 impl DiffLayout {
-    pub fn build(
-        files: &[FileDiff],
-        view_kind: ViewKind,
-        comments: &[HunkComment],
-        content_width: usize,
-    ) -> Self {
+    pub fn build(files: &[FileDiff], view_kind: ViewKind, content_width: usize) -> Self {
         let mut rows = Vec::new();
         let mut file_header_rows = Vec::with_capacity(files.len());
 
-        // Pre-compute wrapped comment lines keyed by (file_idx, hunk_idx)
         let comment_width = content_width.saturating_sub(4).max(20);
         let mut comment_lines: HashMap<(usize, usize), Vec<String>> = HashMap::new();
-        for c in comments {
-            comment_lines.insert(
-                (c.file_idx, c.hunk_idx),
-                wrap_comment(&c.text, comment_width),
-            );
-        }
 
         for (file_idx, file) in files.iter().enumerate() {
             file_header_rows.push(rows.len());
@@ -53,8 +40,8 @@ impl DiffLayout {
                     gap_before,
                 });
 
-                // Emit comment rows after hunk header
-                if let Some(lines) = comment_lines.get(&(file_idx, hunk_idx)) {
+                if let Some(note) = &hunk.note {
+                    let lines = wrap_comment(note, comment_width);
                     for wrap_idx in 0..lines.len() {
                         rows.push(RowRef::Comment {
                             file_idx,
@@ -62,6 +49,7 @@ impl DiffLayout {
                             wrap_idx,
                         });
                     }
+                    comment_lines.insert((file_idx, hunk_idx), lines);
                 }
 
                 let line_count = match view_kind {
@@ -287,6 +275,7 @@ mod tests {
                     old_lineno: Some(10),
                     new_lineno: Some(12),
                 }],
+                note: None,
             }],
             additions: 1,
             deletions: 0,
@@ -298,7 +287,7 @@ mod tests {
 
     #[test]
     fn unified_layout_tracks_gap_and_tail_rows() {
-        let layout = DiffLayout::build(&[sample_file()], ViewKind::Unified, &[], 80);
+        let layout = DiffLayout::build(&[sample_file()], ViewKind::Unified, 80);
         assert_eq!(layout.total_lines(), 4);
         assert_eq!(layout.row(0), Some(RowRef::FileHeader { file_idx: 0 }));
         assert_eq!(

@@ -11,7 +11,7 @@ struct Cli {
     path: PathBuf,
 }
 
-#[tokio::main]
+#[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     let path = cli.path.canonicalize()?;

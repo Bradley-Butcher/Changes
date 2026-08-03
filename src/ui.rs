@@ -1,6 +1,7 @@
 use crate::app::App;
 use crate::diff::{FileStatus, LineKind};
 use crate::highlight::Highlighter;
+use crate::screen::ScreenLayout;
 use crate::viewport::RowRef;
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -31,20 +32,7 @@ const FG_PATH_DIR: Color = Color::Rgb(140, 140, 160);
 const FG_PATH_FILE: Color = Color::Rgb(240, 240, 250);
 const FG_COMMENT: Color = Color::Rgb(220, 180, 60);
 
-/// Layout positions computed during rendering, needed for mouse hit-testing.
-/// Kept separate from App so `draw()` doesn't require `&mut App`.
-#[derive(Default)]
-pub struct LayoutHints {
-    pub tab_positions: Vec<(u16, u16)>,
-    pub mode_badge_pos: (u16, u16),
-    pub view_badge_pos: (u16, u16),
-    pub status_bar_row: u16,
-    pub content_y: u16,
-    pub content_height: u16,
-    pub content_width: u16,
-}
-
-pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut LayoutHints) {
+pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, screen: &mut ScreenLayout) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -56,18 +44,18 @@ pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut
 
     // Compute content area top for mouse hit-testing
     let diff_inner = Block::default().borders(Borders::ALL).inner(chunks[1]);
-    hints.content_y = diff_inner.y;
-    hints.content_height = diff_inner.height;
-    hints.content_width = diff_inner.width;
+    screen.content_y = diff_inner.y;
+    screen.content_height = diff_inner.height;
+    screen.content_width = diff_inner.width;
 
-    draw_tab_bar(frame, app, hints, chunks[0]);
+    draw_tab_bar(frame, app, screen, chunks[0]);
     draw_diff_area(frame, app, highlighter, chunks[1]);
-    draw_status_bar(frame, app, hints, chunks[2]);
+    draw_status_bar(frame, app, screen, chunks[2]);
 
     if app.markdown_preview.is_some() {
         draw_markdown_preview(frame, app);
     } else if app.comment_input.is_some() {
-        draw_comment_input(frame, app);
+        draw_comment_input(frame, app, screen);
     } else if app.comment_browser.is_some() {
         draw_comment_browser(frame, app);
     } else if app.repo_adder.is_some() {
@@ -79,7 +67,7 @@ pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut
     }
 }
 
-fn draw_tab_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rect) {
+fn draw_tab_bar(frame: &mut Frame, app: &App, screen: &mut ScreenLayout, area: Rect) {
     let block = Block::default().borders(Borders::ALL);
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -124,7 +112,7 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rec
             positions[i].1 = area.x + area.width;
         }
     }
-    hints.tab_positions = positions;
+    screen.tab_positions = positions;
 
     let tab_line = Paragraph::new(Line::from(spans));
     frame.render_widget(tab_line, inner);
@@ -1000,7 +988,7 @@ fn format_expand_indicator(gap: usize, width: usize) -> String {
     format!("{}↕ {} │", " ".repeat(pad), gap_str)
 }
 
-fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rect) {
+fn draw_status_bar(frame: &mut Frame, app: &App, screen: &mut ScreenLayout, area: Rect) {
     let total_files: usize = app.repos.iter().map(|r| r.files.len()).sum();
     let base = app
         .repos
@@ -1066,7 +1054,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
             .bg(Color::Cyan)
             .add_modifier(Modifier::BOLD),
     ));
-    hints.mode_badge_pos = (col_before_mode, col_before_mode + mode_width);
+    screen.mode_badge_pos = (col_before_mode, col_before_mode + mode_width);
 
     spans.push(Span::raw(" "));
     let col_before_view: u16 = area.x
@@ -1083,8 +1071,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
             .bg(Color::Magenta)
             .add_modifier(Modifier::BOLD),
     ));
-    hints.view_badge_pos = (col_before_view, col_before_view + view_width);
-    hints.status_bar_row = area.y;
+    screen.view_badge_pos = (col_before_view, col_before_view + view_width);
+    screen.status_bar_row = area.y;
 
     // Right-align help/quit hints by padding
     let used_width: usize = spans
@@ -1459,7 +1447,7 @@ fn draw_help_overlay(frame: &mut Frame) {
     frame.render_widget(help, popup_area);
 }
 
-fn draw_comment_input(frame: &mut Frame, app: &App) {
+fn draw_comment_input(frame: &mut Frame, app: &App, screen: &ScreenLayout) {
     let input = match app.comment_input.as_ref() {
         Some(i) => i,
         None => return,
@@ -1491,15 +1479,15 @@ fn draw_comment_input(frame: &mut Frame, app: &App) {
     // Position anchored near the hunk
     let anchor_screen_y = (input.anchor_row as u16)
         .saturating_sub(app.current_scroll_offset() as u16)
-        + app.layout.content_y
+        + screen.content_y
         + 1;
 
-    let y = if anchor_screen_y + box_height < app.layout.content_y + app.layout.content_height {
+    let y = if anchor_screen_y + box_height < screen.content_y + screen.content_height {
         anchor_screen_y
     } else {
         anchor_screen_y.saturating_sub(box_height + 1)
     }
-    .clamp(app.layout.content_y, area.height.saturating_sub(box_height));
+    .clamp(screen.content_y, area.height.saturating_sub(box_height));
 
     let x = (area.width.saturating_sub(box_width)) / 2;
     let popup_area = Rect::new(x, y, box_width, box_height);
@@ -1570,10 +1558,7 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
         None => return,
     };
 
-    let comments = match app.repos.get(app.active_tab) {
-        Some(r) => &r.comments,
-        None => return,
-    };
+    let comments = app.comments();
 
     let area = frame.area();
     let width = 70u16.min(area.width.saturating_sub(4));
@@ -1644,26 +1629,23 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
                 if query_lower.is_empty() {
                     return true;
                 }
-                let c = &comments[i];
-                let file_path = files.get(c.file_idx).map(|f| f.path.as_str()).unwrap_or("");
-                let haystack = format!("{} {}", file_path, c.text).to_lowercase();
+                let (file_idx, _, note) = comments[i];
+                let file_path = files.get(file_idx).map(|f| f.path.as_str()).unwrap_or("");
+                let haystack = format!("{} {}", file_path, note).to_lowercase();
                 haystack.contains(&query_lower)
             })
             .collect();
 
         for (display_idx, &comment_idx) in filtered.iter().enumerate() {
-            let c = &comments[comment_idx];
+            let (file_idx, hunk_idx, note) = comments[comment_idx];
             let is_selected = display_idx == browser.selected;
             let is_checked = browser.checked.contains(&comment_idx);
             let check = if is_checked { "[x]" } else { "[ ]" };
 
-            let file_name = files
-                .get(c.file_idx)
-                .map(|f| f.path.as_str())
-                .unwrap_or("?");
+            let file_name = files.get(file_idx).map(|f| f.path.as_str()).unwrap_or("?");
             let lineno = files
-                .get(c.file_idx)
-                .and_then(|f| f.hunks.get(c.hunk_idx))
+                .get(file_idx)
+                .and_then(|f| f.hunks.get(hunk_idx))
                 .and_then(|h| h.first_new_lineno())
                 .unwrap_or(0);
 
@@ -1688,7 +1670,7 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
                 Style::default().fg(Color::White).bg(Color::Rgb(30, 30, 20))
             };
 
-            for text_line in c.text.lines() {
+            for text_line in note.lines() {
                 lines.push(Line::from(Span::styled(
                     format!("     {}", text_line),
                     text_style,
