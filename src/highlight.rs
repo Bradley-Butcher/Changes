@@ -1,14 +1,18 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use std::collections::HashMap;
+use std::path::Path;
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{self, ThemeSet};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
+const MAX_SYNTAX_CACHE_ENTRIES: usize = 128;
+const MAX_HIGHLIGHT_CACHE_ENTRIES: usize = 4096;
+
 pub struct Highlighter {
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
-    /// Maps file extensions to syntax name to avoid repeated find_syntax_for_file calls
+    /// Maps file extensions, or extensionless file names, to syntax names.
     syntax_cache: std::cell::RefCell<HashMap<String, String>>,
     highlight_cache: std::cell::RefCell<HashMap<(String, String), Vec<CachedSpan>>>,
 }
@@ -36,11 +40,22 @@ impl Highlighter {
     }
 
     fn get_syntax(&self, file_path: &str) -> &SyntaxReference {
-        // Extract extension for cache key
-        let ext = file_path.rsplit('.').next().unwrap_or("").to_string();
+        let path = Path::new(file_path);
+        let cache_key = path
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .map(|extension| format!("ext:{extension}"))
+            .unwrap_or_else(|| {
+                format!(
+                    "file:{}",
+                    path.file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or(file_path)
+                )
+            });
 
         let cache = self.syntax_cache.borrow();
-        if let Some(name) = cache.get(&ext)
+        if let Some(name) = cache.get(&cache_key)
             && let Some(syn) = self.syntax_set.find_syntax_by_name(name)
         {
             return syn;
@@ -54,9 +69,12 @@ impl Highlighter {
             .flatten()
             .unwrap_or_else(|| self.syntax_set.find_syntax_plain_text());
 
-        self.syntax_cache
-            .borrow_mut()
-            .insert(ext, syntax.name.clone());
+        let mut cache = self.syntax_cache.borrow_mut();
+        if cache.len() >= MAX_SYNTAX_CACHE_ENTRIES {
+            // ponytail: whole-cache eviction is enough for this small lookup cache.
+            cache.clear();
+        }
+        cache.insert(cache_key, syntax.name.clone());
 
         syntax
     }
@@ -101,9 +119,12 @@ impl Highlighter {
                     modifiers: syntect_modifiers(style.font_style),
                 })
                 .collect();
-            self.highlight_cache
-                .borrow_mut()
-                .insert(cache_key, cached.clone());
+            let mut cache = self.highlight_cache.borrow_mut();
+            if cache.len() >= MAX_HIGHLIGHT_CACHE_ENTRIES {
+                // ponytail: whole-cache eviction avoids an LRU dependency.
+                cache.clear();
+            }
+            cache.insert(cache_key, cached.clone());
             cached
         };
 
@@ -119,6 +140,24 @@ impl Highlighter {
             .collect();
 
         Line::from(spans)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Highlighter, MAX_HIGHLIGHT_CACHE_ENTRIES};
+
+    #[test]
+    fn caches_stay_bounded_and_extensionless_paths_use_file_names() {
+        let highlighter = Highlighter::new();
+        highlighter.highlight_line_content("one", "first/Makefile", None);
+        highlighter.highlight_line_content("two", "second/Dockerfile", None);
+        assert_eq!(highlighter.syntax_cache.borrow().len(), 2);
+
+        for index in 0..=MAX_HIGHLIGHT_CACHE_ENTRIES {
+            highlighter.highlight_line_content(&index.to_string(), "file.rs", None);
+        }
+        assert!(highlighter.highlight_cache.borrow().len() <= MAX_HIGHLIGHT_CACHE_ENTRIES);
     }
 }
 

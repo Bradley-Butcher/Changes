@@ -2,6 +2,7 @@ use super::row::{RowRef, ViewKind};
 use crate::app::HunkComment;
 use crate::diff::{FileDiff, gap_between_hunks};
 use std::collections::HashMap;
+use unicode_width::UnicodeWidthStr;
 
 #[derive(Debug, Clone)]
 pub struct DiffLayout {
@@ -247,7 +248,9 @@ fn wrap_comment(text: &str, max_width: usize) -> Vec<String> {
         for word in raw_line.split_whitespace() {
             if current.is_empty() {
                 current = word.to_string();
-            } else if current.len() + 1 + word.len() <= max_width {
+            } else if UnicodeWidthStr::width(current.as_str()) + 1 + UnicodeWidthStr::width(word)
+                <= max_width
+            {
                 current.push(' ');
                 current.push_str(word);
             } else {

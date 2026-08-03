@@ -6,3 +6,5 @@ pub mod runtime;
 pub mod ui;
 pub mod viewport;
 pub(crate) mod watcher;
+
+pub use runtime::run;

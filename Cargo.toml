@@ -23,3 +23,5 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 termimad = "0.34.1"
 ansi-to-tui = "8.0.1"
+unicode-width = "0.2"
+unicode-segmentation = "1"

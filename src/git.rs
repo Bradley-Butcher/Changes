@@ -7,6 +7,8 @@ use std::process::Command;
 
 const GRAPHITE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const GRAPHITE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+const MAX_UNTRACKED_FILE_BYTES: u64 = 5 * 1024 * 1024;
+const MAX_UNTRACKED_LINES: usize = 100_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiffMode {
@@ -274,38 +276,39 @@ pub fn compute_diff(
     // Handle untracked files in unstaged mode - read their content as all-additions
     if mode == DiffMode::Unstaged {
         for file in &mut files {
-            if file.status == FileStatus::Untracked
-                && file.hunks.is_empty()
-                && let Ok(content) = std::fs::read_to_string(repo_path.join(&file.path))
-            {
-                let lines: Vec<DiffLine> = content
-                    .lines()
-                    .enumerate()
-                    .map(|(i, line)| DiffLine {
-                        kind: LineKind::Addition,
-                        content: line.to_string(),
-                        old_lineno: None,
-                        new_lineno: Some(i as u32 + 1),
-                    })
-                    .collect();
-                file.additions = lines.len();
-                file.hunks.push(Hunk {
-                    header: format!("@@ -0,0 +1,{} @@ (new file)", lines.len()),
-                    lines,
-                });
+            if file.status == FileStatus::Untracked && file.hunks.is_empty() {
+                match read_untracked_lines(&repo_path.join(&file.path)) {
+                    Some(lines) => {
+                        file.additions = lines.len();
+                        file.total_new_lines = lines.len();
+                        file.hunks.push(Hunk {
+                            header: format!("@@ -0,0 +1,{} @@ (new file)", lines.len()),
+                            lines,
+                        });
+                    }
+                    None => file.hunks.push(Hunk {
+                        header: "@@ content omitted @@".to_string(),
+                        lines: vec![DiffLine {
+                            kind: LineKind::Context,
+                            content: "[content omitted: file is binary, unreadable, or too large]"
+                                .to_string(),
+                            old_lineno: None,
+                            new_lineno: None,
+                        }],
+                    }),
+                }
             }
         }
     }
 
     // Compute total_new_lines for expand indicators (line count only, no full read)
     for file in &mut files {
-        if file.status == FileStatus::Deleted {
+        if matches!(file.status, FileStatus::Deleted | FileStatus::Untracked) {
             continue;
         }
         let path = repo_path.join(&file.path);
-        if let Ok(f) = std::fs::File::open(&path) {
-            use std::io::BufRead;
-            file.total_new_lines = std::io::BufReader::new(f).lines().count();
+        if let Ok(line_count) = count_lines(&path) {
+            file.total_new_lines = line_count;
         }
     }
 
@@ -343,11 +346,16 @@ pub fn find_base_branch(repo_path: &Path) -> Option<String> {
                 Ok(None) => {
                     if std::time::Instant::now() >= deadline {
                         let _ = child.kill();
+                        let _ = child.wait();
                         break;
                     }
                     std::thread::sleep(GRAPHITE_POLL_INTERVAL);
                 }
-                Err(_) => break,
+                Err(_) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    break;
+                }
             }
         }
     }
@@ -362,6 +370,52 @@ pub fn find_base_branch(repo_path: &Path) -> Option<String> {
     }
 
     find_common_base_branch(&repo)
+}
+
+fn read_untracked_lines(path: &Path) -> Option<Vec<DiffLine>> {
+    use std::io::{BufRead, Read};
+
+    let file = std::fs::File::open(path).ok()?;
+    if file.metadata().ok()?.len() > MAX_UNTRACKED_FILE_BYTES {
+        return None;
+    }
+
+    let mut reader = std::io::BufReader::new(file).take(MAX_UNTRACKED_FILE_BYTES + 1);
+    let mut lines = Vec::new();
+    for (index, line) in reader.by_ref().lines().enumerate() {
+        if index >= MAX_UNTRACKED_LINES {
+            return None;
+        }
+        lines.push(DiffLine {
+            kind: LineKind::Addition,
+            content: line.ok()?,
+            old_lineno: None,
+            new_lineno: Some(index as u32 + 1),
+        });
+    }
+    (reader.limit() > 0).then_some(lines)
+}
+
+fn count_lines(path: &Path) -> std::io::Result<usize> {
+    use std::io::BufRead;
+
+    let file = std::fs::File::open(path)?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut count = 0;
+    let mut has_bytes = false;
+    let mut ends_with_newline = false;
+    loop {
+        let buffer = reader.fill_buf()?;
+        if buffer.is_empty() {
+            break;
+        }
+        has_bytes = true;
+        ends_with_newline = buffer.last() == Some(&b'\n');
+        count += buffer.iter().filter(|&&byte| byte == b'\n').count();
+        let length = buffer.len();
+        reader.consume(length);
+    }
+    Ok(count + usize::from(has_bytes && !ends_with_newline))
 }
 
 fn resolve_base_branch(
@@ -451,4 +505,49 @@ fn compute_branch_diff<'a>(
 
     let diff = repo.diff_tree_to_tree(Some(&merge_base_tree), Some(&head_tree), Some(opts))?;
     Ok(diff)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_UNTRACKED_FILE_BYTES, MAX_UNTRACKED_LINES, count_lines, read_untracked_lines};
+
+    fn temp_path(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "changes-{name}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
+    }
+
+    #[test]
+    fn streaming_line_count_matches_string_lines() {
+        let path = temp_path("line-count");
+        for content in ["", "one", "one\n", "one\ntwo", "one\ntwo\n"] {
+            std::fs::write(&path, content).unwrap();
+            assert_eq!(count_lines(&path).unwrap(), content.lines().count());
+        }
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn untracked_reader_rejects_excessive_line_counts() {
+        let path = temp_path("line-limit");
+        std::fs::write(&path, "\n".repeat(MAX_UNTRACKED_LINES + 1)).unwrap();
+        assert!(read_untracked_lines(&path).is_none());
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn untracked_reader_rejects_excessive_file_sizes() {
+        let path = temp_path("size-limit");
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_UNTRACKED_FILE_BYTES + 1)
+            .unwrap();
+        assert!(read_untracked_lines(&path).is_none());
+        std::fs::remove_file(path).unwrap();
+    }
 }

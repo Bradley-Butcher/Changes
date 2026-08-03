@@ -9,6 +9,8 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{
     Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState, Wrap,
 };
+use unicode_segmentation::UnicodeSegmentation;
+use unicode_width::UnicodeWidthStr;
 
 const BG_ADD: Color = Color::Rgb(30, 60, 30);
 const BG_DEL: Color = Color::Rgb(60, 30, 30);
@@ -95,7 +97,7 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rec
 
         let start = col;
         let label = format!(" {} ", repo.info.name);
-        let width = label.len() as u16;
+        let width = UnicodeWidthStr::width(label.as_str()) as u16;
 
         if i == app.active_tab {
             spans.push(Span::styled(
@@ -517,6 +519,33 @@ fn draw_side_by_side(
     }
 }
 
+fn chunk_end(content: &str, start: usize, max_width: usize) -> usize {
+    let mut width = 0;
+    let mut end = start;
+    for (offset, grapheme) in content[start..].grapheme_indices(true) {
+        let grapheme_end = start + offset + grapheme.len();
+        let grapheme_width = UnicodeWidthStr::width(grapheme);
+        if width + grapheme_width > max_width && width > 0 {
+            break;
+        }
+        width += grapheme_width;
+        end = grapheme_end;
+        if width >= max_width {
+            break;
+        }
+    }
+
+    if end < content.len()
+        && let Some((offset, character)) = content[start..end]
+            .char_indices()
+            .rev()
+            .find(|(_, character)| character.is_whitespace())
+    {
+        return start + offset + character.len_utf8();
+    }
+    end
+}
+
 fn build_unified_line<'a>(
     line: &crate::diff::DiffLine,
     file_path: &str,
@@ -553,7 +582,7 @@ fn build_unified_line<'a>(
     let gutter_width = lno_width * 2 + 2 + prefix.len(); // "NNNN NNNN │+ "
     let available = content_width.saturating_sub(gutter_width);
 
-    if available == 0 || line.content.len() <= available {
+    if available == 0 || UnicodeWidthStr::width(line.content.as_str()) <= available {
         let mut spans = vec![
             Span::styled(lineno, Style::default().fg(FG_MUTED)),
             Span::styled(prefix.to_string(), prefix_style),
@@ -570,16 +599,7 @@ fn build_unified_line<'a>(
     let mut pos = 0;
 
     while pos < content.len() {
-        let end = (pos + available).min(content.len());
-        // Try to break at a word boundary
-        let chunk_end = if end < content.len() {
-            content[pos..end]
-                .rfind(' ')
-                .map(|i| pos + i + 1)
-                .unwrap_or(end)
-        } else {
-            end
-        };
+        let chunk_end = chunk_end(content, pos, available);
         let chunk = &content[pos..chunk_end];
 
         if pos == 0 {
@@ -593,10 +613,7 @@ fn build_unified_line<'a>(
             result.push(Line::from(spans));
         } else {
             // Continuation: padding where gutter would be
-            let mut spans = vec![Span::styled(
-                padding.clone(),
-                Style::default().fg(FG_MUTED),
-            )];
+            let mut spans = vec![Span::styled(padding.clone(), Style::default().fg(FG_MUTED))];
             let mut highlighted = highlighter.highlight_line_content(chunk, file_path, bg);
             spans.append(&mut highlighted.spans);
             result.push(Line::from(spans));
@@ -638,18 +655,17 @@ fn build_sbs_line<'a>(
             let gutter_width = prefix.len();
             let available = pane_width.saturating_sub(gutter_width);
 
-            if available == 0 || line.content.len() <= available {
+            if available == 0 || UnicodeWidthStr::width(line.content.as_str()) <= available {
                 let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
                 let mut highlighted =
                     highlighter.highlight_line_content(&line.content, file_path, bg);
-                if let Some(ranges) = changed_ranges {
-                    let emph_bg = match line.kind {
-                        LineKind::Addition => BG_ADD_EMPH,
-                        LineKind::Deletion => BG_DEL_EMPH,
-                        _ => return vec![Line::from(spans)],
-                    };
-                    apply_inline_emphasis(&mut highlighted.spans, ranges, emph_bg);
-                }
+                apply_chunk_emphasis(
+                    &mut highlighted.spans,
+                    changed_ranges.as_deref(),
+                    line.kind,
+                    0,
+                    line.content.len(),
+                );
                 spans.append(&mut highlighted.spans);
                 return vec![Line::from(spans)];
             }
@@ -661,41 +677,32 @@ fn build_sbs_line<'a>(
             let mut pos = 0;
 
             while pos < content.len() {
-                let end = (pos + available).min(content.len());
-                let chunk_end = if end < content.len() {
-                    content[pos..end]
-                        .rfind(' ')
-                        .map(|i| pos + i + 1)
-                        .unwrap_or(end)
-                } else {
-                    end
-                };
+                let chunk_end = chunk_end(content, pos, available);
                 let chunk = &content[pos..chunk_end];
 
                 if pos == 0 {
                     let mut spans = vec![Span::styled(prefix.to_string(), prefix_style)];
-                    let mut highlighted =
-                        highlighter.highlight_line_content(chunk, file_path, bg);
-                    if let Some(ranges) = changed_ranges {
-                        let emph_bg = match line.kind {
-                            LineKind::Addition => BG_ADD_EMPH,
-                            LineKind::Deletion => BG_DEL_EMPH,
-                            _ => {
-                                spans.append(&mut highlighted.spans);
-                                result.push(Line::from(spans));
-                                pos = chunk_end;
-                                continue;
-                            }
-                        };
-                        apply_inline_emphasis(&mut highlighted.spans, ranges, emph_bg);
-                    }
+                    let mut highlighted = highlighter.highlight_line_content(chunk, file_path, bg);
+                    apply_chunk_emphasis(
+                        &mut highlighted.spans,
+                        changed_ranges.as_deref(),
+                        line.kind,
+                        pos,
+                        chunk_end,
+                    );
                     spans.append(&mut highlighted.spans);
                     result.push(Line::from(spans));
                 } else {
                     let mut spans =
                         vec![Span::styled(padding.clone(), Style::default().fg(FG_MUTED))];
-                    let mut highlighted =
-                        highlighter.highlight_line_content(chunk, file_path, bg);
+                    let mut highlighted = highlighter.highlight_line_content(chunk, file_path, bg);
+                    apply_chunk_emphasis(
+                        &mut highlighted.spans,
+                        changed_ranges.as_deref(),
+                        line.kind,
+                        pos,
+                        chunk_end,
+                    );
                     spans.append(&mut highlighted.spans);
                     result.push(Line::from(spans));
                 }
@@ -707,6 +714,42 @@ fn build_sbs_line<'a>(
         }
         None => vec![Line::from(Span::styled("~", Style::default().fg(FG_MUTED)))],
     }
+}
+
+fn apply_chunk_emphasis(
+    spans: &mut Vec<Span<'_>>,
+    ranges: Option<&[(usize, usize)]>,
+    kind: LineKind,
+    chunk_start: usize,
+    chunk_end: usize,
+) {
+    let Some(emphasis) = (match kind {
+        LineKind::Addition => Some(BG_ADD_EMPH),
+        LineKind::Deletion => Some(BG_DEL_EMPH),
+        LineKind::Context => None,
+    }) else {
+        return;
+    };
+    let Some(ranges) = ranges else {
+        return;
+    };
+    let local_ranges = ranges_for_chunk(ranges, chunk_start, chunk_end);
+    apply_inline_emphasis(spans, &local_ranges, emphasis);
+}
+
+fn ranges_for_chunk(
+    ranges: &[(usize, usize)],
+    chunk_start: usize,
+    chunk_end: usize,
+) -> Vec<(usize, usize)> {
+    ranges
+        .iter()
+        .filter_map(|&(start, end)| {
+            let start = start.max(chunk_start);
+            let end = end.min(chunk_end);
+            (start < end).then_some((start - chunk_start, end - chunk_start))
+        })
+        .collect()
 }
 
 /// Build a full-width centered file header banner.
@@ -795,7 +838,10 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
                 .bg(bg)
                 .add_modifier(Modifier::BOLD | underline),
         ));
-        old_path_str.len() + arrow.len() + dir.len() + filename.len()
+        UnicodeWidthStr::width(old_path_str)
+            + UnicodeWidthStr::width(arrow)
+            + UnicodeWidthStr::width(dir)
+            + UnicodeWidthStr::width(filename)
     } else {
         if !dir.is_empty() {
             spans.push(Span::styled(
@@ -813,11 +859,11 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
                 .bg(bg)
                 .add_modifier(Modifier::BOLD | underline),
         ));
-        dir.len() + filename.len()
+        UnicodeWidthStr::width(dir) + UnicodeWidthStr::width(filename)
     };
     spans.push(Span::styled("  ", Style::default().bg(bg)));
     let used = 1
-        + collapse.len()
+        + UnicodeWidthStr::width(collapse)
         + 1
         + status_char.len()
         + 2
@@ -1006,9 +1052,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
 
     // Mode and view as highlighted badges — track positions for click handling
     spans.push(Span::raw("  "));
-    let col_before_mode: u16 = area.x + spans.iter().map(|s| s.content.len() as u16).sum::<u16>();
+    let col_before_mode: u16 = area.x
+        + spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
+            .sum::<u16>();
     let mode_text = format!(" {} ", mode);
-    let mode_width = mode_text.len() as u16;
+    let mode_width = UnicodeWidthStr::width(mode_text.as_str()) as u16;
     spans.push(Span::styled(
         mode_text,
         Style::default()
@@ -1019,9 +1069,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
     hints.mode_badge_pos = (col_before_mode, col_before_mode + mode_width);
 
     spans.push(Span::raw(" "));
-    let col_before_view: u16 = area.x + spans.iter().map(|s| s.content.len() as u16).sum::<u16>();
+    let col_before_view: u16 = area.x
+        + spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
+            .sum::<u16>();
     let view_text = format!(" {} ", view);
-    let view_width = view_text.len() as u16;
+    let view_width = UnicodeWidthStr::width(view_text.as_str()) as u16;
     spans.push(Span::styled(
         view_text,
         Style::default()
@@ -1033,8 +1087,12 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
     hints.status_bar_row = area.y;
 
     // Right-align help/quit hints by padding
-    let used_width: usize = spans.iter().map(|s| s.content.len()).sum();
-    let padding = (area.width as usize).saturating_sub(used_width + right.len());
+    let used_width: usize = spans
+        .iter()
+        .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+        .sum();
+    let padding =
+        (area.width as usize).saturating_sub(used_width + UnicodeWidthStr::width(right.as_str()));
     spans.push(Span::raw(" ".repeat(padding)));
     spans.push(Span::styled(right, Style::default().fg(FG_MUTED)));
 
@@ -1251,17 +1309,17 @@ fn draw_repo_adder(frame: &mut Frame, app: &App) {
 }
 
 fn draw_markdown_preview(frame: &mut Frame, app: &App) {
-    let preview = match app.markdown_preview.as_ref() {
-        Some(p) => p,
-        None => return,
-    };
-
     let area = frame.area();
     let width = area.width.saturating_sub(6).min(120);
     let height = area.height.saturating_sub(4);
     let x = (area.width.saturating_sub(width)) / 2;
     let y = (area.height.saturating_sub(height)) / 2;
     let popup_area = Rect::new(x, y, width, height);
+
+    let preview = match app.markdown_preview.as_ref() {
+        Some(preview) => preview,
+        None => return,
+    };
 
     frame.render_widget(Clear, popup_area);
 
@@ -1273,37 +1331,47 @@ fn draw_markdown_preview(frame: &mut Frame, app: &App) {
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
-    let mut skin = termimad::MadSkin::default_dark();
-    // Clear backgrounds on paragraph text so it doesn't look highlighted
-    skin.paragraph.set_bg(termimad::crossterm::style::Color::Reset);
-    skin.bold.set_bg(termimad::crossterm::style::Color::Reset);
-    skin.italic.set_bg(termimad::crossterm::style::Color::Reset);
-    skin.strikeout.set_bg(termimad::crossterm::style::Color::Reset);
-    let fmt_text = skin.text(&preview.content, Some(inner.width as usize));
-    let rendered = format!("{fmt_text}");
+    let needs_render = app
+        .markdown_render_cache
+        .borrow()
+        .as_ref()
+        .is_none_or(|(width, _)| *width != inner.width);
+    if needs_render {
+        let mut skin = termimad::MadSkin::default_dark();
+        skin.paragraph
+            .set_bg(termimad::crossterm::style::Color::Reset);
+        skin.bold.set_bg(termimad::crossterm::style::Color::Reset);
+        skin.italic.set_bg(termimad::crossterm::style::Color::Reset);
+        skin.strikeout
+            .set_bg(termimad::crossterm::style::Color::Reset);
+        let fmt_text = skin.text(&preview.content, Some(inner.width as usize));
+        let rendered = format!("{fmt_text}");
+        let text = ansi_to_tui::IntoText::into_text(&rendered)
+            .unwrap_or_else(|_| ratatui::text::Text::raw(preview.content.clone()));
+        *app.markdown_render_cache.borrow_mut() = Some((inner.width, text.lines));
+    }
 
-    // Convert ANSI-styled string to ratatui Text
-    let text: ratatui::text::Text = match ansi_to_tui::IntoText::into_text(&rendered) {
-        Ok(t) => t,
-        Err(_) => ratatui::text::Text::raw(&preview.content),
-    };
-
-    let total_lines = text.lines.len();
+    let render_cache = app.markdown_render_cache.borrow();
+    let rendered_lines = &render_cache.as_ref().expect("rendered above").1;
+    let total_lines = rendered_lines.len();
     let scroll = preview
         .scroll
         .min(total_lines.saturating_sub(inner.height as usize));
+    let visible_lines: Vec<Line> = rendered_lines
+        .iter()
+        .skip(scroll)
+        .take(inner.height as usize)
+        .cloned()
+        .collect();
 
-    let para = Paragraph::new(text)
-        .scroll((scroll as u16, 0))
-        .style(Style::default().bg(Color::Rgb(25, 25, 35)));
+    let para = Paragraph::new(visible_lines).style(Style::default().bg(Color::Rgb(25, 25, 35)));
 
     frame.render_widget(para, inner);
 
     // Scrollbar
     if total_lines > inner.height as usize {
         let mut scrollbar_state =
-            ScrollbarState::new(total_lines.saturating_sub(inner.height as usize))
-                .position(scroll);
+            ScrollbarState::new(total_lines.saturating_sub(inner.height as usize)).position(scroll);
         let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
         frame.render_stateful_widget(scrollbar, popup_area, &mut scrollbar_state);
     }
@@ -1448,17 +1516,22 @@ fn draw_comment_input(frame: &mut Frame, app: &App) {
 
     // Render text with cursor
     let mut display_lines: Vec<Line> = Vec::new();
-    let mut char_count = 0;
+    let mut byte_count = 0;
     for (i, text_line) in text_lines.iter().enumerate() {
-        let line_start = char_count;
+        let line_start = byte_count;
         let line_end = line_start + text_line.len();
 
         if input.cursor_pos >= line_start && input.cursor_pos <= line_end {
             let cursor_col = input.cursor_pos - line_start;
             let before = &text_line[..cursor_col.min(text_line.len())];
             let after = &text_line[cursor_col.min(text_line.len())..];
-            let cursor_char = if after.is_empty() { " " } else { &after[..1] };
-            let after_cursor = if after.len() > 1 { &after[1..] } else { "" };
+            let cursor_len = after.chars().next().map(char::len_utf8).unwrap_or_default();
+            let cursor_char = if after.is_empty() {
+                " "
+            } else {
+                &after[..cursor_len]
+            };
+            let after_cursor = &after[cursor_len..];
             display_lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {}", before),
@@ -1484,7 +1557,7 @@ fn draw_comment_input(frame: &mut Frame, app: &App) {
         }
 
         // +1 for the \n between lines
-        char_count = line_end + if i < text_lines.len() - 1 { 1 } else { 0 };
+        byte_count = line_end + if i < text_lines.len() - 1 { 1 } else { 0 };
     }
 
     let para = Paragraph::new(display_lines).style(Style::default().bg(Color::Rgb(30, 30, 20)));
@@ -1659,7 +1732,25 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use super::hunk_context;
+    use super::{chunk_end, hunk_context, ranges_for_chunk};
+
+    #[test]
+    fn wraps_on_utf8_display_width_boundaries() {
+        let content = "aé界b";
+        assert_eq!(chunk_end(content, 0, 2), 3);
+        assert_eq!(chunk_end(content, 3, 2), 6);
+    }
+
+    #[test]
+    fn wrapping_keeps_unicode_sequences_together() {
+        assert_eq!(chunk_end("👩‍💻b", 0, 2), "👩‍💻".len());
+        assert_eq!(chunk_end("e\u{301}b", 0, 1), "e\u{301}".len());
+    }
+
+    #[test]
+    fn inline_ranges_follow_wrapped_chunks() {
+        assert_eq!(ranges_for_chunk(&[(2, 8)], 5, 10), vec![(0, 3)]);
+    }
 
     #[test]
     fn extracts_function_name() {
