@@ -23,6 +23,7 @@ pub struct DiffLine {
 pub struct Hunk {
     pub header: String,
     pub lines: Vec<DiffLine>,
+    pub note: Option<String>,
 }
 
 impl Hunk {
@@ -72,28 +73,6 @@ pub struct FileDiff {
 }
 
 impl FileDiff {
-    pub fn total_display_lines(&self) -> usize {
-        if self.collapsed {
-            return 1;
-        }
-        1 + self
-            .hunks
-            .iter()
-            .map(|hunk| 1 + hunk.lines.len())
-            .sum::<usize>()
-    }
-
-    pub fn total_sbs_display_lines(&self) -> usize {
-        if self.collapsed {
-            return 1;
-        }
-        let hunk_lines: usize = match &self.sbs_cache {
-            Some(hunks) => hunks.iter().map(|hunk| 1 + hunk.len()).sum(),
-            None => self.hunks.iter().map(|hunk| 1 + hunk.lines.len()).sum(),
-        };
-        1 + hunk_lines
-    }
-
     pub fn ensure_sbs_cache(&mut self) {
         if self.sbs_cache.is_none() {
             self.sbs_cache = Some(compute_side_by_side(&self.hunks));
@@ -264,85 +243,39 @@ fn merge_ranges(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
 mod tests {
     use super::{DiffLine, Hunk, gap_between_hunks};
 
+    fn hunk_at(line: Option<u32>) -> Hunk {
+        Hunk {
+            header: String::new(),
+            lines: line
+                .map(|line| DiffLine {
+                    kind: super::LineKind::Context,
+                    content: String::new(),
+                    old_lineno: Some(line),
+                    new_lineno: Some(line),
+                })
+                .into_iter()
+                .collect(),
+            note: None,
+        }
+    }
+
     #[test]
     fn adjacent_hunks_have_no_gap() {
-        let prev = Hunk {
-            header: String::new(),
-            lines: vec![DiffLine {
-                kind: super::LineKind::Context,
-                content: String::new(),
-                old_lineno: Some(10),
-                new_lineno: Some(10),
-            }],
-        };
-        let next = Hunk {
-            header: String::new(),
-            lines: vec![DiffLine {
-                kind: super::LineKind::Context,
-                content: String::new(),
-                old_lineno: Some(11),
-                new_lineno: Some(11),
-            }],
-        };
-        assert_eq!(gap_between_hunks(&prev, &next), 0);
+        assert_eq!(gap_between_hunks(&hunk_at(Some(10)), &hunk_at(Some(11))), 0);
     }
 
     #[test]
     fn gap_of_five() {
-        let prev = Hunk {
-            header: String::new(),
-            lines: vec![DiffLine {
-                kind: super::LineKind::Context,
-                content: String::new(),
-                old_lineno: Some(10),
-                new_lineno: Some(10),
-            }],
-        };
-        let next = Hunk {
-            header: String::new(),
-            lines: vec![DiffLine {
-                kind: super::LineKind::Context,
-                content: String::new(),
-                old_lineno: Some(16),
-                new_lineno: Some(16),
-            }],
-        };
-        assert_eq!(gap_between_hunks(&prev, &next), 5);
+        assert_eq!(gap_between_hunks(&hunk_at(Some(10)), &hunk_at(Some(16))), 5);
     }
 
     #[test]
     fn overlapping_hunks_have_no_gap() {
-        let prev = Hunk {
-            header: String::new(),
-            lines: vec![DiffLine {
-                kind: super::LineKind::Context,
-                content: String::new(),
-                old_lineno: Some(15),
-                new_lineno: Some(15),
-            }],
-        };
-        let next = Hunk {
-            header: String::new(),
-            lines: vec![DiffLine {
-                kind: super::LineKind::Context,
-                content: String::new(),
-                old_lineno: Some(10),
-                new_lineno: Some(10),
-            }],
-        };
-        assert_eq!(gap_between_hunks(&prev, &next), 0);
+        assert_eq!(gap_between_hunks(&hunk_at(Some(15)), &hunk_at(Some(10))), 0);
     }
 
     #[test]
     fn empty_hunks_have_no_gap() {
-        let prev = Hunk {
-            header: String::new(),
-            lines: vec![],
-        };
-        let next = Hunk {
-            header: String::new(),
-            lines: vec![],
-        };
-        assert_eq!(gap_between_hunks(&prev, &next), 0);
+        assert_eq!(gap_between_hunks(&hunk_at(None), &hunk_at(None)), 0);
     }
 }

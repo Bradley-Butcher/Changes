@@ -216,6 +216,7 @@ pub fn compute_diff(
                     current_hunk = Some(Hunk {
                         header,
                         lines: Vec::new(),
+                        note: None,
                     });
                 }
             }
@@ -255,6 +256,7 @@ pub fn compute_diff(
                 let hunk = Hunk {
                     header: String::new(),
                     lines: vec![diff_line],
+                    note: None,
                 };
                 current_hunk = Some(hunk);
             }
@@ -284,6 +286,7 @@ pub fn compute_diff(
                         file.hunks.push(Hunk {
                             header: format!("@@ -0,0 +1,{} @@ (new file)", lines.len()),
                             lines,
+                            note: None,
                         });
                     }
                     None => file.hunks.push(Hunk {
@@ -295,6 +298,7 @@ pub fn compute_diff(
                             old_lineno: None,
                             new_lineno: None,
                         }],
+                        note: None,
                     }),
                 }
             }

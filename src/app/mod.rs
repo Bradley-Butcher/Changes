@@ -1,26 +1,19 @@
-pub mod keys;
-pub mod mouse;
+pub(crate) mod keys;
+pub(crate) mod mouse;
 
 use crate::diff::{DiffLine, FileDiff, LineKind};
 use crate::git::{self, DiffMode, RepoInfo};
-use crate::ui::LayoutHints;
+use crate::screen::ViewportSize;
 use crate::viewport::{DiffLayout, ViewKind, ViewportState};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use tokio::sync::mpsc;
 
 // Tunable constants
 const FLASH_DURATION: Duration = Duration::from_millis(300);
 pub(crate) const SCROLL_SPEED: usize = 3;
 pub(crate) const PAGE_SCROLL: usize = 20;
 pub(crate) const DOUBLE_CLICK_MS: u64 = 400;
-
-pub struct HunkComment {
-    pub file_idx: usize,
-    pub hunk_idx: usize,
-    pub text: String,
-}
 
 pub struct CommentInputState {
     pub file_idx: usize,
@@ -37,29 +30,6 @@ pub struct CommentBrowserState {
     pub checked: std::collections::HashSet<usize>,
 }
 
-#[derive(Default)]
-struct RefreshGate {
-    in_flight: bool,
-    pending: bool,
-}
-
-impl RefreshGate {
-    fn request(&mut self) -> bool {
-        if self.in_flight {
-            self.pending = true;
-            false
-        } else {
-            self.in_flight = true;
-            true
-        }
-    }
-
-    fn complete(&mut self) -> bool {
-        self.in_flight = false;
-        std::mem::take(&mut self.pending)
-    }
-}
-
 pub struct RepoState {
     pub id: u64,
     pub info: RepoInfo,
@@ -71,7 +41,6 @@ pub struct RepoState {
     pub sbs_layout: Option<DiffLayout>,
     pub unified_viewport: ViewportState,
     pub sbs_viewport: ViewportState,
-    pub comments: Vec<HunkComment>,
 }
 
 pub struct FlashState {
@@ -102,8 +71,6 @@ pub struct MarkdownPreviewState {
 pub struct App {
     pub repos: Vec<RepoState>,
     next_repo_id: u64,
-    diff_refreshes: std::collections::HashMap<u64, RefreshGate>,
-    base_refreshes: std::collections::HashMap<u64, RefreshGate>,
     pub active_tab: usize,
     pub focused_file: Option<usize>,
     pub side_by_side: bool,
@@ -118,7 +85,6 @@ pub struct App {
     pub markdown_preview: Option<MarkdownPreviewState>,
     pub(crate) markdown_render_cache:
         std::cell::RefCell<Option<(u16, Vec<ratatui::text::Line<'static>>)>>,
-    pub layout: LayoutHints,
     pub last_click: Option<(u16, u16, Instant)>,
 }
 
@@ -138,23 +104,12 @@ impl App {
                 sbs_layout: None,
                 unified_viewport: ViewportState::default(),
                 sbs_viewport: ViewportState::default(),
-                comments: Vec::new(),
             })
             .collect();
         let next_repo_id = repos.len() as u64;
-        let diff_refreshes = repos
-            .iter()
-            .map(|repo| (repo.id, RefreshGate::default()))
-            .collect();
-        let base_refreshes = repos
-            .iter()
-            .map(|repo| (repo.id, RefreshGate::default()))
-            .collect();
         Self {
             repos,
             next_repo_id,
-            diff_refreshes,
-            base_refreshes,
             active_tab: 0,
             focused_file: None,
             side_by_side: false,
@@ -168,7 +123,6 @@ impl App {
             comment_browser: None,
             markdown_preview: None,
             markdown_render_cache: std::cell::RefCell::new(None),
-            layout: LayoutHints::default(),
             last_click: None,
         }
     }
@@ -177,19 +131,12 @@ impl App {
         self.repos[self.active_tab].mode
     }
 
-    pub fn set_mode(&mut self, mode: DiffMode, diff_tx: &mpsc::UnboundedSender<DiffResult>) {
+    pub fn set_mode(&mut self, mode: DiffMode) {
         self.repos[self.active_tab].mode = mode;
-        self.refresh_repo_async(self.active_tab, diff_tx);
         self.jump_active_viewport_top();
     }
 
-    pub(crate) fn set_mode_bounded(&mut self, mode: DiffMode, diff_tx: &mpsc::Sender<DiffResult>) {
-        self.repos[self.active_tab].mode = mode;
-        self.refresh_repo_async_bounded(self.active_tab, diff_tx);
-        self.jump_active_viewport_top();
-    }
-
-    pub fn toggle_view(&mut self) {
+    pub fn toggle_view(&mut self, viewport: ViewportSize) {
         self.side_by_side = !self.side_by_side;
         if !self.side_by_side {
             for repo in &mut self.repos {
@@ -199,30 +146,30 @@ impl App {
                 }
             }
         }
-        self.prepare_active_layout();
-        self.clamp_active_viewport();
+        self.prepare_active_layout(viewport);
+        self.clamp_active_viewport(viewport);
     }
 
-    pub fn toggle_collapsed(&mut self, file_idx: usize) {
+    pub fn toggle_collapsed(&mut self, file_idx: usize, viewport: ViewportSize) {
         if let Some(files) = self.current_files_mut()
             && let Some(file) = files.get_mut(file_idx)
         {
             file.collapsed = !file.collapsed;
         }
         self.invalidate_layouts(self.active_tab);
-        self.prepare_active_layout();
-        self.clamp_active_viewport();
+        self.prepare_active_layout(viewport);
+        self.clamp_active_viewport(viewport);
     }
 
-    pub fn set_all_collapsed(&mut self, collapsed: bool) {
+    pub fn set_all_collapsed(&mut self, collapsed: bool, viewport: ViewportSize) {
         if let Some(files) = self.current_files_mut() {
             for file in files.iter_mut() {
                 file.collapsed = collapsed;
             }
         }
         self.invalidate_layouts(self.active_tab);
-        self.prepare_active_layout();
-        self.clamp_active_viewport();
+        self.prepare_active_layout(viewport);
+        self.clamp_active_viewport(viewport);
     }
 
     pub fn active_view_kind(&self) -> ViewKind {
@@ -231,10 +178,6 @@ impl App {
         } else {
             ViewKind::Unified
         }
-    }
-
-    fn viewport_height(&self) -> usize {
-        self.layout.content_height.max(1) as usize
     }
 
     pub fn current_files(&self) -> Option<&Vec<FileDiff>> {
@@ -259,10 +202,10 @@ impl App {
             .unwrap_or(0)
     }
 
-    pub fn prepare_active_layout(&mut self) {
+    pub fn prepare_active_layout(&mut self, viewport: ViewportSize) {
         let idx = self.active_tab;
         let view = self.active_view_kind();
-        self.ensure_layout(idx, view);
+        self.ensure_layout(idx, view, viewport);
     }
 
     pub fn current_layout(&self) -> Option<&DiffLayout> {
@@ -289,14 +232,7 @@ impl App {
             .unwrap_or(0..0)
     }
 
-    pub fn warm_row_range(&self, total_lines: usize, viewport_height: usize) -> Range<usize> {
-        self.current_viewport()
-            .map(|viewport| viewport.warm_range(total_lines, viewport_height))
-            .unwrap_or(0..0)
-    }
-
-    fn ensure_layout(&mut self, idx: usize, view: ViewKind) {
-        let height = self.viewport_height();
+    fn ensure_layout(&mut self, idx: usize, view: ViewKind, viewport: ViewportSize) {
         let repo = match self.repos.get_mut(idx) {
             Some(repo) => repo,
             None => return,
@@ -313,16 +249,14 @@ impl App {
                 file.ensure_sbs_cache();
             }
         }
-        let width = self.layout.content_width.max(1) as usize;
-        let width = if width <= 1 { 80 } else { width };
-        *layout_slot = Some(DiffLayout::build(&repo.files, view, &repo.comments, width));
+        *layout_slot = Some(DiffLayout::build(&repo.files, view, viewport.width));
         let total = layout_slot
             .as_ref()
             .map(DiffLayout::total_lines)
             .unwrap_or(0);
         match view {
-            ViewKind::Unified => repo.unified_viewport.clamp_scroll(total, height),
-            ViewKind::SideBySide => repo.sbs_viewport.clamp_scroll(total, height),
+            ViewKind::Unified => repo.unified_viewport.clamp_scroll(total, viewport.height),
+            ViewKind::SideBySide => repo.sbs_viewport.clamp_scroll(total, viewport.height),
         }
     }
 
@@ -333,10 +267,17 @@ impl App {
         }
     }
 
-    pub fn clamp_active_viewport(&mut self) {
+    pub(crate) fn invalidate_all_layouts(&mut self) {
+        for repo in &mut self.repos {
+            repo.unified_layout = None;
+            repo.sbs_layout = None;
+        }
+    }
+
+    pub fn clamp_active_viewport(&mut self, viewport: ViewportSize) {
         let idx = self.active_tab;
         let view = self.active_view_kind();
-        self.ensure_layout(idx, view);
+        self.ensure_layout(idx, view, viewport);
         let total = self
             .repos
             .get(idx)
@@ -346,19 +287,18 @@ impl App {
             })
             .map(DiffLayout::total_lines)
             .unwrap_or(0);
-        let height = self.viewport_height();
         if let Some(repo) = self.repos.get_mut(idx) {
             match view {
-                ViewKind::Unified => repo.unified_viewport.clamp_scroll(total, height),
-                ViewKind::SideBySide => repo.sbs_viewport.clamp_scroll(total, height),
+                ViewKind::Unified => repo.unified_viewport.clamp_scroll(total, viewport.height),
+                ViewKind::SideBySide => repo.sbs_viewport.clamp_scroll(total, viewport.height),
             }
         }
     }
 
-    pub fn scroll_active_viewport(&mut self, delta: isize) {
+    pub fn scroll_active_viewport(&mut self, delta: isize, viewport: ViewportSize) {
         let idx = self.active_tab;
         let view = self.active_view_kind();
-        self.ensure_layout(idx, view);
+        self.ensure_layout(idx, view, viewport);
         let total = self
             .repos
             .get(idx)
@@ -368,20 +308,21 @@ impl App {
             })
             .map(DiffLayout::total_lines)
             .unwrap_or(0);
-        let height = self.viewport_height();
         if let Some(repo) = self.repos.get_mut(idx) {
             match view {
-                ViewKind::Unified => repo.unified_viewport.scroll_by(delta, total, height),
-                ViewKind::SideBySide => repo.sbs_viewport.scroll_by(delta, total, height),
+                ViewKind::Unified => repo
+                    .unified_viewport
+                    .scroll_by(delta, total, viewport.height),
+                ViewKind::SideBySide => repo.sbs_viewport.scroll_by(delta, total, viewport.height),
             }
         }
         self.focused_file = self.focused_file_from_scroll();
     }
 
-    pub fn jump_active_viewport_to(&mut self, row: usize) {
+    pub fn jump_active_viewport_to(&mut self, row: usize, viewport: ViewportSize) {
         let idx = self.active_tab;
         let view = self.active_view_kind();
-        self.ensure_layout(idx, view);
+        self.ensure_layout(idx, view, viewport);
         let total = self
             .repos
             .get(idx)
@@ -391,11 +332,10 @@ impl App {
             })
             .map(DiffLayout::total_lines)
             .unwrap_or(0);
-        let height = self.viewport_height();
         if let Some(repo) = self.repos.get_mut(idx) {
             match view {
-                ViewKind::Unified => repo.unified_viewport.jump_to(row, total, height),
-                ViewKind::SideBySide => repo.sbs_viewport.jump_to(row, total, height),
+                ViewKind::Unified => repo.unified_viewport.jump_to(row, total, viewport.height),
+                ViewKind::SideBySide => repo.sbs_viewport.jump_to(row, total, viewport.height),
             }
         }
         self.focused_file = self.focused_file_from_scroll();
@@ -412,10 +352,10 @@ impl App {
         self.focused_file = self.focused_file_from_scroll();
     }
 
-    pub fn jump_active_viewport_bottom(&mut self) {
+    pub fn jump_active_viewport_bottom(&mut self, viewport: ViewportSize) {
         let idx = self.active_tab;
         let view = self.active_view_kind();
-        self.ensure_layout(idx, view);
+        self.ensure_layout(idx, view, viewport);
         let total = self
             .repos
             .get(idx)
@@ -425,11 +365,10 @@ impl App {
             })
             .map(DiffLayout::total_lines)
             .unwrap_or(0);
-        let height = self.viewport_height();
         if let Some(repo) = self.repos.get_mut(idx) {
             match view {
-                ViewKind::Unified => repo.unified_viewport.jump_to_bottom(total, height),
-                ViewKind::SideBySide => repo.sbs_viewport.jump_to_bottom(total, height),
+                ViewKind::Unified => repo.unified_viewport.jump_to_bottom(total, viewport.height),
+                ViewKind::SideBySide => repo.sbs_viewport.jump_to_bottom(total, viewport.height),
             }
         }
         self.focused_file = self.focused_file_from_scroll();
@@ -471,13 +410,13 @@ impl App {
             .collect()
     }
 
-    pub fn jump_to_file(&mut self, file_idx: usize) {
-        self.prepare_active_layout();
+    pub fn jump_to_file(&mut self, file_idx: usize, viewport: ViewportSize) {
+        self.prepare_active_layout(viewport);
         if let Some(pos) = self
             .current_layout()
             .and_then(|layout| layout.file_header_row(file_idx))
         {
-            self.jump_active_viewport_to(pos);
+            self.jump_active_viewport_to(pos, viewport);
             self.focused_file = Some(file_idx);
         }
     }
@@ -537,7 +476,7 @@ impl App {
     }
 
     /// Apply the result of a background gap expansion.
-    pub fn apply_gap_expand(&mut self, result: GapExpandResult) {
+    pub fn apply_gap_expand(&mut self, result: GapExpandResult, viewport: ViewportSize) {
         let idx = match self.find_repo(result.repo_id) {
             Some(i) => i,
             None => return,
@@ -569,8 +508,8 @@ impl App {
         file.sbs_cache = None;
         self.invalidate_layouts(idx);
         if idx == self.active_tab {
-            self.prepare_active_layout();
-            self.clamp_active_viewport();
+            self.prepare_active_layout(viewport);
+            self.clamp_active_viewport(viewport);
         }
     }
 
@@ -675,10 +614,7 @@ impl App {
             sbs_layout: None,
             unified_viewport: ViewportState::default(),
             sbs_viewport: ViewportState::default(),
-            comments: Vec::new(),
         });
-        self.diff_refreshes.insert(id, RefreshGate::default());
-        self.base_refreshes.insert(id, RefreshGate::default());
         self.active_tab = idx;
         self.focused_file = None;
 
@@ -687,11 +623,8 @@ impl App {
 
     pub(crate) fn remove_repo_at(&mut self, idx: usize) -> Option<PathBuf> {
         let repo = self.repos.get(idx)?;
-        let id = repo.id;
         let path = repo.info.path.clone();
         self.repos.remove(idx);
-        self.diff_refreshes.remove(&id);
-        self.base_refreshes.remove(&id);
         if self.repos.is_empty() {
             self.active_tab = 0;
         } else {
@@ -702,20 +635,12 @@ impl App {
         Some(path)
     }
 
-    /// Preserve the original public cache-preparation entry point.
-    pub fn ensure_sbs_caches(&mut self) {
-        if !self.side_by_side {
-            return;
-        }
-        if let Some(files) = self.current_files_mut() {
-            for file in files {
-                file.ensure_sbs_cache();
-            }
-        }
-        self.ensure_layout(self.active_tab, ViewKind::SideBySide);
-    }
-
-    pub fn apply_diff_result(&mut self, idx: usize, result: anyhow::Result<Vec<FileDiff>>) {
+    pub(crate) fn apply_diff_result(
+        &mut self,
+        idx: usize,
+        result: anyhow::Result<Vec<FileDiff>>,
+        viewport: ViewportSize,
+    ) {
         match result {
             Ok(files) => {
                 let old_collapsed: std::collections::HashMap<String, bool> = self.repos[idx]
@@ -735,28 +660,27 @@ impl App {
                 }
 
                 self.repos[idx].files = new_files;
-                self.repos[idx].comments.clear();
                 self.comment_input = None;
                 self.comment_browser = None;
                 self.invalidate_layouts(idx);
-                self.ensure_layout(idx, ViewKind::Unified);
+                self.ensure_layout(idx, ViewKind::Unified, viewport);
                 if self.side_by_side && idx == self.active_tab {
-                    self.ensure_layout(idx, ViewKind::SideBySide);
+                    self.ensure_layout(idx, ViewKind::SideBySide, viewport);
                 }
-                let height = self.viewport_height();
                 if let Some(repo) = self.repos.get_mut(idx) {
                     let unified_total = repo
                         .unified_layout
                         .as_ref()
                         .map(DiffLayout::total_lines)
                         .unwrap_or(0);
-                    repo.unified_viewport.clamp_scroll(unified_total, height);
+                    repo.unified_viewport
+                        .clamp_scroll(unified_total, viewport.height);
                     let sbs_total = repo
                         .sbs_layout
                         .as_ref()
                         .map(DiffLayout::total_lines)
                         .unwrap_or(0);
-                    repo.sbs_viewport.clamp_scroll(sbs_total, height);
+                    repo.sbs_viewport.clamp_scroll(sbs_total, viewport.height);
                 }
                 self.last_error = None;
             }
@@ -766,154 +690,19 @@ impl App {
         }
     }
 
-    pub(crate) fn refresh_repo_async_bounded(
-        &mut self,
-        idx: usize,
-        diff_tx: &mpsc::Sender<DiffResult>,
-    ) {
-        let repo = &self.repos[idx];
-        let id = repo.id;
-        if !self.diff_refreshes.entry(id).or_default().request() {
-            return;
-        }
-        let path = repo.info.path.clone();
-        let mode = repo.mode;
-        let base = repo.base_branch.clone();
-        let tx = diff_tx.clone();
-        std::thread::spawn(move || {
-            let result = git::compute_diff(&path, mode, base.as_deref());
-            let _ = tx.blocking_send(DiffResult {
-                repo_id: id,
-                mode,
-                result,
-            });
-        });
-    }
-
-    pub fn refresh_repo_async(&self, idx: usize, diff_tx: &mpsc::UnboundedSender<DiffResult>) {
-        let repo = &self.repos[idx];
-        let id = repo.id;
-        let path = repo.info.path.clone();
-        let mode = repo.mode;
-        let base = repo.base_branch.clone();
-        let tx = diff_tx.clone();
-        std::thread::spawn(move || {
-            let result = git::compute_diff(&path, mode, base.as_deref());
-            let _ = tx.send(DiffResult {
-                repo_id: id,
-                mode,
-                result,
-            });
-        });
-    }
-
-    pub(crate) fn apply_diff_refresh_result(
-        &mut self,
-        result: DiffResult,
-        diff_tx: &mpsc::Sender<DiffResult>,
-    ) -> bool {
-        let Some(idx) = self.find_repo(result.repo_id) else {
-            return false;
-        };
-
-        let pending = self
-            .diff_refreshes
-            .entry(result.repo_id)
-            .or_default()
-            .complete();
-        let applied = !pending && result.mode == self.repos[idx].mode;
-        if applied {
-            self.apply_diff_result(idx, result.result);
-        }
-
-        if pending {
-            self.refresh_repo_async_bounded(idx, diff_tx);
-        }
-        applied
-    }
-
-    pub(crate) fn refresh_base_async(
-        &mut self,
-        idx: usize,
-        base_tx: &mpsc::Sender<BaseBranchResult>,
-    ) {
-        let repo = &self.repos[idx];
-        let id = repo.id;
-        if !self.base_refreshes.entry(id).or_default().request() {
-            return;
-        }
-        let path = repo.info.path.clone();
-        let tx = base_tx.clone();
-        std::thread::spawn(move || {
-            let branch = git::find_base_branch(&path);
-            let branch_name = git::current_branch(&path);
-            let _ = tx.blocking_send(BaseBranchResult {
-                repo_id: id,
-                branch,
-                branch_name,
-            });
-        });
-    }
-
-    pub(crate) fn apply_base_refresh_result(
-        &mut self,
-        result: BaseBranchResult,
-        base_tx: &mpsc::Sender<BaseBranchResult>,
-        diff_tx: &mpsc::Sender<DiffResult>,
-    ) -> bool {
-        let Some(idx) = self.find_repo(result.repo_id) else {
-            return false;
-        };
-
-        let pending = self
-            .base_refreshes
-            .entry(result.repo_id)
-            .or_default()
-            .complete();
-        if !pending {
-            let changed = self.repos[idx].base_branch != result.branch;
-            self.repos[idx].base_branch = result.branch;
-            self.repos[idx].branch_name = result.branch_name;
-            if changed && self.repos[idx].mode == DiffMode::Branch {
-                self.refresh_repo_async_bounded(idx, diff_tx);
-            }
-        } else {
-            self.refresh_base_async(idx, base_tx);
-        }
-        !pending
-    }
-
-    pub fn refresh_repo_sync(&mut self, idx: usize) {
+    pub fn refresh_repo_sync(&mut self, idx: usize, viewport: ViewportSize) {
         let repo = &self.repos[idx];
         let mode = repo.mode;
         let base = repo.base_branch.clone();
         let path = repo.info.path.clone();
         let result = git::compute_diff(&path, mode, base.as_deref());
-        self.apply_diff_result(idx, result);
+        self.apply_diff_result(idx, result, viewport);
     }
 
-    pub fn refresh_all_sync(&mut self) {
+    pub fn refresh_all_sync(&mut self, viewport: ViewportSize) {
         for i in 0..self.repos.len() {
-            self.refresh_repo_sync(i);
+            self.refresh_repo_sync(i, viewport);
         }
-    }
-
-    pub fn total_display_lines(&self) -> usize {
-        self.current_layout()
-            .map(DiffLayout::total_lines)
-            .unwrap_or(0)
-    }
-
-    pub fn file_header_positions(&self) -> Vec<usize> {
-        let mut positions = Vec::new();
-        if let Some(layout) = self.current_layout() {
-            for file_idx in 0..self.current_files().map(Vec::len).unwrap_or(0) {
-                if let Some(row) = layout.file_header_row(file_idx) {
-                    positions.push(row);
-                }
-            }
-        }
-        positions
     }
 
     pub fn focused_file_from_scroll(&self) -> Option<usize> {
@@ -976,25 +765,11 @@ impl App {
             .and_then(|l| l.new_lineno.or(l.old_lineno))
             .unwrap_or(0);
 
-        // Collect any comments attached to this hunk
-        let hunk_comments: Vec<&HunkComment> = self
-            .repos
-            .get(self.active_tab)
-            .map(|r| {
-                r.comments
-                    .iter()
-                    .filter(|c| c.file_idx == file_idx && c.hunk_idx == target_hunk)
-                    .collect()
-            })
-            .unwrap_or_default();
-
         let mut result = format!("// {}:{}-{}\n", file.path, first_lineno, last_lineno);
 
-        if !hunk_comments.is_empty() {
-            for c in &hunk_comments {
-                for comment_line in c.text.lines() {
-                    result.push_str(&format!("// > {}\n", comment_line));
-                }
+        if let Some(note) = &hunk.note {
+            for line in note.lines() {
+                result.push_str(&format!("// > {}\n", line));
             }
         }
 
@@ -1018,49 +793,67 @@ impl App {
 
     // -- Comment methods --
 
-    pub fn find_comment(&self, file_idx: usize, hunk_idx: usize) -> Option<&HunkComment> {
-        self.repos
-            .get(self.active_tab)?
-            .comments
-            .iter()
-            .find(|c| c.file_idx == file_idx && c.hunk_idx == hunk_idx)
+    pub fn comments(&self) -> Vec<(usize, usize, &str)> {
+        self.current_files()
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .flat_map(|(file_idx, file)| {
+                file.hunks
+                    .iter()
+                    .enumerate()
+                    .filter_map(move |(hunk_idx, hunk)| {
+                        hunk.note.as_deref().map(|note| (file_idx, hunk_idx, note))
+                    })
+            })
+            .collect()
+    }
+
+    pub fn find_comment(&self, file_idx: usize, hunk_idx: usize) -> Option<&str> {
+        self.current_files()?
+            .get(file_idx)?
+            .hunks
+            .get(hunk_idx)?
+            .note
+            .as_deref()
     }
 
     pub fn add_or_update_comment(&mut self, file_idx: usize, hunk_idx: usize, text: String) {
-        if let Some(repo) = self.repos.get_mut(self.active_tab) {
-            if let Some(existing) = repo
-                .comments
-                .iter_mut()
-                .find(|c| c.file_idx == file_idx && c.hunk_idx == hunk_idx)
-            {
-                existing.text = text;
-            } else {
-                repo.comments.push(HunkComment {
-                    file_idx,
-                    hunk_idx,
-                    text,
-                });
-            }
+        if let Some(hunk) = self
+            .current_files_mut()
+            .and_then(|files| files.get_mut(file_idx))
+            .and_then(|file| file.hunks.get_mut(hunk_idx))
+        {
+            hunk.note = Some(text);
         }
         self.invalidate_layouts(self.active_tab);
     }
 
     pub fn remove_comment(&mut self, file_idx: usize, hunk_idx: usize) {
-        if let Some(repo) = self.repos.get_mut(self.active_tab) {
-            repo.comments
-                .retain(|c| !(c.file_idx == file_idx && c.hunk_idx == hunk_idx));
+        if let Some(hunk) = self
+            .current_files_mut()
+            .and_then(|files| files.get_mut(file_idx))
+            .and_then(|file| file.hunks.get_mut(hunk_idx))
+        {
+            hunk.note = None;
         }
         self.invalidate_layouts(self.active_tab);
     }
 
+    pub fn remove_comment_at(&mut self, index: usize) -> bool {
+        let Some((file_idx, hunk_idx, _)) = self.comments().get(index).copied() else {
+            return false;
+        };
+        self.remove_comment(file_idx, hunk_idx);
+        true
+    }
+
     pub fn clear_comments(&mut self) {
-        let count = self
-            .repos
-            .get(self.active_tab)
-            .map(|r| r.comments.len())
-            .unwrap_or(0);
-        if let Some(repo) = self.repos.get_mut(self.active_tab) {
-            repo.comments.clear();
+        let count = self.comments().len();
+        if let Some(files) = self.current_files_mut() {
+            for hunk in files.iter_mut().flat_map(|file| &mut file.hunks) {
+                hunk.note = None;
+            }
         }
         self.invalidate_layouts(self.active_tab);
         if count > 0 {
@@ -1076,41 +869,29 @@ impl App {
     }
 
     pub fn format_comments_markdown(&self, indices: Option<&[usize]>) -> Option<String> {
-        let repo = self.repos.get(self.active_tab)?;
-        let files = &repo.files;
-        let comments = &repo.comments;
-
+        let comments = self.comments();
         if comments.is_empty() {
             return None;
         }
 
-        // Collect the comments to include, sorted by file then hunk position
-        let mut selected: Vec<&HunkComment> = match indices {
-            Some(idxs) => idxs.iter().filter_map(|&i| comments.get(i)).collect(),
-            None => comments.iter().collect(),
+        let mut selected: Vec<_> = match indices {
+            Some(indices) => indices
+                .iter()
+                .filter_map(|&index| comments.get(index).copied())
+                .collect(),
+            None => comments,
         };
-
         if selected.is_empty() {
             return None;
         }
-
-        selected.sort_by(|a, b| {
-            let file_cmp = files
-                .get(a.file_idx)
-                .map(|f| f.path.as_str())
-                .cmp(&files.get(b.file_idx).map(|f| f.path.as_str()));
-            file_cmp.then(a.hunk_idx.cmp(&b.hunk_idx))
-        });
+        let files = self.current_files()?;
+        selected.sort_by(|a, b| files[a.0].path.cmp(&files[b.0].path).then(a.1.cmp(&b.1)));
 
         let mut result = String::from("## Review comments\n");
 
-        for comment in &selected {
-            let Some(file) = files.get(comment.file_idx) else {
-                continue;
-            };
-            let Some(hunk) = file.hunks.get(comment.hunk_idx) else {
-                continue;
-            };
+        for (file_idx, hunk_idx, note) in selected {
+            let file = files.get(file_idx)?;
+            let hunk = file.hunks.get(hunk_idx)?;
 
             let first_lineno = hunk
                 .lines
@@ -1128,7 +909,7 @@ impl App {
                 file.path, first_lineno, last_lineno
             ));
 
-            for line in comment.text.lines() {
+            for line in note.lines() {
                 result.push_str(&format!("> {}\n", line));
             }
 
@@ -1166,18 +947,6 @@ impl App {
                 }
             })
     }
-}
-
-pub struct DiffResult {
-    pub repo_id: u64,
-    pub mode: DiffMode,
-    pub result: anyhow::Result<Vec<FileDiff>>,
-}
-
-pub struct BaseBranchResult {
-    pub repo_id: u64,
-    pub branch: Option<String>,
-    pub branch_name: Option<String>,
 }
 
 pub struct GapExpandRequest {
@@ -1230,9 +999,10 @@ impl GapExpandRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, DiffResult, RefreshGate};
-    use crate::diff::{FileDiff, FileStatus};
+    use super::App;
+    use crate::diff::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
     use crate::git::RepoInfo;
+    use crate::screen::ViewportSize;
     use std::path::PathBuf;
 
     fn test_app_with_files(paths: &[&str]) -> App {
@@ -1264,44 +1034,46 @@ mod tests {
         });
     }
 
-    #[test]
-    fn refresh_gate_coalesces_work() {
-        let mut gate = RefreshGate::default();
-        assert!(gate.request());
-        assert!(!gate.request());
-        assert!(gate.complete());
-        assert!(gate.request());
-    }
-
-    #[test]
-    fn pending_refresh_drops_the_old_result() {
-        let mut app = test_app_with_files(&["old.rs"]);
-        let repo_id = app.repos[0].id;
-        let gate = app.diff_refreshes.get_mut(&repo_id).unwrap();
-        assert!(gate.request());
-        assert!(!gate.request());
-        let (tx, _rx) = tokio::sync::mpsc::channel(1);
-        let mut stale = test_app_with_files(&["stale.rs"]);
-        let result = DiffResult {
-            repo_id: app.repos[0].id,
-            mode: app.repos[0].mode,
-            result: Ok(stale.repos.remove(0).files),
-        };
-
-        assert!(!app.apply_diff_refresh_result(result, &tx));
-        assert_eq!(app.repos[0].files[0].path, "old.rs");
+    fn add_hunk(app: &mut App) {
+        app.repos[0].files[0].hunks.push(Hunk {
+            header: "@@ -1 +1 @@".to_string(),
+            lines: vec![DiffLine {
+                kind: LineKind::Addition,
+                content: "new".to_string(),
+                old_lineno: None,
+                new_lineno: Some(1),
+            }],
+            note: None,
+        });
     }
 
     #[test]
     fn leaving_side_by_side_view_releases_its_cache() {
         let mut app = test_app_with_files(&["src/main.rs"]);
 
-        app.toggle_view();
+        app.toggle_view(ViewportSize::default());
         assert!(app.repos[0].files[0].sbs_cache.is_some());
 
-        app.toggle_view();
+        app.toggle_view(ViewportSize::default());
         assert!(app.repos[0].files[0].sbs_cache.is_none());
         assert!(app.repos[0].sbs_layout.is_none());
+    }
+
+    #[test]
+    fn review_notes_live_on_hunks() {
+        let mut app = test_app_with_files(&["src/main.rs"]);
+        add_hunk(&mut app);
+
+        app.add_or_update_comment(0, 0, "check this".to_string());
+        assert_eq!(app.find_comment(0, 0), Some("check this"));
+        assert_eq!(app.comments(), vec![(0, 0, "check this")]);
+        assert!(
+            app.format_comments_markdown(None)
+                .is_some_and(|markdown| markdown.contains("> check this"))
+        );
+
+        assert!(app.remove_comment_at(0));
+        assert!(app.comments().is_empty());
     }
 
     #[test]

@@ -1,10 +1,12 @@
-pub mod app;
-pub mod diff;
-pub mod git;
-pub mod highlight;
-pub mod runtime;
-pub mod ui;
-pub mod viewport;
-pub(crate) mod watcher;
+mod app;
+mod diff;
+mod git;
+mod highlight;
+mod refresh;
+mod runtime;
+mod screen;
+mod ui;
+mod viewport;
+mod watcher;
 
 pub use runtime::run;

@@ -1,7 +1,9 @@
-use crate::app::{App, BaseBranchResult, DiffResult, GapExpandResult};
+use crate::app::{App, GapExpandResult};
 use crate::git;
 use crate::highlight::Highlighter;
-use crate::ui::{self, LayoutHints};
+use crate::refresh::{BaseBranchResult, DiffResult, RefreshCoordinator};
+use crate::screen::ScreenLayout;
+use crate::ui;
 use crate::watcher::{self, WatchEvent};
 use anyhow::Result;
 use crossterm::event::{
@@ -38,9 +40,7 @@ enum AppEvent {
 struct Channels {
     watch_rx: mpsc::Receiver<WatchEvent>,
     diff_rx: mpsc::Receiver<DiffResult>,
-    diff_tx: mpsc::Sender<DiffResult>,
     base_rx: mpsc::Receiver<BaseBranchResult>,
-    base_tx: mpsc::Sender<BaseBranchResult>,
     gap_rx: mpsc::Receiver<GapExpandResult>,
     gap_tx: mpsc::Sender<GapExpandResult>,
 }
@@ -64,7 +64,8 @@ pub async fn run(path: PathBuf) -> Result<()> {
     let repo_infos = git::discover_repos(&path)?;
 
     let mut app = App::new(repo_infos);
-    app.refresh_all_sync();
+    let mut screen = ScreenLayout::default();
+    app.refresh_all_sync(screen.viewport_size());
 
     // Set up file watcher with shared repo paths
     let (watch_tx, watch_rx) = mpsc::channel::<WatchEvent>(EVENT_CHANNEL_CAPACITY);
@@ -93,18 +94,17 @@ pub async fn run(path: PathBuf) -> Result<()> {
     let (diff_tx, diff_rx) = mpsc::channel::<DiffResult>(DIFF_CHANNEL_CAPACITY);
     let (base_tx, base_rx) = mpsc::channel::<BaseBranchResult>(EVENT_CHANNEL_CAPACITY);
     let (gap_tx, gap_rx) = mpsc::channel::<GapExpandResult>(EVENT_CHANNEL_CAPACITY);
+    let mut refresh = RefreshCoordinator::new(diff_tx, base_tx);
 
     // Resolve base branches + branch names in background at startup
     for idx in 0..app.repos.len() {
-        app.refresh_base_async(idx, &base_tx);
+        refresh.request_base(&app.repos[idx]);
     }
 
     let mut channels = Channels {
         watch_rx,
         diff_rx,
-        diff_tx,
         base_rx,
-        base_tx,
         gap_rx,
         gap_tx,
     };
@@ -113,6 +113,8 @@ pub async fn run(path: PathBuf) -> Result<()> {
         &mut terminal,
         &mut app,
         &mut channels,
+        &mut refresh,
+        &mut screen,
         &highlighter,
         &mut repo_watcher,
     )
@@ -123,6 +125,8 @@ async fn run_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
     ch: &mut Channels,
+    refresh: &mut RefreshCoordinator,
+    screen: &mut ScreenLayout,
     highlighter: &Highlighter,
     repo_watcher: &mut watcher::RepoWatcher,
 ) -> Result<()> {
@@ -144,11 +148,16 @@ async fn run_loop(
 
     loop {
         if needs_redraw {
-            app.prepare_active_layout();
-            let mut hints = LayoutHints::default();
-            terminal.draw(|f| ui::draw(f, app, highlighter, &mut hints))?;
-            app.layout = hints;
-            app.clamp_active_viewport();
+            let viewport_before = screen.viewport_size();
+            app.prepare_active_layout(viewport_before);
+            terminal.draw(|f| ui::draw(f, app, highlighter, screen))?;
+            let viewport = screen.viewport_size();
+            if viewport != viewport_before {
+                app.invalidate_all_layouts();
+                needs_redraw = true;
+                continue;
+            }
+            app.clamp_active_viewport(viewport);
             needs_redraw = false;
         }
 
@@ -185,12 +194,12 @@ async fn run_loop(
                     continue;
                 }
                 if app.comment_browser.is_some() {
-                    keys::handle_comment_browser_key(app, key);
+                    keys::handle_comment_browser_key(app, key, screen.viewport_size());
                     needs_redraw = true;
                     continue;
                 }
                 if app.file_picker.is_some() {
-                    keys::handle_file_picker_key(app, key);
+                    keys::handle_file_picker_key(app, key, screen.viewport_size());
                     needs_redraw = true;
                     continue;
                 }
@@ -206,8 +215,8 @@ async fn run_loop(
                             ));
                             continue;
                         }
-                        app.refresh_repo_async_bounded(new_idx, &ch.diff_tx);
-                        app.refresh_base_async(new_idx, &ch.base_tx);
+                        refresh.request_diff(&app.repos[new_idx]);
+                        refresh.request_base(&app.repos[new_idx]);
                     }
                     needs_redraw = true;
                     continue;
@@ -215,20 +224,26 @@ async fn run_loop(
                 // Remove current tab
                 if key.code == KeyCode::Char('x') && app.repos.len() > 1 {
                     let idx = app.active_tab;
+                    let repo_id = app.repos[idx].id;
                     if let Some(path) = app.remove_repo_at(idx) {
+                        refresh.forget(repo_id);
                         repo_watcher.remove(&path);
                     }
 
                     needs_redraw = true;
                     continue;
                 }
-                if keys::handle_key_bounded(app, key, &ch.diff_tx) {
+                let mode_before = (app.repos[app.active_tab].id, app.current_mode());
+                if keys::handle_key(app, key, screen.viewport_size()) {
                     return Ok(());
                 }
+                request_mode_change(mode_before, app, refresh);
                 needs_redraw = true;
             }
             AppEvent::Terminal(Event::Mouse(m)) => {
-                if mouse::handle_mouse_bounded(app, m, &ch.diff_tx, &ch.gap_tx) {
+                let mode_before = (app.repos[app.active_tab].id, app.current_mode());
+                if mouse::handle_mouse(app, m, screen, &ch.gap_tx) {
+                    request_mode_change(mode_before, app, refresh);
                     needs_redraw = true;
                 }
             }
@@ -242,25 +257,25 @@ async fn run_loop(
                     .iter()
                     .position(|r| r.info.path == event.repo_path)
                 {
-                    app.refresh_repo_async_bounded(idx, &ch.diff_tx);
+                    refresh.request_diff(&app.repos[idx]);
                     if event.base_refresh_needed {
-                        app.refresh_base_async(idx, &ch.base_tx);
+                        refresh.request_base(&app.repos[idx]);
                     }
                 }
             }
             AppEvent::DiffDone(result) => {
-                if app.apply_diff_refresh_result(result, &ch.diff_tx) {
+                if refresh.apply_diff(app, result, screen.viewport_size()) {
                     highlighter.clear_highlight_cache();
                     needs_redraw = true;
                 }
             }
             AppEvent::BaseBranch(result) => {
-                if app.apply_base_refresh_result(result, &ch.base_tx, &ch.diff_tx) {
+                if refresh.apply_base(app, result) {
                     needs_redraw = true;
                 }
             }
             AppEvent::GapExpanded(result) => {
-                app.apply_gap_expand(result);
+                app.apply_gap_expand(result, screen.viewport_size());
                 needs_redraw = true;
             }
             AppEvent::Tick => {
@@ -278,5 +293,17 @@ async fn run_loop(
                 }
             }
         }
+    }
+}
+
+fn request_mode_change(
+    (repo_id, mode): (u64, crate::git::DiffMode),
+    app: &App,
+    refresh: &mut RefreshCoordinator,
+) {
+    if let Some(idx) = app.find_repo(repo_id)
+        && app.repos[idx].mode != mode
+    {
+        refresh.request_diff(&app.repos[idx]);
     }
 }

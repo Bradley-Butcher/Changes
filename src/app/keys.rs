@@ -1,12 +1,12 @@
 use super::{
-    App, CommentBrowserState, CommentInputState, DiffResult, FilePickerState, FlashState,
-    MarkdownPreviewState, PAGE_SCROLL, RepoAdderState,
+    App, CommentBrowserState, CommentInputState, FilePickerState, FlashState, MarkdownPreviewState,
+    PAGE_SCROLL, RepoAdderState,
 };
 use crate::git::DiffMode;
+use crate::screen::ViewportSize;
 use arboard::Clipboard;
 use crossterm::event::{self, KeyCode, KeyModifiers};
 use std::path::PathBuf;
-use tokio::sync::mpsc;
 
 const MAX_MARKDOWN_PREVIEW_BYTES: u64 = 5 * 1024 * 1024;
 
@@ -28,29 +28,7 @@ fn read_markdown_preview(path: &std::path::Path) -> Result<String, String> {
     Ok(content)
 }
 
-pub fn handle_key(
-    app: &mut App,
-    key: event::KeyEvent,
-    diff_tx: &mpsc::UnboundedSender<DiffResult>,
-) -> bool {
-    handle_key_with_set_mode(app, key, |app, mode| app.set_mode(mode, diff_tx))
-}
-
-pub(crate) fn handle_key_bounded(
-    app: &mut App,
-    key: event::KeyEvent,
-    diff_tx: &mpsc::Sender<DiffResult>,
-) -> bool {
-    handle_key_with_set_mode(app, key, |app, mode| {
-        app.set_mode_bounded(mode, diff_tx);
-    })
-}
-
-fn handle_key_with_set_mode(
-    app: &mut App,
-    key: event::KeyEvent,
-    mut set_mode: impl FnMut(&mut App, DiffMode),
-) -> bool {
+pub fn handle_key(app: &mut App, key: event::KeyEvent, viewport: ViewportSize) -> bool {
     match key.code {
         KeyCode::Char('q') => return true,
         KeyCode::Esc => {
@@ -89,43 +67,43 @@ fn handle_key_with_set_mode(
 
         // Mode switching
         KeyCode::Char('m') => {
-            set_mode(app, DiffMode::Unstaged);
+            app.set_mode(DiffMode::Unstaged);
         }
         KeyCode::Char('s') => {
-            set_mode(app, DiffMode::Staged);
+            app.set_mode(DiffMode::Staged);
         }
         KeyCode::Char('b') => {
-            set_mode(app, DiffMode::Branch);
+            app.set_mode(DiffMode::Branch);
         }
 
         // View toggle
         KeyCode::Char('v') => {
-            app.toggle_view();
+            app.toggle_view(viewport);
         }
 
         // Scrolling
         KeyCode::Char('j') | KeyCode::Down => {
-            app.scroll_active_viewport(1);
+            app.scroll_active_viewport(1, viewport);
         }
         KeyCode::Char('k') | KeyCode::Up => {
-            app.scroll_active_viewport(-1);
+            app.scroll_active_viewport(-1, viewport);
         }
         KeyCode::Char('J') => {
-            app.prepare_active_layout();
+            app.prepare_active_layout(viewport);
             if let Some(next) = app
                 .current_layout()
                 .and_then(|layout| layout.next_file_header_row(app.current_scroll_offset()))
             {
-                app.jump_active_viewport_to(next);
+                app.jump_active_viewport_to(next, viewport);
             }
         }
         KeyCode::Char('K') => {
-            app.prepare_active_layout();
+            app.prepare_active_layout(viewport);
             if let Some(prev) = app
                 .current_layout()
                 .and_then(|layout| layout.prev_file_header_row(app.current_scroll_offset()))
             {
-                app.jump_active_viewport_to(prev);
+                app.jump_active_viewport_to(prev, viewport);
             }
         }
         KeyCode::Char('g') => {
@@ -133,26 +111,26 @@ fn handle_key_with_set_mode(
             app.focused_file = Some(0);
         }
         KeyCode::Char('G') => {
-            app.jump_active_viewport_bottom();
+            app.jump_active_viewport_bottom(viewport);
         }
         KeyCode::PageDown => {
-            app.scroll_active_viewport(PAGE_SCROLL as isize);
+            app.scroll_active_viewport(PAGE_SCROLL as isize, viewport);
         }
         KeyCode::PageUp => {
-            app.scroll_active_viewport(-(PAGE_SCROLL as isize));
+            app.scroll_active_viewport(-(PAGE_SCROLL as isize), viewport);
         }
 
         // Collapse
         KeyCode::Enter => {
             if let Some(idx) = app.focused_file {
-                app.toggle_collapsed(idx);
+                app.toggle_collapsed(idx, viewport);
             }
         }
         KeyCode::Char('c') => {
-            app.set_all_collapsed(true);
+            app.set_all_collapsed(true, viewport);
         }
         KeyCode::Char('e') => {
-            app.set_all_collapsed(false);
+            app.set_all_collapsed(false, viewport);
         }
 
         // Copy
@@ -189,7 +167,7 @@ fn handle_key_with_set_mode(
             if let Some((file_idx, hunk_idx)) = app.focused_hunk() {
                 let existing_text = app
                     .find_comment(file_idx, hunk_idx)
-                    .map(|c| c.text.clone())
+                    .map(str::to_owned)
                     .unwrap_or_default();
                 let cursor_pos = existing_text.len();
                 app.comment_input = Some(CommentInputState {
@@ -222,23 +200,17 @@ fn handle_key_with_set_mode(
                 }
                 // Flash all commented hunks
                 let now = std::time::Instant::now() + std::time::Duration::from_millis(300);
-                if let Some(repo) = app.repos.get(app.active_tab) {
-                    let flashes: Vec<FlashState> = repo
-                        .comments
-                        .iter()
-                        .map(|c| FlashState {
-                            until: now,
-                            file_idx: c.file_idx,
-                            hunk_idx: c.hunk_idx,
-                        })
-                        .collect();
-                    app.flash.extend(flashes);
-                }
-                let count = app
-                    .repos
-                    .get(app.active_tab)
-                    .map(|r| r.comments.len())
-                    .unwrap_or(0);
+                let comments = app.comments();
+                let flashes: Vec<FlashState> = comments
+                    .iter()
+                    .map(|&(file_idx, hunk_idx, _)| FlashState {
+                        until: now,
+                        file_idx,
+                        hunk_idx,
+                    })
+                    .collect();
+                let count = comments.len();
+                app.flash.extend(flashes);
                 app.status_message = Some((
                     format!("Copied {} note{}", count, if count == 1 { "" } else { "s" }),
                     std::time::Instant::now() + std::time::Duration::from_millis(300),
@@ -276,11 +248,7 @@ fn handle_key_with_set_mode(
 
         // Comments browser
         KeyCode::Char('C') => {
-            let count = app
-                .repos
-                .get(app.active_tab)
-                .map(|r| r.comments.len())
-                .unwrap_or(0);
+            let count = app.comments().len();
             if count > 0 {
                 app.comment_browser = Some(CommentBrowserState {
                     query: String::new(),
@@ -295,7 +263,7 @@ fn handle_key_with_set_mode(
     false
 }
 
-pub fn handle_file_picker_key(app: &mut App, key: event::KeyEvent) {
+pub fn handle_file_picker_key(app: &mut App, key: event::KeyEvent, viewport: ViewportSize) {
     if app.file_picker.is_none() {
         return;
     }
@@ -314,9 +282,9 @@ pub fn handle_file_picker_key(app: &mut App, key: event::KeyEvent) {
                     .and_then(|f| f.get(file_idx))
                     .is_some_and(|f| f.collapsed)
                 {
-                    app.toggle_collapsed(file_idx);
+                    app.toggle_collapsed(file_idx, viewport);
                 }
-                app.jump_to_file(file_idx);
+                app.jump_to_file(file_idx, viewport);
             } else {
                 app.file_picker = None;
             }
@@ -555,16 +523,12 @@ pub fn handle_comment_input_key(app: &mut App, key: event::KeyEvent) {
     }
 }
 
-pub fn handle_comment_browser_key(app: &mut App, key: event::KeyEvent) {
+pub fn handle_comment_browser_key(app: &mut App, key: event::KeyEvent, viewport: ViewportSize) {
     if app.comment_browser.is_none() {
         return;
     }
 
-    let comment_count = app
-        .repos
-        .get(app.active_tab)
-        .map(|r| r.comments.len())
-        .unwrap_or(0);
+    let comment_count = app.comments().len();
 
     match key.code {
         KeyCode::Esc => {
@@ -594,13 +558,7 @@ pub fn handle_comment_browser_key(app: &mut App, key: event::KeyEvent) {
         KeyCode::Enter => {
             // Jump to the selected comment's hunk
             let selected = app.comment_browser.as_ref().unwrap().selected;
-            if let Some(comment) = app
-                .repos
-                .get(app.active_tab)
-                .and_then(|r| r.comments.get(selected))
-            {
-                let file_idx = comment.file_idx;
-                let _hunk_idx = comment.hunk_idx;
+            if let Some((file_idx, _, _)) = app.comments().get(selected).copied() {
                 app.comment_browser = None;
                 // Uncollapse if needed
                 if app
@@ -608,22 +566,16 @@ pub fn handle_comment_browser_key(app: &mut App, key: event::KeyEvent) {
                     .and_then(|f| f.get(file_idx))
                     .is_some_and(|f| f.collapsed)
                 {
-                    app.toggle_collapsed(file_idx);
+                    app.toggle_collapsed(file_idx, viewport);
                 }
-                app.jump_to_file(file_idx);
+                app.jump_to_file(file_idx, viewport);
             }
         }
         KeyCode::Char('d') => {
             // Delete selected comment
             let selected = app.comment_browser.as_ref().unwrap().selected;
-            let can_delete = app
-                .repos
-                .get(app.active_tab)
-                .is_some_and(|r| selected < r.comments.len());
-            if can_delete {
-                app.repos[app.active_tab].comments.remove(selected);
-                app.invalidate_layouts(app.active_tab);
-                let new_count = app.repos[app.active_tab].comments.len();
+            if app.remove_comment_at(selected) {
+                let new_count = app.comments().len();
                 if new_count == 0 {
                     app.comment_browser = None;
                     return;
