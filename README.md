@@ -73,7 +73,7 @@ If you point it at a directory with multiple git repos, it opens them all in tab
 ## Example workflow
 
 1. Your agent is working across two repos. Run `changes /path/to/projects` — both open in tabs
-2. Scroll through the diff. See something wrong — right-click the hunk, type your feedback, `Ctrl+D` to save
+2. Scroll through the diff. See something wrong — right-click the hunk (or press `n`), type your feedback, `Ctrl+D` to save
 3. Keep reviewing. Add more comments to other hunks across files
 4. When you're done, press `Y` — all your comments get copied as markdown with the relevant code blocks
 5. Paste into your agent. It gets something like:
@@ -100,26 +100,31 @@ If you point it at a directory with multiple git repos, it opens them all in tab
 
 ## Keybindings
 
+The `┃` gutter bar marks the hunk that `y` / `n` / `N` act on. Click a hunk or use `]` / `[` to move it.
+
 | Key | Action |
 |-----|--------|
 | `m` / `s` / `b` | Switch mode: modified, staged, branch diff |
 | `v` | Toggle unified / side-by-side view |
-| `j` / `k` | Scroll |
-| `J` / `K` | Jump to next / previous file |
+| `j` / `k`, `Ctrl+D` / `Ctrl+U`, `PgDn` / `PgUp` | Scroll by line, half page, page |
+| `g` / `G` | Jump to top / bottom |
+| `]` / `[` | Next / previous hunk |
+| `J` / `K` | Next / previous file |
 | `f` | Fuzzy file picker |
 | `Enter` / Click header | Collapse / expand file |
 | `c` / `e` | Collapse / expand all |
 | `y` / Double-click | Copy hunk to clipboard |
-| Right-click / `n` | Add comment to hunk |
-| `N` | Remove comment from hunk |
-| `Y` | Copy all comments + hunks as markdown |
-| `C` | Open comments browser |
-| `D` | Clear all comments |
+| `n` / Right-click | Add or edit note on hunk |
+| `N` | Remove note from hunk |
+| `Y` | Copy all notes + hunks as markdown |
+| `C` | Browse notes |
+| `D` | Clear all notes |
+| `p` | Preview focused markdown file |
 | `a` / `x` | Add / remove repo tab |
-| `Tab` / `1`-`9` | Switch tabs |
-| Click gap indicator | Expand context |
+| `Tab` / `Shift+Tab` / `1`-`9` | Switch tabs |
+| Click `↕ N` | Expand hidden context lines |
 | `?` | Help |
-| `q` | Quit |
+| `q` / `Ctrl+C` | Quit |
 
 ## Development
 

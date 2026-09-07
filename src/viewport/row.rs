@@ -18,11 +18,15 @@ pub enum RowRef {
         file_idx: usize,
         hunk_idx: usize,
         line_idx: usize,
+        /// Physical wrapped chunk within the logical diff line.
+        chunk_idx: usize,
     },
     SideBySideLine {
         file_idx: usize,
         hunk_idx: usize,
         line_idx: usize,
+        /// Physical wrapped chunk within the paired side-by-side row.
+        chunk_idx: usize,
     },
     GapTail {
         file_idx: usize,

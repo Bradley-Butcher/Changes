@@ -111,37 +111,85 @@ pub struct SideBySideLine {
     pub right_changed: Option<ChangedRanges>,
 }
 
+/// Lines above which alignment work is split across threads.
+const PARALLEL_SBS_LINES: usize = 8_000;
+
 pub fn compute_side_by_side(hunks: &[Hunk]) -> Vec<Vec<SideBySideLine>> {
-    hunks.iter().map(align_hunk_lines).collect()
+    let total_lines: usize = hunks.iter().map(|hunk| hunk.lines.len()).sum();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if total_lines < PARALLEL_SBS_LINES || hunks.len() < 2 || threads < 2 {
+        return hunks.iter().map(align_hunk_lines).collect();
+    }
+    let chunk_size = hunks.len().div_ceil(threads);
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = hunks
+            .chunks(chunk_size)
+            .map(|chunk| {
+                scope.spawn(move || chunk.iter().map(align_hunk_lines).collect::<Vec<_>>())
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| handle.join().expect("side-by-side worker panicked"))
+            .collect()
+    })
 }
 
-/// Use line-level diff to align old/new sides, then compute word-level inline diffs
-/// for matched deletion/addition pairs.
+/// Build the side-by-side cache for every file that lacks one. Large diffs are spread
+/// across threads, largest files first, so a refresh in side-by-side view stays quick.
+pub fn ensure_sbs_caches(files: &mut [FileDiff]) {
+    let mut missing: Vec<&mut FileDiff> = files
+        .iter_mut()
+        .filter(|file| file.sbs_cache.is_none())
+        .collect();
+    let total_lines: usize = missing
+        .iter()
+        .flat_map(|file| &file.hunks)
+        .map(|hunk| hunk.lines.len())
+        .sum();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    if missing.len() == 1 {
+        // One file: parallelism (if any) happens across its hunks instead.
+        missing[0].ensure_sbs_cache();
+        return;
+    }
+    if total_lines < PARALLEL_SBS_LINES || threads < 2 {
+        for file in missing {
+            file.sbs_cache = Some(file.hunks.iter().map(align_hunk_lines).collect());
+        }
+        return;
+    }
+
+    // Longest-processing-time-first assignment keeps the threads evenly loaded.
+    let line_count = |file: &FileDiff| file.hunks.iter().map(|h| h.lines.len()).sum::<usize>();
+    missing.sort_by_key(|file| std::cmp::Reverse(line_count(file)));
+    let mut groups: Vec<(usize, Vec<&mut FileDiff>)> =
+        (0..threads).map(|_| (0, Vec::new())).collect();
+    for file in missing {
+        let lines = line_count(file);
+        let (load, group) = groups
+            .iter_mut()
+            .min_by_key(|(load, _)| *load)
+            .expect("at least one group");
+        *load += lines;
+        group.push(file);
+    }
+    std::thread::scope(|scope| {
+        for (_, group) in groups {
+            scope.spawn(move || {
+                for file in group {
+                    file.sbs_cache = Some(file.hunks.iter().map(align_hunk_lines).collect());
+                }
+            });
+        }
+    });
+}
+
+/// Pair up the two sides of a hunk. Git's hunk is already an alignment: context lines
+/// appear on both sides, and each run of deletions is matched positionally with the run
+/// of additions that follows it. Matched pairs get a word-level inline diff.
 fn align_hunk_lines(hunk: &Hunk) -> Vec<SideBySideLine> {
-    let old_lines: Vec<&DiffLine> = hunk
-        .lines
-        .iter()
-        .filter(|l| l.kind == LineKind::Context || l.kind == LineKind::Deletion)
-        .collect();
-    let new_lines: Vec<&DiffLine> = hunk
-        .lines
-        .iter()
-        .filter(|l| l.kind == LineKind::Context || l.kind == LineKind::Addition)
-        .collect();
-
-    let old_text: String = old_lines
-        .iter()
-        .map(|l| format!("{}\n", l.content))
-        .collect();
-    let new_text: String = new_lines
-        .iter()
-        .map(|l| format!("{}\n", l.content))
-        .collect();
-
-    let diff = TextDiff::from_lines(&old_text, &new_text);
-    let mut result = Vec::new();
-
-    // Collect changes, then pair up delete/insert runs for inline diff
+    let mut result = Vec::with_capacity(hunk.lines.len());
     let mut pending_dels: Vec<&DiffLine> = Vec::new();
     let mut pending_adds: Vec<&DiffLine> = Vec::new();
 
@@ -167,27 +215,19 @@ fn align_hunk_lines(hunk: &Hunk) -> Vec<SideBySideLine> {
             adds.clear();
         };
 
-    for change in diff.iter_all_changes() {
-        match change.tag() {
-            similar::ChangeTag::Equal => {
+    for line in &hunk.lines {
+        match line.kind {
+            LineKind::Context => {
                 flush_pending(&mut result, &mut pending_dels, &mut pending_adds);
-                let old_idx = change.old_index().unwrap();
-                let new_idx = change.new_index().unwrap();
                 result.push(SideBySideLine {
-                    left: Some(old_lines[old_idx].clone()),
-                    right: Some(new_lines[new_idx].clone()),
+                    left: Some(line.clone()),
+                    right: Some(line.clone()),
                     left_changed: None,
                     right_changed: None,
                 });
             }
-            similar::ChangeTag::Delete => {
-                let old_idx = change.old_index().unwrap();
-                pending_dels.push(old_lines[old_idx]);
-            }
-            similar::ChangeTag::Insert => {
-                let new_idx = change.new_index().unwrap();
-                pending_adds.push(new_lines[new_idx]);
-            }
+            LineKind::Deletion => pending_dels.push(line),
+            LineKind::Addition => pending_adds.push(line),
         }
     }
     flush_pending(&mut result, &mut pending_dels, &mut pending_adds);
@@ -195,9 +235,16 @@ fn align_hunk_lines(hunk: &Hunk) -> Vec<SideBySideLine> {
     result
 }
 
+/// Lines longer than this (minified bundles, data blobs) skip word-level emphasis: the
+/// diff is quadratic in the worst case and the result is unreadable anyway.
+const MAX_INLINE_DIFF_BYTES: usize = 4096;
+
 /// Compute word-level diff between two lines.
 /// Returns byte ranges of changed words in each line.
 fn compute_inline_diff(old: &str, new: &str) -> (Option<ChangedRanges>, Option<ChangedRanges>) {
+    if old.len() > MAX_INLINE_DIFF_BYTES || new.len() > MAX_INLINE_DIFF_BYTES {
+        return (None, None);
+    }
     if old == new {
         return (None, None);
     }

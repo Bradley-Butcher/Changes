@@ -8,7 +8,9 @@ use std::sync::{Arc, RwLock};
 use std::time::Duration;
 use tokio::sync::mpsc;
 
-const DEBOUNCE_DURATION: Duration = Duration::from_millis(300);
+/// Delay between the last file event and a diff refresh. Long enough to coalesce an
+/// agent's burst of writes, short enough that the screen feels live.
+const DEBOUNCE_DURATION: Duration = Duration::from_millis(60);
 
 #[derive(Debug, Clone)]
 pub struct WatchEvent {
@@ -16,32 +18,56 @@ pub struct WatchEvent {
     pub base_refresh_needed: bool,
 }
 
+/// A git directory that lives outside the worktree it belongs to. A linked worktree keeps
+/// HEAD and its index under `main/.git/worktrees/<name>` and shares refs in `main/.git`, so
+/// staging or switching branches there never touches the watched worktree directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalGitDir {
+    /// Directory handed to the OS watcher.
+    watch: PathBuf,
+    /// Prefix stripped from event paths before applying the git metadata allowlist.
+    strip: PathBuf,
+    /// The repository tab the events belong to.
+    repo_path: PathBuf,
+}
+
+#[derive(Default)]
+struct WatchedRepos {
+    repo_paths: Vec<PathBuf>,
+    external_git_dirs: Vec<ExternalGitDir>,
+}
+
 pub struct RepoWatcher {
     debouncer: notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>,
-    repo_paths: Arc<RwLock<Vec<PathBuf>>>,
+    watched: Arc<RwLock<WatchedRepos>>,
 }
 
 impl RepoWatcher {
     pub fn new(repo_paths: Vec<PathBuf>, tx: mpsc::Sender<WatchEvent>) -> Result<Self> {
-        let repo_paths = Arc::new(RwLock::new(repo_paths));
-        let mut debouncer = start_watching(repo_paths.clone(), tx)?;
-        for path in repo_paths.read().unwrap_or_else(|e| e.into_inner()).iter() {
-            debouncer.watcher().watch(path, RecursiveMode::Recursive)?;
+        let watched = Arc::new(RwLock::new(WatchedRepos::default()));
+        let debouncer = start_watching(watched.clone(), tx)?;
+        let mut watcher = Self { debouncer, watched };
+        for path in repo_paths {
+            watcher.add(&path)?;
         }
-        Ok(Self {
-            debouncer,
-            repo_paths,
-        })
+        Ok(watcher)
     }
 
     pub fn add(&mut self, path: &Path) -> Result<()> {
         self.debouncer
             .watcher()
             .watch(path, RecursiveMode::Recursive)?;
-        self.repo_paths
-            .write()
-            .unwrap_or_else(|e| e.into_inner())
-            .push(path.to_path_buf());
+        let externals = external_git_dirs(path);
+        for external in &externals {
+            // A missing refs directory is not fatal; the worktree itself is still watched.
+            let _ = self
+                .debouncer
+                .watcher()
+                .watch(&external.watch, RecursiveMode::Recursive);
+        }
+        let mut watched = self.watched.write().unwrap_or_else(|e| e.into_inner());
+        watched.repo_paths.push(path.to_path_buf());
+        watched.external_git_dirs.extend(externals);
         Ok(())
     }
 
@@ -49,15 +75,79 @@ impl RepoWatcher {
         // The OS can remove a watch first when its directory disappears.
         // Cleanup must not make closing a repository tab fatal.
         let _ = self.debouncer.watcher().unwatch(path);
-        self.repo_paths
-            .write()
+        let mut watched = self.watched.write().unwrap_or_else(|e| e.into_inner());
+        watched.repo_paths.retain(|repo_path| repo_path != path);
+        let (removed, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut watched.external_git_dirs)
+            .into_iter()
+            .partition(|external| external.repo_path == path);
+        watched.external_git_dirs = kept;
+        for external in removed {
+            // Another tab (the main repository) may still need this directory watched.
+            let still_used = watched
+                .external_git_dirs
+                .iter()
+                .any(|other| other.watch == external.watch);
+            if !still_used {
+                let _ = self.debouncer.watcher().unwatch(&external.watch);
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn repo_paths(&self) -> Vec<PathBuf> {
+        self.watched
+            .read()
             .unwrap_or_else(|e| e.into_inner())
-            .retain(|repo_path| repo_path != path);
+            .repo_paths
+            .clone()
     }
 }
 
+/// Git directories for `repo_path` that are not inside it. Empty for an ordinary checkout,
+/// whose `.git` directory is already covered by the recursive worktree watch.
+fn external_git_dirs(repo_path: &Path) -> Vec<ExternalGitDir> {
+    let Ok(repository) = Repository::open(repo_path) else {
+        return Vec::new();
+    };
+    // git2 reports canonical paths; compare against the canonical worktree path so a
+    // symlinked checkout (e.g. macOS /var → /private/var) is not mistaken for external.
+    let canonical_repo = repo_path
+        .canonicalize()
+        .unwrap_or_else(|_| repo_path.to_path_buf());
+    let mut externals = Vec::new();
+    let git_dir = repository.path().to_path_buf();
+    if !git_dir.starts_with(&canonical_repo) {
+        externals.push(ExternalGitDir {
+            watch: git_dir.clone(),
+            strip: git_dir.clone(),
+            repo_path: repo_path.to_path_buf(),
+        });
+    }
+    let common_dir = repository.commondir().to_path_buf();
+    if common_dir != git_dir && !common_dir.starts_with(&canonical_repo) {
+        // Only refs are shared state worth watching here; objects/ and logs/ are noise.
+        externals.push(ExternalGitDir {
+            watch: common_dir.join("refs"),
+            strip: common_dir,
+            repo_path: repo_path.to_path_buf(),
+        });
+    }
+    externals
+}
+
+/// The external git directory an event path falls under, preferring the most specific one.
+fn find_external_git_dir<'a>(
+    externals: &'a [ExternalGitDir],
+    event_path: &Path,
+) -> Option<&'a ExternalGitDir> {
+    externals
+        .iter()
+        .filter(|external| event_path.starts_with(&external.strip))
+        .max_by_key(|external| external.strip.components().count())
+}
+
 fn start_watching(
-    repo_paths: Arc<RwLock<Vec<PathBuf>>>,
+    watched: Arc<RwLock<WatchedRepos>>,
     tx: mpsc::Sender<WatchEvent>,
 ) -> Result<notify_debouncer_mini::Debouncer<notify::RecommendedWatcher>> {
     let debouncer = new_debouncer(
@@ -68,7 +158,7 @@ fn start_watching(
                 Err(_) => return,
             };
 
-            let repo_paths = repo_paths.read().unwrap_or_else(|e| e.into_inner());
+            let watched = watched.read().unwrap_or_else(|e| e.into_inner());
             let mut pending = HashMap::<PathBuf, bool>::new();
             let mut repositories = HashMap::<PathBuf, Option<Repository>>::new();
 
@@ -77,11 +167,25 @@ fn start_watching(
                     continue;
                 }
 
+                // Metadata of a linked worktree stored outside its directory.
+                if let Some(external) =
+                    find_external_git_dir(&watched.external_git_dirs, &event.path)
+                {
+                    let relative = event
+                        .path
+                        .strip_prefix(&external.strip)
+                        .unwrap_or(&event.path);
+                    if git_metadata_is_relevant(relative) {
+                        pending.insert(external.repo_path.clone(), true);
+                    }
+                    // Fall through: the same path may also belong to a watched main repo.
+                }
+
                 if is_git_internal_path(&event.path) {
                     continue;
                 }
 
-                let Some(repo_path) = find_repo_path(&repo_paths, &event.path) else {
+                let Some(repo_path) = find_repo_path(&watched.repo_paths, &event.path) else {
                     continue;
                 };
                 let git_metadata_changed = is_git_path(&event.path);
@@ -105,7 +209,7 @@ fn start_watching(
                     .and_modify(|needed| *needed |= base_refresh_needed)
                     .or_insert(base_refresh_needed);
             }
-            drop(repo_paths);
+            drop(watched);
 
             for (repo_path, base_refresh_needed) in pending {
                 let _ = tx.blocking_send(WatchEvent {
@@ -119,28 +223,29 @@ fn start_watching(
     Ok(debouncer)
 }
 
+/// Whether a path relative to a git directory changes on commit/checkout/stage/rebase:
+/// HEAD, index, refs/*, MERGE_HEAD, REBASE_HEAD, CHERRY_PICK_HEAD. Everything else
+/// (objects/, logs/, COMMIT_EDITMSG, hooks/, ...) is noise.
+fn git_metadata_is_relevant(relative: &Path) -> bool {
+    let Some(first) = relative.components().next() else {
+        return false; // the git directory itself
+    };
+    matches!(
+        first.as_os_str().to_string_lossy().as_ref(),
+        "HEAD" | "index" | "MERGE_HEAD" | "REBASE_HEAD" | "CHERRY_PICK_HEAD" | "refs"
+    )
+}
+
 /// Returns true for `.git` paths that are noisy and irrelevant to diff state.
 /// Allows through key files that change on commit/checkout/stage/rebase:
 /// - HEAD, index, refs/*, MERGE_HEAD, REBASE_HEAD, CHERRY_PICK_HEAD
 fn is_git_internal_path(path: &Path) -> bool {
     let components: Vec<_> = path.components().collect();
-    let git_pos = components.iter().position(|c| c.as_os_str() == ".git");
-    let Some(pos) = git_pos else {
+    let Some(pos) = components.iter().position(|c| c.as_os_str() == ".git") else {
         return false; // not inside .git at all
     };
-
-    // Get the path after `.git/`
-    let remaining: Vec<_> = components[pos + 1..].iter().collect();
-    if remaining.is_empty() {
-        return true; // bare `.git` directory event
-    }
-
-    let first = remaining[0].as_os_str().to_string_lossy();
-    match first.as_ref() {
-        "HEAD" | "index" | "MERGE_HEAD" | "REBASE_HEAD" | "CHERRY_PICK_HEAD" => false,
-        "refs" => false, // refs/heads/*, refs/tags/* change on commit/branch ops
-        _ => true,       // objects/, logs/, COMMIT_EDITMSG, hooks/, etc.
-    }
+    let relative: PathBuf = components[pos + 1..].iter().collect();
+    !git_metadata_is_relevant(&relative)
 }
 
 fn is_git_path(path: &Path) -> bool {
@@ -193,7 +298,10 @@ fn find_repo_path(repo_paths: &[PathBuf], event_path: &Path) -> Option<PathBuf> 
 
 #[cfg(test)]
 mod tests {
-    use super::{RepoWatcher, is_git_internal_path, is_git_path, path_is_ignored};
+    use super::{
+        ExternalGitDir, RepoWatcher, external_git_dirs, find_external_git_dir,
+        git_metadata_is_relevant, is_git_internal_path, is_git_path, path_is_ignored,
+    };
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -337,12 +445,95 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
         watcher.remove(&root);
 
+        assert!(watcher.repo_paths().is_empty());
+    }
+
+    fn init_repo_with_commit(root: &Path) -> git2::Repository {
+        fs::create_dir_all(root).unwrap();
+        let repository = git2::Repository::init(root).unwrap();
+        fs::write(root.join("tracked.txt"), "tracked\n").unwrap();
+        let mut index = repository.index().unwrap();
+        index.add_path(Path::new("tracked.txt")).unwrap();
+        index.write().unwrap();
+        let tree_id = index.write_tree().unwrap();
+        {
+            let tree = repository.find_tree(tree_id).unwrap();
+            let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+            repository
+                .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+                .unwrap();
+        }
+        repository
+    }
+
+    #[test]
+    fn ordinary_checkouts_have_no_external_git_dirs() {
+        let root = temporary_path("watcher-plain-repo");
+        let _repository = init_repo_with_commit(&root);
+        assert!(external_git_dirs(&root).is_empty());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn linked_worktrees_watch_their_git_dir_and_shared_refs() {
+        let root = temporary_path("watcher-worktree-main");
+        let repository = init_repo_with_commit(&root);
+        let worktree_path = temporary_path("watcher-worktree-linked");
+        repository.worktree("linked", &worktree_path, None).unwrap();
+        let worktree_path = worktree_path.canonicalize().unwrap();
+
+        let externals = external_git_dirs(&worktree_path);
+        let git_dir = root
+            .canonicalize()
+            .unwrap()
+            .join(".git")
+            .join("worktrees")
+            .join("linked");
+        let common_dir = root.canonicalize().unwrap().join(".git");
         assert!(
-            watcher
-                .repo_paths
-                .read()
-                .unwrap_or_else(|error| error.into_inner())
-                .is_empty()
+            externals.iter().any(|external| {
+                external.strip == git_dir && external.repo_path == worktree_path
+            }),
+            "expected the worktree git dir in {externals:?}"
         );
+        assert!(
+            externals
+                .iter()
+                .any(|external| external.watch == common_dir.join("refs")),
+            "expected the shared refs directory in {externals:?}"
+        );
+
+        // Staging in the worktree only touches its index, which now maps back to the tab.
+        let found = find_external_git_dir(&externals, &git_dir.join("index")).unwrap();
+        assert_eq!(found.repo_path, worktree_path);
+        assert!(git_metadata_is_relevant(
+            git_dir.join("index").strip_prefix(&found.strip).unwrap()
+        ));
+
+        fs::remove_dir_all(&worktree_path).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn most_specific_external_git_dir_wins() {
+        let externals = vec![
+            ExternalGitDir {
+                watch: PathBuf::from("/main/.git/refs"),
+                strip: PathBuf::from("/main/.git"),
+                repo_path: PathBuf::from("/wt"),
+            },
+            ExternalGitDir {
+                watch: PathBuf::from("/main/.git/worktrees/wt"),
+                strip: PathBuf::from("/main/.git/worktrees/wt"),
+                repo_path: PathBuf::from("/wt"),
+            },
+        ];
+        let found =
+            find_external_git_dir(&externals, Path::new("/main/.git/worktrees/wt/index")).unwrap();
+        assert_eq!(found.strip, PathBuf::from("/main/.git/worktrees/wt"));
+        assert!(git_metadata_is_relevant(Path::new("index")));
+        assert!(git_metadata_is_relevant(Path::new("refs/heads/main")));
+        assert!(!git_metadata_is_relevant(Path::new("objects/ab/cdef")));
+        assert!(!git_metadata_is_relevant(Path::new("")));
     }
 }

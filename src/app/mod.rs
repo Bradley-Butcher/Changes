@@ -4,7 +4,7 @@ pub mod mouse;
 use crate::diff::{DiffLine, FileDiff, LineKind};
 use crate::git::{self, DiffMode, RepoInfo};
 use crate::ui::LayoutHints;
-use crate::viewport::{DiffLayout, ViewKind, ViewportState};
+use crate::viewport::{DiffLayout, RowRef, ViewKind, ViewportState};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -12,9 +12,12 @@ use tokio::sync::mpsc;
 
 // Tunable constants
 const FLASH_DURATION: Duration = Duration::from_millis(300);
+/// How long a status-bar message stays readable.
+pub(crate) const STATUS_DURATION: Duration = Duration::from_secs(2);
 pub(crate) const SCROLL_SPEED: usize = 3;
-pub(crate) const PAGE_SCROLL: usize = 20;
 pub(crate) const DOUBLE_CLICK_MS: u64 = 400;
+/// Columns of mouse jitter tolerated between the two clicks of a double-click.
+pub(crate) const DOUBLE_CLICK_SLOP: u16 = 2;
 
 pub struct HunkComment {
     pub file_idx: usize,
@@ -41,6 +44,12 @@ pub struct CommentBrowserState {
 struct RefreshGate {
     in_flight: bool,
     pending: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct GapExpansionKey {
+    file_path: String,
+    gap_idx: usize,
 }
 
 impl RefreshGate {
@@ -72,6 +81,10 @@ pub struct RepoState {
     pub unified_viewport: ViewportState,
     pub sbs_viewport: ViewportState,
     pub comments: Vec<HunkComment>,
+    /// False until the first diff computation for this repo has finished (or failed).
+    pub loaded: bool,
+    diff_generation: u64,
+    pending_gap_expansions: std::collections::HashSet<GapExpansionKey>,
 }
 
 pub struct FlashState {
@@ -106,6 +119,9 @@ pub struct App {
     base_refreshes: std::collections::HashMap<u64, RefreshGate>,
     pub active_tab: usize,
     pub focused_file: Option<usize>,
+    /// Hunk explicitly selected with `]`/`[` or a click. Only honoured while it is on screen;
+    /// otherwise focus falls back to the first hunk in view. Cleared on every diff refresh.
+    hunk_cursor: Option<(usize, usize)>,
     pub side_by_side: bool,
     pub last_error: Option<String>,
     pub flash: Vec<FlashState>,
@@ -120,6 +136,7 @@ pub struct App {
         std::cell::RefCell<Option<(u16, Vec<ratatui::text::Line<'static>>)>>,
     pub layout: LayoutHints,
     pub last_click: Option<(u16, u16, Instant)>,
+    diff_worker: Option<DiffWorker>,
 }
 
 impl App {
@@ -139,6 +156,9 @@ impl App {
                 unified_viewport: ViewportState::default(),
                 sbs_viewport: ViewportState::default(),
                 comments: Vec::new(),
+                loaded: false,
+                diff_generation: 0,
+                pending_gap_expansions: std::collections::HashSet::new(),
             })
             .collect();
         let next_repo_id = repos.len() as u64;
@@ -157,6 +177,7 @@ impl App {
             base_refreshes,
             active_tab: 0,
             focused_file: None,
+            hunk_cursor: None,
             side_by_side: false,
             last_error: None,
             flash: Vec::new(),
@@ -170,11 +191,60 @@ impl App {
             markdown_render_cache: std::cell::RefCell::new(None),
             layout: LayoutHints::default(),
             last_click: None,
+            diff_worker: None,
         }
     }
 
     pub fn current_mode(&self) -> DiffMode {
         self.repos[self.active_tab].mode
+    }
+
+    /// True while a popup owns the keyboard; mouse clicks on the diff are ignored then.
+    pub fn modal_open(&self) -> bool {
+        self.comment_input.is_some()
+            || self.comment_browser.is_some()
+            || self.file_picker.is_some()
+            || self.repo_adder.is_some()
+            || self.markdown_preview.is_some()
+            || self.show_help
+    }
+
+    /// Show a transient message in the status bar.
+    pub fn set_status(&mut self, message: impl Into<String>) {
+        self.status_message = Some((message.into(), Instant::now() + STATUS_DURATION));
+    }
+
+    /// Rows scrolled by PageUp/PageDown: one screen minus a line of overlap.
+    pub fn page_size(&self) -> usize {
+        self.viewport_height().saturating_sub(1).max(1)
+    }
+
+    /// Rows scrolled by Ctrl+D/Ctrl+U.
+    pub fn half_page_size(&self) -> usize {
+        (self.viewport_height() / 2).max(1)
+    }
+
+    pub fn switch_tab(&mut self, idx: usize) {
+        if idx >= self.repos.len() {
+            return;
+        }
+        self.active_tab = idx;
+        self.hunk_cursor = None;
+        self.prepare_active_layout();
+        self.clamp_active_viewport();
+        self.focused_file = self.focused_file_from_scroll();
+    }
+
+    pub fn next_tab(&mut self) {
+        if !self.repos.is_empty() {
+            self.switch_tab((self.active_tab + 1) % self.repos.len());
+        }
+    }
+
+    pub fn prev_tab(&mut self) {
+        if !self.repos.is_empty() {
+            self.switch_tab((self.active_tab + self.repos.len() - 1) % self.repos.len());
+        }
     }
 
     pub fn set_mode(&mut self, mode: DiffMode, diff_tx: &mpsc::UnboundedSender<DiffResult>) {
@@ -297,6 +367,8 @@ impl App {
 
     fn ensure_layout(&mut self, idx: usize, view: ViewKind) {
         let height = self.viewport_height();
+        let width = self.layout.content_width.max(1) as usize;
+        let width = if width <= 1 { 80 } else { width };
         let repo = match self.repos.get_mut(idx) {
             Some(repo) => repo,
             None => return,
@@ -305,16 +377,15 @@ impl App {
             ViewKind::Unified => &mut repo.unified_layout,
             ViewKind::SideBySide => &mut repo.sbs_layout,
         };
-        if layout_slot.is_some() {
+        if layout_slot
+            .as_ref()
+            .is_some_and(|layout| layout.content_width() == width)
+        {
             return;
         }
         if view == ViewKind::SideBySide {
-            for file in &mut repo.files {
-                file.ensure_sbs_cache();
-            }
+            crate::diff::ensure_sbs_caches(&mut repo.files);
         }
-        let width = self.layout.content_width.max(1) as usize;
-        let width = if width <= 1 { 80 } else { width };
         *layout_slot = Some(DiffLayout::build(&repo.files, view, &repo.comments, width));
         let total = layout_slot
             .as_ref()
@@ -471,6 +542,37 @@ impl App {
             .collect()
     }
 
+    /// Returns raw comment indices matching the browser query.
+    pub fn filtered_comment_indices(&self) -> Vec<usize> {
+        let Some(repo) = self.repos.get(self.active_tab) else {
+            return Vec::new();
+        };
+        let query = self
+            .comment_browser
+            .as_ref()
+            .map(|browser| browser.query.to_lowercase())
+            .unwrap_or_default();
+
+        repo.comments
+            .iter()
+            .enumerate()
+            .filter(|(_, comment)| {
+                if query.is_empty() {
+                    return true;
+                }
+                let file_path = repo
+                    .files
+                    .get(comment.file_idx)
+                    .map(|file| file.path.as_str())
+                    .unwrap_or("");
+                format!("{} {}", file_path, comment.text)
+                    .to_lowercase()
+                    .contains(&query)
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+
     pub fn jump_to_file(&mut self, file_idx: usize) {
         self.prepare_active_layout();
         if let Some(pos) = self
@@ -484,10 +586,21 @@ impl App {
 
     /// Start an async gap expansion. Returns parameters for the background file read,
     /// or None if the gap is already closed or the indices are invalid.
-    pub fn start_expand_gap(&self, file_idx: usize, gap_idx: usize) -> Option<GapExpandRequest> {
+    pub fn start_expand_gap(
+        &mut self,
+        file_idx: usize,
+        gap_idx: usize,
+    ) -> Option<GapExpandRequest> {
         let repo = self.repos.get(self.active_tab)?;
         let file = repo.files.get(file_idx)?;
         if file.hunks.is_empty() {
+            return None;
+        }
+        let expansion_key = GapExpansionKey {
+            file_path: file.path.clone(),
+            gap_idx,
+        };
+        if repo.pending_gap_expansions.contains(&expansion_key) {
             return None;
         }
 
@@ -525,15 +638,23 @@ impl App {
             (start, end, last_old as i64 - last_new as i64)
         };
 
-        Some(GapExpandRequest {
+        let request = GapExpandRequest {
             repo_id: repo.id,
+            diff_generation: repo.diff_generation,
             file_idx,
             gap_idx,
-            file_path: repo.info.path.join(&file.path),
+            repo_path: repo.info.path.clone(),
+            mode: repo.mode,
+            diff_file_path: file.path.clone(),
             gap_start,
             gap_end,
             old_offset,
-        })
+        };
+        self.repos
+            .get_mut(self.active_tab)?
+            .pending_gap_expansions
+            .insert(expansion_key);
+        Some(request)
     }
 
     /// Apply the result of a background gap expansion.
@@ -542,14 +663,25 @@ impl App {
             Some(i) => i,
             None => return,
         };
-        let file = match self
-            .repos
-            .get_mut(idx)
-            .and_then(|r| r.files.get_mut(result.file_idx))
-        {
-            Some(f) => f,
-            None => return,
+        let Some(repo) = self.repos.get_mut(idx) else {
+            return;
         };
+        if repo.diff_generation != result.diff_generation {
+            return;
+        }
+        let expansion_key = GapExpansionKey {
+            file_path: result.diff_file_path.clone(),
+            gap_idx: result.gap_idx,
+        };
+        if !repo.pending_gap_expansions.remove(&expansion_key) {
+            return;
+        }
+        let Some(file) = repo.files.get_mut(result.file_idx) else {
+            return;
+        };
+        if file.path != result.diff_file_path || file.hunks.is_empty() {
+            return;
+        }
 
         let context_lines = result.lines;
         let gap_idx = result.gap_idx;
@@ -676,11 +808,13 @@ impl App {
             unified_viewport: ViewportState::default(),
             sbs_viewport: ViewportState::default(),
             comments: Vec::new(),
+            loaded: false,
+            diff_generation: 0,
+            pending_gap_expansions: std::collections::HashSet::new(),
         });
         self.diff_refreshes.insert(id, RefreshGate::default());
         self.base_refreshes.insert(id, RefreshGate::default());
-        self.active_tab = idx;
-        self.focused_file = None;
+        self.switch_tab(idx);
 
         Ok(idx)
     }
@@ -694,11 +828,11 @@ impl App {
         self.base_refreshes.remove(&id);
         if self.repos.is_empty() {
             self.active_tab = 0;
+            self.focused_file = None;
+            self.hunk_cursor = None;
         } else {
-            self.active_tab = self.active_tab.min(self.repos.len() - 1);
-            self.jump_active_viewport_top();
+            self.switch_tab(self.active_tab.min(self.repos.len() - 1));
         }
-        self.focused_file = None;
         Some(path)
     }
 
@@ -708,16 +842,17 @@ impl App {
             return;
         }
         if let Some(files) = self.current_files_mut() {
-            for file in files {
-                file.ensure_sbs_cache();
-            }
+            crate::diff::ensure_sbs_caches(files);
         }
         self.ensure_layout(self.active_tab, ViewKind::SideBySide);
     }
 
     pub fn apply_diff_result(&mut self, idx: usize, result: anyhow::Result<Vec<FileDiff>>) {
+        self.repos[idx].loaded = true;
         match result {
             Ok(files) => {
+                self.repos[idx].diff_generation = self.repos[idx].diff_generation.wrapping_add(1);
+                self.repos[idx].pending_gap_expansions.clear();
                 let old_collapsed: std::collections::HashMap<String, bool> = self.repos[idx]
                     .files
                     .iter()
@@ -729,15 +864,29 @@ impl App {
                     if let Some(&collapsed) = old_collapsed.get(&file.path) {
                         file.collapsed = collapsed;
                     }
-                    if self.side_by_side {
-                        file.ensure_sbs_cache();
-                    }
+                }
+                if self.side_by_side {
+                    crate::diff::ensure_sbs_caches(&mut new_files);
                 }
 
                 self.repos[idx].files = new_files;
+                let cleared_notes = self.repos[idx].comments.len();
                 self.repos[idx].comments.clear();
-                self.comment_input = None;
-                self.comment_browser = None;
+                if idx == self.active_tab {
+                    let had_draft = self.comment_input.is_some();
+                    self.comment_input = None;
+                    self.comment_browser = None;
+                    self.hunk_cursor = None;
+                    if had_draft {
+                        self.set_status("Diff changed — unsaved note discarded");
+                    } else if cleared_notes > 0 {
+                        self.set_status(format!(
+                            "Diff changed — {} note{} cleared",
+                            cleared_notes,
+                            if cleared_notes == 1 { "" } else { "s" }
+                        ));
+                    }
+                }
                 self.invalidate_layouts(idx);
                 self.ensure_layout(idx, ViewKind::Unified);
                 if self.side_by_side && idx == self.active_tab {
@@ -758,6 +907,9 @@ impl App {
                         .unwrap_or(0);
                     repo.sbs_viewport.clamp_scroll(sbs_total, height);
                 }
+                if idx == self.active_tab {
+                    self.focused_file = self.focused_file_from_scroll();
+                }
                 self.last_error = None;
             }
             Err(e) => {
@@ -776,18 +928,30 @@ impl App {
         if !self.diff_refreshes.entry(id).or_default().request() {
             return;
         }
-        let path = repo.info.path.clone();
-        let mode = repo.mode;
-        let base = repo.base_branch.clone();
+        let job = DiffJob {
+            repo_id: id,
+            path: repo.info.path.clone(),
+            mode: repo.mode,
+            base: repo.base_branch.clone(),
+        };
+        if let Some(worker) = &self.diff_worker
+            && worker.submit(job.clone())
+        {
+            return;
+        }
+        // No worker (tests) or the worker is gone: fall back to a one-off thread.
         let tx = diff_tx.clone();
         std::thread::spawn(move || {
-            let result = git::compute_diff(&path, mode, base.as_deref());
-            let _ = tx.blocking_send(DiffResult {
-                repo_id: id,
-                mode,
-                result,
-            });
+            let _ = tx.blocking_send(job.run());
         });
+    }
+
+    /// Route diff computations through one long-lived thread instead of a thread per
+    /// refresh. Besides skipping spawn cost, this keeps the (large, short-lived) diff
+    /// allocations in a single malloc magazine, so freed memory is reused rather than
+    /// left dirty across many per-thread arenas.
+    pub fn attach_diff_worker(&mut self, results: mpsc::Sender<DiffResult>) {
+        self.diff_worker = Some(DiffWorker::spawn(results));
     }
 
     pub fn refresh_repo_async(&self, idx: usize, diff_tx: &mpsc::UnboundedSender<DiffResult>) {
@@ -883,21 +1047,6 @@ impl App {
         !pending
     }
 
-    pub fn refresh_repo_sync(&mut self, idx: usize) {
-        let repo = &self.repos[idx];
-        let mode = repo.mode;
-        let base = repo.base_branch.clone();
-        let path = repo.info.path.clone();
-        let result = git::compute_diff(&path, mode, base.as_deref());
-        self.apply_diff_result(idx, result);
-    }
-
-    pub fn refresh_all_sync(&mut self) {
-        for i in 0..self.repos.len() {
-            self.refresh_repo_sync(i);
-        }
-    }
-
     pub fn total_display_lines(&self) -> usize {
         self.current_layout()
             .map(DiffLayout::total_lines)
@@ -933,27 +1082,31 @@ impl App {
             .and_then(|layout| layout.hunk_at_row(content_row))
     }
 
-    pub fn copy_hunk_at_row(&mut self, content_row: usize) -> Option<String> {
-        let (file_idx, target_hunk) = self.file_and_hunk_at_row(content_row)?;
-        self.copy_hunk(file_idx, target_hunk)
+    /// Put text on the clipboard and report the outcome in the status bar.
+    pub fn copy_to_clipboard(&mut self, text: String, description: &str) {
+        match arboard::Clipboard::new().and_then(|mut clipboard| clipboard.set_text(text)) {
+            Ok(()) => self.set_status(format!("Copied {description}")),
+            Err(error) => self.set_status(format!("Clipboard unavailable: {error}")),
+        }
     }
 
-    pub fn copy_hunk_at_focus(&mut self) -> Option<String> {
-        let file_idx = self.focused_file?;
-        let files = self.current_files()?;
-        let file = files.get(file_idx)?;
-
-        if file.hunks.is_empty() {
-            return None;
-        }
-
-        let target_hunk = self
-            .current_layout()
-            .and_then(|layout| layout.hunk_at_or_after_row(self.current_scroll_offset(), file_idx))
-            .map(|(_, hunk_idx)| hunk_idx)
-            .unwrap_or(0);
-
-        self.copy_hunk(file_idx, target_hunk)
+    /// Copy the focused hunk (or the hunk at `content_row` if given) with feedback.
+    pub fn copy_hunk_with_feedback(&mut self, content_row: Option<usize>) {
+        let target = match content_row {
+            Some(row) => self.file_and_hunk_at_row(row),
+            None => self.focused_hunk(),
+        };
+        let Some((file_idx, hunk_idx)) = target else {
+            self.set_status("No hunk to copy");
+            return;
+        };
+        let Some(text) = self.copy_hunk(file_idx, hunk_idx) else {
+            self.set_status("No hunk to copy");
+            return;
+        };
+        let label = text.lines().next().unwrap_or("").trim_start_matches("// ");
+        let label = format!("hunk {label}");
+        self.copy_to_clipboard(text, &label);
     }
 
     fn copy_hunk(&mut self, file_idx: usize, target_hunk: usize) -> Option<String> {
@@ -1018,6 +1171,37 @@ impl App {
 
     // -- Comment methods --
 
+    /// Open the floating note editor for a hunk, pre-filled with any existing note.
+    /// `anchor_row` is the layout row the editor floats next to; defaults to the hunk header.
+    pub fn open_comment_input(
+        &mut self,
+        file_idx: usize,
+        hunk_idx: usize,
+        anchor_row: Option<usize>,
+    ) {
+        let anchor_row = anchor_row
+            .or_else(|| {
+                self.current_layout()
+                    .and_then(|layout| layout.hunk_row_range(file_idx, hunk_idx))
+                    .map(|rows| rows.start)
+            })
+            .unwrap_or_else(|| self.current_scroll_offset());
+        let existing_text = self
+            .find_comment(file_idx, hunk_idx)
+            .map(|c| c.text.clone())
+            .unwrap_or_default();
+        let cursor_pos = existing_text.len();
+        self.hunk_cursor = Some((file_idx, hunk_idx));
+        self.focused_file = Some(file_idx);
+        self.comment_input = Some(CommentInputState {
+            file_idx,
+            hunk_idx,
+            text: existing_text,
+            cursor_pos,
+            anchor_row,
+        });
+    }
+
     pub fn find_comment(&self, file_idx: usize, hunk_idx: usize) -> Option<&HunkComment> {
         self.repos
             .get(self.active_tab)?
@@ -1064,14 +1248,13 @@ impl App {
         }
         self.invalidate_layouts(self.active_tab);
         if count > 0 {
-            self.status_message = Some((
-                format!(
-                    "Cleared {} note{}",
-                    count,
-                    if count == 1 { "" } else { "s" }
-                ),
-                Instant::now() + FLASH_DURATION,
+            self.set_status(format!(
+                "Cleared {} note{}",
+                count,
+                if count == 1 { "" } else { "s" }
             ));
+        } else {
+            self.set_status("No notes to clear");
         }
     }
 
@@ -1147,24 +1330,94 @@ impl App {
         Some(result)
     }
 
-    /// Resolve the hunk at the current focus for keyboard comment operations.
+    /// The hunk that `y`, `n`, and `N` act on. This is the explicitly selected hunk while it is
+    /// on screen, otherwise the first hunk visible in the viewport.
     pub fn focused_hunk(&self) -> Option<(usize, usize)> {
-        let file_idx = self.focused_file?;
-        let files = self.current_files()?;
-        files.get(file_idx)?;
+        let layout = self.current_layout()?;
+        let visible = self.visible_row_range(layout.total_lines(), self.viewport_height());
+        if let Some((file_idx, hunk_idx)) = self.hunk_cursor
+            && let Some(rows) = layout.hunk_row_range(file_idx, hunk_idx)
+            && rows.start < visible.end
+            && rows.end > visible.start
+        {
+            return Some((file_idx, hunk_idx));
+        }
+        layout.first_hunk_in_rows(visible)
+    }
 
-        self.current_layout()
-            .and_then(|layout| layout.hunk_at_or_after_row(self.current_scroll_offset(), file_idx))
-            .or_else(|| {
-                // If no hunk at scroll offset, try first hunk of focused file
-                let files = self.current_files()?;
-                let file = files.get(file_idx)?;
-                if file.hunks.is_empty() {
-                    None
-                } else {
-                    Some((file_idx, 0))
-                }
-            })
+    pub fn is_hunk_focused(&self, file_idx: usize, hunk_idx: usize) -> bool {
+        self.focused_hunk() == Some((file_idx, hunk_idx))
+    }
+
+    /// Select a hunk and scroll just enough to bring its first rows into view.
+    pub fn select_hunk(&mut self, file_idx: usize, hunk_idx: usize) {
+        self.prepare_active_layout();
+        let Some(rows) = self
+            .current_layout()
+            .and_then(|layout| layout.hunk_row_range(file_idx, hunk_idx))
+        else {
+            return;
+        };
+        let total = self.total_display_lines();
+        let height = self.viewport_height();
+        let visible = self.visible_row_range(total, height);
+        // Leave one row above the hunk header for the pinned file header, otherwise the
+        // header (and its function context) would be hidden behind it.
+        let header_visible_from = visible.start + usize::from(visible.start > 0);
+        if rows.start < header_visible_from || rows.start >= visible.end {
+            self.jump_active_viewport_to(rows.start.saturating_sub(1));
+        }
+        self.hunk_cursor = Some((file_idx, hunk_idx));
+        self.focused_file = Some(file_idx);
+    }
+
+    /// Move the hunk cursor forward to the next hunk in display order.
+    pub fn select_next_hunk(&mut self) -> bool {
+        self.prepare_active_layout();
+        let Some(layout) = self.current_layout() else {
+            return false;
+        };
+        let anchor = self
+            .focused_hunk()
+            .and_then(|(file_idx, hunk_idx)| layout.hunk_row_range(file_idx, hunk_idx))
+            .map(|rows| rows.start)
+            .unwrap_or(self.current_scroll_offset());
+        let Some((file_idx, hunk_idx)) = layout.next_hunk_after_row(anchor) else {
+            return false;
+        };
+        self.select_hunk(file_idx, hunk_idx);
+        true
+    }
+
+    /// Move the hunk cursor back to the previous hunk in display order.
+    pub fn select_prev_hunk(&mut self) -> bool {
+        self.prepare_active_layout();
+        let Some(layout) = self.current_layout() else {
+            return false;
+        };
+        let anchor = self
+            .focused_hunk()
+            .and_then(|(file_idx, hunk_idx)| layout.hunk_row_range(file_idx, hunk_idx))
+            .map(|rows| rows.start)
+            .unwrap_or(self.current_scroll_offset());
+        let Some((file_idx, hunk_idx)) = layout.prev_hunk_before_row(anchor) else {
+            return false;
+        };
+        self.select_hunk(file_idx, hunk_idx);
+        true
+    }
+
+    /// The file whose header should be pinned to the top of the diff area because the
+    /// viewport has scrolled past it. `None` when the first visible row is already a header.
+    pub fn sticky_header_file(&self) -> Option<usize> {
+        let layout = self.current_layout()?;
+        let first_row = self
+            .visible_row_range(layout.total_lines(), self.viewport_height())
+            .next()?;
+        match layout.row(first_row)? {
+            RowRef::FileHeader { .. } => None,
+            row => Some(row.file_idx()),
+        }
     }
 }
 
@@ -1172,6 +1425,53 @@ pub struct DiffResult {
     pub repo_id: u64,
     pub mode: DiffMode,
     pub result: anyhow::Result<Vec<FileDiff>>,
+}
+
+/// One diff computation to run off the UI thread.
+#[derive(Clone)]
+struct DiffJob {
+    repo_id: u64,
+    path: PathBuf,
+    mode: DiffMode,
+    base: Option<String>,
+}
+
+impl DiffJob {
+    fn run(self) -> DiffResult {
+        let result = git::compute_diff(&self.path, self.mode, self.base.as_deref());
+        DiffResult {
+            repo_id: self.repo_id,
+            mode: self.mode,
+            result,
+        }
+    }
+}
+
+/// A single long-lived thread that computes diffs in submission order.
+struct DiffWorker {
+    jobs: std::sync::mpsc::Sender<DiffJob>,
+}
+
+impl DiffWorker {
+    fn spawn(results: mpsc::Sender<DiffResult>) -> Self {
+        let (jobs, inbox) = std::sync::mpsc::channel::<DiffJob>();
+        std::thread::Builder::new()
+            .name("diff-worker".to_string())
+            .spawn(move || {
+                for job in inbox {
+                    if results.blocking_send(job.run()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn diff worker thread");
+        Self { jobs }
+    }
+
+    /// False if the worker thread has exited, so the caller can fall back.
+    fn submit(&self, job: DiffJob) -> bool {
+        self.jobs.send(job).is_ok()
+    }
 }
 
 pub struct BaseBranchResult {
@@ -1182,9 +1482,13 @@ pub struct BaseBranchResult {
 
 pub struct GapExpandRequest {
     pub repo_id: u64,
+    pub diff_generation: u64,
     pub file_idx: usize,
     pub gap_idx: usize,
-    pub file_path: PathBuf,
+    pub repo_path: PathBuf,
+    /// Decides where context comes from: working tree, index, or HEAD commit.
+    pub mode: DiffMode,
+    pub diff_file_path: String,
     pub gap_start: usize,
     pub gap_end: usize,
     pub old_offset: i64,
@@ -1192,37 +1496,42 @@ pub struct GapExpandRequest {
 
 pub struct GapExpandResult {
     pub repo_id: u64,
+    pub diff_generation: u64,
     pub file_idx: usize,
     pub gap_idx: usize,
+    pub diff_file_path: String,
     pub lines: Vec<DiffLine>,
 }
 
 impl GapExpandRequest {
-    /// Read the file lines in a background thread. This is the blocking part.
+    /// Read the context lines in a background thread. This is the blocking part.
     pub fn execute(self) -> GapExpandResult {
-        use std::io::BufRead;
-        let lines = match std::fs::File::open(&self.file_path) {
-            Ok(f) => std::io::BufReader::new(f)
-                .lines()
-                .skip(self.gap_start - 1)
-                .take(self.gap_end - self.gap_start + 1)
-                .enumerate()
-                .map(|(offset, line)| {
-                    let lineno = self.gap_start + offset;
-                    DiffLine {
-                        kind: LineKind::Context,
-                        content: line.unwrap_or_default(),
-                        old_lineno: Some((lineno as i64 + self.old_offset) as u32),
-                        new_lineno: Some(lineno as u32),
-                    }
-                })
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        let lines = git::read_new_side_lines(
+            &self.repo_path,
+            Path::new(&self.diff_file_path),
+            self.mode,
+            self.gap_start,
+            self.gap_end,
+        )
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .map(|(offset, content)| {
+            let lineno = self.gap_start + offset;
+            DiffLine {
+                kind: LineKind::Context,
+                content,
+                old_lineno: Some((lineno as i64 + self.old_offset) as u32),
+                new_lineno: Some(lineno as u32),
+            }
+        })
+        .collect();
         GapExpandResult {
             repo_id: self.repo_id,
+            diff_generation: self.diff_generation,
             file_idx: self.file_idx,
             gap_idx: self.gap_idx,
+            diff_file_path: self.diff_file_path,
             lines,
         }
     }
@@ -1231,7 +1540,8 @@ impl GapExpandRequest {
 #[cfg(test)]
 mod tests {
     use super::{App, DiffResult, RefreshGate};
-    use crate::diff::{FileDiff, FileStatus};
+    use crate::diff::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
+    use crate::git::DiffMode;
     use crate::git::RepoInfo;
     use std::path::PathBuf;
 
@@ -1257,11 +1567,254 @@ mod tests {
         app
     }
 
+    fn file_with_hunk(path: &str, first_line: u32) -> FileDiff {
+        FileDiff {
+            path: path.to_string(),
+            old_path: None,
+            status: FileStatus::Modified,
+            hunks: vec![Hunk {
+                header: format!("@@ -{first_line} +{first_line} @@"),
+                lines: vec![DiffLine {
+                    kind: LineKind::Context,
+                    content: "existing".to_string(),
+                    old_lineno: Some(first_line),
+                    new_lineno: Some(first_line),
+                }],
+            }],
+            additions: 0,
+            deletions: 0,
+            collapsed: false,
+            total_new_lines: first_line as usize,
+            sbs_cache: None,
+        }
+    }
+
     fn set_picker_query(app: &mut App, query: &str) {
         app.file_picker = Some(super::FilePickerState {
             query: query.to_string(),
             selected: 0,
         });
+    }
+
+    #[test]
+    fn stale_gap_expansion_does_not_modify_a_newer_diff() {
+        let root = std::env::temp_dir().join(format!(
+            "changes-stale-gap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create temporary repository");
+        std::fs::write(root.join("old.rs"), "first\nsecond\nexisting\n").expect("write old file");
+
+        let mut app = test_app_with_files(&[]);
+        app.repos[0].info.path = root.clone();
+        app.repos[0].files = vec![file_with_hunk("old.rs", 3)];
+        let request = app
+            .start_expand_gap(0, 0)
+            .expect("old diff should have an expandable leading gap");
+
+        app.apply_diff_result(0, Ok(vec![file_with_hunk("new.rs", 3)]));
+        app.apply_gap_expand(request.execute());
+
+        assert_eq!(app.repos[0].files[0].path, "new.rs");
+        assert_eq!(app.repos[0].files[0].hunks[0].lines.len(), 1);
+        std::fs::remove_dir_all(root).expect("remove temporary repository");
+    }
+
+    #[test]
+    fn staged_gap_expansion_reads_the_index_not_the_working_tree() {
+        let root = std::env::temp_dir().join(format!(
+            "changes-staged-gap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock should be after epoch")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("create temporary repository");
+        let repository = git2::Repository::init(&root).expect("init repository");
+        let committed: String = (1..=10).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(root.join("file.txt"), &committed).expect("write file");
+        let mut index = repository.index().expect("index");
+        index
+            .add_path(std::path::Path::new("file.txt"))
+            .expect("add file");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        {
+            let tree = repository.find_tree(tree_id).expect("tree");
+            let signature = git2::Signature::now("Test", "test@example.com").expect("sig");
+            repository
+                .commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])
+                .expect("commit");
+        }
+        // Stage a change to line 10, then dirty line 3 in the working tree only.
+        let staged = committed.replace("line 10\n", "STAGED\n");
+        std::fs::write(root.join("file.txt"), &staged).expect("write staged");
+        index
+            .add_path(std::path::Path::new("file.txt"))
+            .expect("stage change");
+        index.write().expect("write index");
+        let unstaged = staged.replace("line 3\n", "UNSTAGED\n");
+        std::fs::write(root.join("file.txt"), &unstaged).expect("write unstaged");
+        drop(index);
+        drop(repository);
+
+        let mut app = test_app_with_files(&[]);
+        app.repos[0].info.path = root.clone();
+        app.repos[0].mode = DiffMode::Staged;
+        let files = crate::git::compute_diff(&root, DiffMode::Staged, None).expect("diff");
+        app.apply_diff_result(0, Ok(files));
+        assert_eq!(app.repos[0].files[0].total_new_lines, 10);
+
+        let request = app
+            .start_expand_gap(0, 0)
+            .expect("staged hunk has hidden lines above it");
+        let result = request.execute();
+        let contents: Vec<&str> = result.lines.iter().map(|l| l.content.as_str()).collect();
+        std::fs::remove_dir_all(root).expect("remove temporary repository");
+
+        assert!(
+            contents.contains(&"line 3"),
+            "expected index content: {contents:?}"
+        );
+        assert!(
+            !contents.contains(&"UNSTAGED"),
+            "working tree leaked: {contents:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_gap_expansion_request_is_coalesced() {
+        let mut app = test_app_with_files(&[]);
+        app.repos[0].files = vec![file_with_hunk("old.rs", 3)];
+
+        assert!(app.start_expand_gap(0, 0).is_some());
+        assert!(app.start_expand_gap(0, 0).is_none());
+    }
+
+    /// A file with `count` single-line hunks spaced far enough apart to leave gaps.
+    fn file_with_hunks(path: &str, count: u32) -> FileDiff {
+        let mut file = file_with_hunk(path, 10);
+        file.hunks = (0..count)
+            .map(|i| {
+                let line = 10 + i * 30;
+                Hunk {
+                    header: format!("@@ -{line} +{line} @@"),
+                    lines: vec![DiffLine {
+                        kind: LineKind::Addition,
+                        content: format!("hunk {i}"),
+                        old_lineno: None,
+                        new_lineno: Some(line),
+                    }],
+                }
+            })
+            .collect();
+        file.total_new_lines = (10 + count * 30) as usize;
+        file
+    }
+
+    fn app_with_two_files_of_three_hunks() -> App {
+        let mut app = test_app_with_files(&[]);
+        app.layout.content_width = 80;
+        app.layout.content_height = 6;
+        app.apply_diff_result(
+            0,
+            Ok(vec![file_with_hunks("a.rs", 3), file_with_hunks("b.rs", 3)]),
+        );
+        app
+    }
+
+    #[test]
+    fn focus_is_available_before_the_user_scrolls() {
+        let app = app_with_two_files_of_three_hunks();
+        assert_eq!(app.focused_file, Some(0));
+        assert_eq!(app.focused_hunk(), Some((0, 0)));
+    }
+
+    #[test]
+    fn bracket_navigation_walks_hunks_across_files_and_keeps_them_in_view() {
+        let mut app = app_with_two_files_of_three_hunks();
+
+        assert!(app.select_next_hunk());
+        assert_eq!(app.focused_hunk(), Some((0, 1)));
+        assert!(app.select_next_hunk());
+        assert!(app.select_next_hunk());
+        assert_eq!(app.focused_hunk(), Some((1, 0)));
+        assert_eq!(app.focused_file, Some(1));
+
+        // The selected hunk's rows are always inside the viewport.
+        let layout = app.current_layout().unwrap();
+        let rows = layout.hunk_row_range(1, 0).unwrap();
+        let visible = app.visible_row_range(layout.total_lines(), 6);
+        assert!(rows.start >= visible.start && rows.start < visible.end);
+
+        assert!(app.select_prev_hunk());
+        assert_eq!(app.focused_hunk(), Some((0, 2)));
+
+        for _ in 0..10 {
+            app.select_prev_hunk();
+        }
+        assert!(!app.select_prev_hunk());
+        assert_eq!(app.focused_hunk(), Some((0, 0)));
+    }
+
+    #[test]
+    fn hunk_cursor_yields_to_the_viewport_once_scrolled_away() {
+        let mut app = app_with_two_files_of_three_hunks();
+        app.select_hunk(0, 1);
+        assert_eq!(app.focused_hunk(), Some((0, 1)));
+
+        app.jump_active_viewport_bottom();
+        let focused = app.focused_hunk().expect("a hunk is visible at the bottom");
+        assert_ne!(focused, (0, 1));
+        assert_eq!(focused.0, 1);
+    }
+
+    #[test]
+    fn diff_refresh_drops_the_hunk_cursor() {
+        let mut app = app_with_two_files_of_three_hunks();
+        app.select_hunk(1, 2);
+        app.apply_diff_result(0, Ok(vec![file_with_hunks("a.rs", 3)]));
+        assert_eq!(app.focused_hunk(), Some((0, 0)));
+    }
+
+    #[test]
+    fn sticky_header_appears_only_after_scrolling_past_the_file_header() {
+        let mut app = app_with_two_files_of_three_hunks();
+        assert_eq!(app.sticky_header_file(), None);
+
+        app.scroll_active_viewport(2);
+        assert_eq!(app.sticky_header_file(), Some(0));
+
+        let header_row = app.current_layout().unwrap().file_header_row(1).unwrap();
+        app.jump_active_viewport_to(header_row);
+        assert_eq!(app.sticky_header_file(), None);
+    }
+
+    #[test]
+    fn switching_tabs_keeps_a_focused_file() {
+        let mut app = App::new(vec![
+            RepoInfo {
+                name: "one".to_string(),
+                path: PathBuf::from("/one"),
+            },
+            RepoInfo {
+                name: "two".to_string(),
+                path: PathBuf::from("/two"),
+            },
+        ]);
+        app.layout.content_width = 80;
+        app.layout.content_height = 6;
+        app.apply_diff_result(1, Ok(vec![file_with_hunks("b.rs", 1)]));
+
+        app.next_tab();
+        assert_eq!(app.active_tab, 1);
+        assert_eq!(app.focused_file, Some(0));
+        assert_eq!(app.focused_hunk(), Some((0, 0)));
     }
 
     #[test]
@@ -1290,6 +1843,24 @@ mod tests {
 
         assert!(!app.apply_diff_refresh_result(result, &tx));
         assert_eq!(app.repos[0].files[0].path, "old.rs");
+    }
+
+    #[test]
+    fn active_layout_rebuilds_when_content_width_changes() {
+        let mut app = test_app_with_files(&[]);
+        let mut file = file_with_hunk("src/main.rs", 1);
+        file.hunks[0].lines[0].content = "word ".repeat(30);
+        app.repos[0].files = vec![file];
+
+        app.layout.content_width = 80;
+        app.prepare_active_layout();
+        let wide_total = app.current_layout().unwrap().total_lines();
+
+        app.layout.content_width = 20;
+        app.prepare_active_layout();
+        let narrow_total = app.current_layout().unwrap().total_lines();
+
+        assert!(narrow_total > wide_total);
     }
 
     #[test]
