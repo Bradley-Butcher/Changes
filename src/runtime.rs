@@ -258,6 +258,10 @@ fn handle_event(
                 *needs_redraw = true;
                 return Ok(false);
             }
+            if keys::handle_outline_key(app, key) {
+                *needs_redraw = true;
+                return Ok(false);
+            }
             // Remove current tab
             if key.code == KeyCode::Char('x') {
                 if app.repos.len() > 1 {

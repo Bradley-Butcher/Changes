@@ -1,6 +1,7 @@
 use crate::app::App;
 use crate::diff::{FileStatus, LineKind};
 use crate::highlight::Highlighter;
+use crate::outline::{self, OutlineRow, SymbolChange, hunk_context};
 use crate::viewport::{RowRef, chunk_end, side_by_side_gutter_width, side_by_side_pane_widths};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -313,10 +314,175 @@ fn draw_diff_area(frame: &mut Frame, app: &App, highlighter: &Highlighter, area:
         return;
     }
 
-    if app.side_by_side {
+    if app.outline.is_some() {
+        draw_outline(frame, app, area);
+    } else if app.side_by_side {
         draw_side_by_side(frame, app, highlighter, files, layout, area);
     } else {
         draw_unified(frame, app, highlighter, files, layout, area);
+    }
+}
+
+/// The change-shape view: directory tree, per-file counts, and changed declarations.
+fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
+    let Some(state) = app.outline.as_ref() else {
+        return;
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Outline — ↵ open · j/k move · y copy as markdown · o full diff ")
+        .title_style(Style::default().fg(FG_MUTED));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+
+    let height = inner.height as usize;
+    let scroll = state.scroll.min(state.rows.len().saturating_sub(height));
+    let width = inner.width as usize;
+
+    let mut lines: Vec<Line> = Vec::with_capacity(height);
+    for (index, row) in state.rows.iter().enumerate().skip(scroll).take(height) {
+        let selected = index == state.selected;
+        let row_bg = if selected { Some(BG_TAB_ACTIVE) } else { None };
+        let with_bg = |style: Style| match row_bg {
+            Some(bg) => style.bg(bg),
+            None => style,
+        };
+        let mut spans: Vec<Span> = vec![Span::styled(" ", with_bg(Style::default()))];
+        let counts: Option<(usize, usize)> = match row {
+            OutlineRow::Dir {
+                prefix,
+                name,
+                additions,
+                deletions,
+            } => {
+                spans.push(Span::styled(
+                    prefix.clone(),
+                    with_bg(Style::default().fg(FG_MUTED)),
+                ));
+                spans.push(Span::styled(
+                    format!("{name}/"),
+                    with_bg(
+                        Style::default()
+                            .fg(FG_PATH_DIR)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ));
+                Some((*additions, *deletions))
+            }
+            OutlineRow::File {
+                prefix,
+                name,
+                status,
+                additions,
+                deletions,
+                ..
+            } => {
+                spans.push(Span::styled(
+                    prefix.clone(),
+                    with_bg(Style::default().fg(FG_MUTED)),
+                ));
+                spans.push(Span::styled(
+                    format!("{} ", outline::status_glyph(*status)),
+                    with_bg(
+                        Style::default()
+                            .fg(status_color(*status))
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ));
+                spans.push(Span::styled(
+                    name.clone(),
+                    with_bg(Style::default().fg(FG_PATH_FILE).add_modifier(if selected {
+                        Modifier::BOLD
+                    } else {
+                        Modifier::empty()
+                    })),
+                ));
+                Some((*additions, *deletions))
+            }
+            OutlineRow::Symbol { prefix, symbol, .. } => {
+                spans.push(Span::styled(
+                    prefix.clone(),
+                    with_bg(Style::default().fg(FG_MUTED)),
+                ));
+                let (glyph_color, name_color) = match symbol.change {
+                    SymbolChange::Added => (FG_ADD, Color::White),
+                    SymbolChange::Removed => (FG_DEL, FG_MUTED),
+                    SymbolChange::Modified => (FG_STATUS_M, Color::White),
+                };
+                spans.push(Span::styled(
+                    format!("{} ", outline::change_glyph(symbol.change)),
+                    with_bg(
+                        Style::default()
+                            .fg(glyph_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ));
+                spans.push(Span::styled(
+                    symbol.name.clone(),
+                    with_bg(Style::default().fg(name_color)),
+                ));
+                None
+            }
+            OutlineRow::More { prefix, count, .. } => {
+                spans.push(Span::styled(
+                    prefix.clone(),
+                    with_bg(Style::default().fg(FG_MUTED)),
+                ));
+                spans.push(Span::styled(
+                    format!("… {count} more"),
+                    with_bg(Style::default().fg(FG_MUTED).add_modifier(Modifier::ITALIC)),
+                ));
+                None
+            }
+        };
+        let used: usize = spans
+            .iter()
+            .map(|span| UnicodeWidthStr::width(span.content.as_ref()))
+            .sum();
+        if let Some((additions, deletions)) = counts {
+            let adds = format!("+{additions}");
+            let dels = format!("-{deletions}");
+            let tail = adds.len() + 1 + dels.len() + 1;
+            let pad = width.saturating_sub(used + tail);
+            spans.push(Span::styled(" ".repeat(pad), with_bg(Style::default())));
+            spans.push(Span::styled(adds, with_bg(Style::default().fg(FG_ADD))));
+            spans.push(Span::styled(" ", with_bg(Style::default())));
+            spans.push(Span::styled(dels, with_bg(Style::default().fg(FG_DEL))));
+            spans.push(Span::styled(" ", with_bg(Style::default())));
+        } else if selected {
+            spans.push(Span::styled(
+                " ".repeat(width.saturating_sub(used)),
+                with_bg(Style::default()),
+            ));
+        }
+        lines.push(Line::from(spans));
+    }
+    if state.rows.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  No changes to outline",
+            Style::default().fg(FG_MUTED),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+
+    if state.rows.len() > height {
+        let mut scrollbar_state =
+            ScrollbarState::new(state.rows.len().saturating_sub(height)).position(scroll);
+        frame.render_stateful_widget(
+            Scrollbar::new(ScrollbarOrientation::VerticalRight),
+            area,
+            &mut scrollbar_state,
+        );
+    }
+}
+
+fn status_color(status: FileStatus) -> Color {
+    match status {
+        FileStatus::Modified => FG_STATUS_M,
+        FileStatus::Added => FG_STATUS_A,
+        FileStatus::Deleted => FG_STATUS_D,
+        FileStatus::Renamed => FG_STATUS_R,
+        FileStatus::Untracked => FG_MUTED,
     }
 }
 
@@ -466,6 +632,7 @@ fn draw_unified(
                     inner_area.width as usize,
                     chunk_idx,
                     chunk_start,
+                    file.is_whole_file_change(),
                 ));
             }
             RowRef::GapTail { gap_after, .. } if gap_after > 0 => {
@@ -630,6 +797,7 @@ fn draw_side_by_side(
                     PaneSide::Left,
                     chunk_idx,
                     layout.chunk_start(row),
+                    file.is_whole_file_change(),
                 )
                 .unwrap_or_else(|| sbs_continuation(lno_w, focused));
                 let right = build_sbs_line(
@@ -643,6 +811,7 @@ fn draw_side_by_side(
                     PaneSide::Right,
                     chunk_idx,
                     layout.right_chunk_start(row),
+                    file.is_whole_file_change(),
                 )
                 .unwrap_or_else(|| sbs_continuation(lno_w, focused));
                 left_lines.push(left);
@@ -743,8 +912,12 @@ fn build_unified_line<'a>(
     content_width: usize,
     chunk_idx: usize,
     chunk_start: usize,
+    plain: bool,
 ) -> Line<'a> {
+    // In a file that is entirely new or entirely deleted every line is on one side, so
+    // per-line markers carry no information; show it as source with a header badge.
     let prefix = match line.kind {
+        _ if plain => "  ",
         LineKind::Context => "  ",
         LineKind::Addition => "+ ",
         LineKind::Deletion => "- ",
@@ -752,6 +925,8 @@ fn build_unified_line<'a>(
 
     let bg = if is_flashing {
         Some(BG_FLASH)
+    } else if plain {
+        None
     } else {
         match line.kind {
             LineKind::Addition => Some(BG_ADD),
@@ -761,6 +936,7 @@ fn build_unified_line<'a>(
     };
 
     let prefix_style = match line.kind {
+        _ if plain => Style::default().fg(FG_MUTED),
         LineKind::Addition => Style::default().fg(FG_ADD).bg(bg.unwrap_or_default()),
         LineKind::Deletion => Style::default().fg(FG_DEL).bg(bg.unwrap_or_default()),
         _ => Style::default().fg(FG_MUTED),
@@ -804,6 +980,7 @@ fn build_sbs_line<'a>(
     side: PaneSide,
     chunk_idx: usize,
     chunk_start: Option<usize>,
+    plain: bool,
 ) -> Option<Line<'a>> {
     let Some(line) = line_opt else {
         return (chunk_idx == 0).then(|| {
@@ -816,18 +993,21 @@ fn build_sbs_line<'a>(
     };
 
     let bg = match line.kind {
+        _ if plain => None,
         LineKind::Addition => Some(BG_ADD),
         LineKind::Deletion => Some(BG_DEL),
         _ => None,
     };
 
     let prefix = match line.kind {
+        _ if plain => "  ",
         LineKind::Addition => "+ ",
         LineKind::Deletion => "- ",
         _ => "  ",
     };
 
     let prefix_style = match line.kind {
+        _ if plain => Style::default().fg(FG_MUTED),
         LineKind::Addition => Style::default().fg(FG_ADD),
         LineKind::Deletion => Style::default().fg(FG_DEL),
         _ => Style::default().fg(FG_MUTED),
@@ -1017,6 +1197,20 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
         UnicodeWidthStr::width(dir) + UnicodeWidthStr::width(filename)
     };
     spans.push(Span::styled("  ", Style::default().bg(bg)));
+    let badge = match file.status {
+        FileStatus::Added | FileStatus::Untracked => "new file  ",
+        FileStatus::Deleted => "deleted  ",
+        _ => "",
+    };
+    if !badge.is_empty() {
+        spans.push(Span::styled(
+            badge,
+            Style::default()
+                .fg(FG_MUTED)
+                .bg(bg)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    }
     let used = 1
         + UnicodeWidthStr::width(collapse)
         + 1
@@ -1024,6 +1218,7 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
         + 2
         + path_display_len
         + 2
+        + badge.len()
         + adds.len()
         + 2
         + dels.len();
@@ -1090,16 +1285,6 @@ fn apply_inline_emphasis(spans: &mut Vec<Span<'_>>, ranges: &[(usize, usize)], e
     *spans = new_spans;
 }
 
-/// Extract the function context from a hunk header like `@@ -10,5 +10,7 @@ fn foo()`.
-/// Returns the function name if present, otherwise None.
-fn hunk_context(header: &str) -> Option<&str> {
-    // Find the closing "@@" (skip the opening one)
-    let rest = header.strip_prefix("@@")?;
-    let end = rest.find("@@")?;
-    let after = rest[end + 2..].trim();
-    if after.is_empty() { None } else { Some(after) }
-}
-
 fn format_lineno(line: &crate::diff::DiffLine, width: usize) -> String {
     use std::fmt::Write;
     let mut buf = String::with_capacity(width * 2 + 4);
@@ -1139,7 +1324,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
     let repo = app.repos.get(app.active_tab);
     let base = repo.and_then(|r| r.base_branch.as_deref());
     let mode = app.current_mode().label(base);
-    let view = if app.side_by_side {
+    let view = if app.outline.is_some() {
+        "outline"
+    } else if app.side_by_side {
         "side-by-side"
     } else {
         "unified"
@@ -1247,21 +1434,34 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
         spans.push(Span::styled(msg, style));
     } else {
         // Key hints, from the most useful down, dropped from the right when space is tight.
-        let hints_full = [
-            ("y", "copy hunk"),
-            ("n", "note"),
-            ("Y", "copy notes"),
-            ("]/[", "hunk"),
-            ("J/K", "file"),
-            ("f", "find"),
-            ("?", "help"),
-            ("q", "quit"),
-        ];
+        let hints_full: [(&str, &str); 8] = if app.outline.is_some() {
+            [
+                ("↵", "open"),
+                ("j/k", "move"),
+                ("y", "copy outline"),
+                ("o", "full diff"),
+                ("m/s/b", "mode"),
+                ("f", "find"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]
+        } else {
+            [
+                ("y", "copy hunk"),
+                ("n", "note"),
+                ("Y", "copy notes"),
+                ("]/[", "hunk"),
+                ("o", "outline"),
+                ("J/K", "file"),
+                ("?", "help"),
+                ("q", "quit"),
+            ]
+        };
         let mut hint_spans: Vec<Span> = Vec::new();
         let mut hint_width = 0usize;
         let budget = remaining.saturating_sub(3);
         for (key, label) in hints_full {
-            let piece_width = key.len() + 1 + label.len() + 2;
+            let piece_width = UnicodeWidthStr::width(key) + 1 + UnicodeWidthStr::width(label) + 2;
             if hint_width + piece_width > budget {
                 break;
             }
@@ -1608,6 +1808,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         &[
             ("m/s/b", "Modified / staged / branch"),
             ("v", "Unified ↔ side-by-side"),
+            ("o", "Outline: files + changed symbols"),
             ("p", "Preview focused .md file"),
         ],
     ));
@@ -1982,7 +2183,7 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{LayoutHints, chunk_end, draw, hunk_context, ranges_for_chunk};
+    use super::{LayoutHints, chunk_end, draw, ranges_for_chunk};
     use crate::app::App;
     use crate::diff::{DiffLine, FileDiff, FileStatus, Hunk, LineKind, SideBySideLine};
     use crate::git::RepoInfo;
@@ -2018,30 +2219,6 @@ mod tests {
         assert_eq!(ranges_for_chunk(&[(2, 8)], 5, 10), vec![(0, 3)]);
     }
 
-    #[test]
-    fn extracts_function_name() {
-        assert_eq!(hunk_context("@@ -10,5 +10,7 @@ fn foo()"), Some("fn foo()"));
-    }
-
-    #[test]
-    fn no_function_context() {
-        assert_eq!(hunk_context("@@ -10,5 +10,7 @@"), None);
-    }
-
-    #[test]
-    fn whitespace_only_after_returns_none() {
-        assert_eq!(hunk_context("@@ -10,5 +10,7 @@   "), None);
-    }
-
-    #[test]
-    fn impl_block_context() {
-        assert_eq!(hunk_context("@@ -1,3 +1,5 @@ impl Foo"), Some("impl Foo"));
-    }
-
-    #[test]
-    fn non_hunk_header_returns_none() {
-        assert_eq!(hunk_context("not a header"), None);
-    }
     #[test]
     fn bottom_of_viewport_renders_the_last_wrapped_chunk() {
         let mut app = App::new(vec![RepoInfo {

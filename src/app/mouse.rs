@@ -83,6 +83,30 @@ fn handle_mouse_with_senders(
         return false;
     }
 
+    // The outline view owns scrolling and clicks inside the content area.
+    if app.outline.is_some() {
+        match mouse.kind {
+            MouseEventKind::ScrollUp => {
+                app.outline_move(-(SCROLL_SPEED as isize));
+                return true;
+            }
+            MouseEventKind::ScrollDown => {
+                app.outline_move(SCROLL_SPEED as isize);
+                return true;
+            }
+            MouseEventKind::Down(MouseButton::Left) if mouse.row >= app.layout.content_y => {
+                let row = (mouse.row as usize).saturating_sub(app.layout.content_y as usize)
+                    + app.outline.as_ref().map_or(0, |state| state.scroll);
+                if app.outline_select_row(row) {
+                    app.outline_jump();
+                }
+                return true;
+            }
+            MouseEventKind::Down(_) if mouse.row >= app.layout.content_y => return false,
+            _ => {}
+        }
+    }
+
     match mouse.kind {
         MouseEventKind::ScrollUp => {
             app.scroll_active_viewport(-(SCROLL_SPEED as isize));

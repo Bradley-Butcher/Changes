@@ -3,6 +3,7 @@ pub mod mouse;
 
 use crate::diff::{DiffLine, FileDiff, LineKind};
 use crate::git::{self, DiffMode, RepoInfo};
+use crate::outline::{self, OutlineRow};
 use crate::ui::LayoutHints;
 use crate::viewport::{DiffLayout, RowRef, ViewKind, ViewportState};
 use std::ops::Range;
@@ -112,6 +113,21 @@ pub struct MarkdownPreviewState {
     pub scroll: usize,
 }
 
+/// The change-shape view: a file tree with the declarations each hunk touches.
+pub struct OutlineState {
+    pub rows: Vec<OutlineRow>,
+    /// Index into `rows`; always a selectable row when any exist.
+    pub selected: usize,
+    pub scroll: usize,
+}
+
+/// Diffs with at least this many files open in the outline first, so the shape of the
+/// change is visible before any single hunk.
+pub const OUTLINE_AUTO_OPEN_FILES: usize = 15;
+
+/// Whole-file additions or deletions longer than this start collapsed.
+pub const LARGE_WHOLE_FILE_LINES: usize = 200;
+
 pub struct App {
     pub repos: Vec<RepoState>,
     next_repo_id: u64,
@@ -132,6 +148,7 @@ pub struct App {
     pub comment_input: Option<CommentInputState>,
     pub comment_browser: Option<CommentBrowserState>,
     pub markdown_preview: Option<MarkdownPreviewState>,
+    pub outline: Option<OutlineState>,
     pub(crate) markdown_render_cache:
         std::cell::RefCell<Option<(u16, Vec<ratatui::text::Line<'static>>)>>,
     pub layout: LayoutHints,
@@ -188,6 +205,7 @@ impl App {
             comment_input: None,
             comment_browser: None,
             markdown_preview: None,
+            outline: None,
             markdown_render_cache: std::cell::RefCell::new(None),
             layout: LayoutHints::default(),
             last_click: None,
@@ -233,6 +251,173 @@ impl App {
         self.prepare_active_layout();
         self.clamp_active_viewport();
         self.focused_file = self.focused_file_from_scroll();
+        if self.outline.is_some() {
+            self.rebuild_outline();
+        }
+    }
+
+    // -- Outline (change shape) view --
+
+    pub fn open_outline(&mut self) {
+        let rows = self
+            .current_files()
+            .map(|files| outline::build_outline(files))
+            .unwrap_or_default();
+        let selected = rows.iter().position(OutlineRow::is_selectable).unwrap_or(0);
+        self.outline = Some(OutlineState {
+            rows,
+            selected,
+            scroll: 0,
+        });
+    }
+
+    pub fn close_outline(&mut self) {
+        self.outline = None;
+    }
+
+    pub fn toggle_outline(&mut self) {
+        if self.outline.is_some() {
+            self.close_outline();
+        } else {
+            self.open_outline();
+        }
+    }
+
+    /// Recompute rows after the diff changed, keeping the cursor on the same file.
+    fn rebuild_outline(&mut self) {
+        let Some(state) = &self.outline else {
+            return;
+        };
+        let previous_target = state.rows.get(state.selected).and_then(OutlineRow::target);
+        let previous_path = previous_target.and_then(|(file_idx, _)| {
+            self.current_files()
+                .and_then(|files| files.get(file_idx))
+                .map(|file| file.path.clone())
+        });
+        self.open_outline();
+        if let (Some(path), Some(state)) = (previous_path, &mut self.outline) {
+            let same_file = state.rows.iter().position(|row| {
+                matches!(row, OutlineRow::File { file_idx, .. }
+                    if self.repos[self.active_tab].files.get(*file_idx).is_some_and(|f| f.path == path))
+            });
+            if let Some(index) = same_file {
+                state.selected = index;
+            }
+        }
+        self.keep_outline_selection_visible();
+    }
+
+    /// Move the outline cursor by `delta` selectable rows.
+    pub fn outline_move(&mut self, delta: isize) {
+        let Some(state) = &mut self.outline else {
+            return;
+        };
+        let selectable: Vec<usize> = state
+            .rows
+            .iter()
+            .enumerate()
+            .filter(|(_, row)| row.is_selectable())
+            .map(|(index, _)| index)
+            .collect();
+        if selectable.is_empty() {
+            return;
+        }
+        let position = selectable
+            .iter()
+            .position(|&index| index >= state.selected)
+            .unwrap_or(selectable.len() - 1);
+        let next = position
+            .saturating_add_signed(delta)
+            .min(selectable.len() - 1);
+        state.selected = selectable[next];
+        self.keep_outline_selection_visible();
+    }
+
+    /// Scroll the outline just enough to keep the selection on screen, with a small
+    /// margin so the next row is already visible when moving.
+    fn keep_outline_selection_visible(&mut self) {
+        let height = self.viewport_height();
+        let Some(state) = &mut self.outline else {
+            return;
+        };
+        let max_scroll = state.rows.len().saturating_sub(height);
+        let margin = 2.min(height / 3);
+        if state.selected < state.scroll + margin {
+            state.scroll = state.selected.saturating_sub(margin);
+        } else if state.selected + margin >= state.scroll + height {
+            state.scroll = (state.selected + margin + 1).saturating_sub(height);
+        }
+        state.scroll = state.scroll.min(max_scroll);
+    }
+
+    pub fn outline_jump_to_end(&mut self, end: bool) {
+        let Some(state) = &mut self.outline else {
+            return;
+        };
+        let target = if end {
+            state.rows.iter().rposition(OutlineRow::is_selectable)
+        } else {
+            state.rows.iter().position(OutlineRow::is_selectable)
+        };
+        if let Some(index) = target {
+            state.selected = index;
+        }
+        self.keep_outline_selection_visible();
+    }
+
+    /// Select the row under a content-area click, if it is selectable.
+    pub fn outline_select_row(&mut self, row: usize) -> bool {
+        let Some(state) = &mut self.outline else {
+            return false;
+        };
+        if state.rows.get(row).is_some_and(OutlineRow::is_selectable) {
+            state.selected = row;
+            self.keep_outline_selection_visible();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Leave the outline and scroll the diff to the selected file or hunk.
+    pub fn outline_jump(&mut self) {
+        let Some(target) = self
+            .outline
+            .as_ref()
+            .and_then(|state| state.rows.get(state.selected))
+            .and_then(OutlineRow::target)
+        else {
+            return;
+        };
+        self.outline = None;
+        let (file_idx, hunk_idx) = target;
+        if self
+            .current_files()
+            .and_then(|files| files.get(file_idx))
+            .is_some_and(|file| file.collapsed)
+        {
+            self.toggle_collapsed(file_idx);
+        }
+        match hunk_idx {
+            Some(hunk_idx) => {
+                self.prepare_active_layout();
+                let row = self
+                    .current_layout()
+                    .and_then(|layout| layout.hunk_row_range(file_idx, hunk_idx))
+                    .map(|rows| rows.start.saturating_sub(1));
+                if let Some(row) = row {
+                    self.jump_active_viewport_to(row);
+                }
+                self.hunk_cursor = Some((file_idx, hunk_idx));
+                self.focused_file = Some(file_idx);
+            }
+            None => self.jump_to_file(file_idx),
+        }
+    }
+
+    pub fn outline_markdown(&self) -> Option<String> {
+        let state = self.outline.as_ref()?;
+        (!state.rows.is_empty()).then(|| outline::outline_markdown(&state.rows))
     }
 
     pub fn next_tab(&mut self) {
@@ -848,7 +1033,7 @@ impl App {
     }
 
     pub fn apply_diff_result(&mut self, idx: usize, result: anyhow::Result<Vec<FileDiff>>) {
-        self.repos[idx].loaded = true;
+        let was_loaded = std::mem::replace(&mut self.repos[idx].loaded, true);
         match result {
             Ok(files) => {
                 self.repos[idx].diff_generation = self.repos[idx].diff_generation.wrapping_add(1);
@@ -859,10 +1044,17 @@ impl App {
                     .map(|f| (f.path.clone(), f.collapsed))
                     .collect();
 
+                let first_load = !was_loaded;
                 let mut new_files = files;
                 for file in &mut new_files {
                     if let Some(&collapsed) = old_collapsed.get(&file.path) {
                         file.collapsed = collapsed;
+                    } else if file.is_whole_file_change()
+                        && file.total_display_lines() > LARGE_WHOLE_FILE_LINES
+                    {
+                        // A 400-line new file is best read as a file, not a diff; start
+                        // folded so the shape of the change stays visible.
+                        file.collapsed = true;
                     }
                 }
                 if self.side_by_side {
@@ -909,6 +1101,15 @@ impl App {
                 }
                 if idx == self.active_tab {
                     self.focused_file = self.focused_file_from_scroll();
+                    let file_count = self.repos[idx].files.len();
+                    if self.outline.is_some() {
+                        self.rebuild_outline();
+                    } else if first_load && file_count >= OUTLINE_AUTO_OPEN_FILES {
+                        self.open_outline();
+                        self.set_status(format!(
+                            "{file_count} files changed — showing the outline; Enter opens a file, o shows the full diff"
+                        ));
+                    }
                 }
                 self.last_error = None;
             }
@@ -1815,6 +2016,77 @@ mod tests {
         assert_eq!(app.active_tab, 1);
         assert_eq!(app.focused_file, Some(0));
         assert_eq!(app.focused_hunk(), Some((0, 0)));
+    }
+
+    #[test]
+    fn outline_navigation_skips_directories_and_jumps_to_hunks() {
+        let mut app = app_with_two_files_of_three_hunks();
+        app.repos[0].files[1].path = "src/b.rs".to_string();
+        app.open_outline();
+        let state = app.outline.as_ref().unwrap();
+        // First row is the `src/` directory, which is not selectable.
+        assert!(!state.rows[0].is_selectable());
+        assert!(state.rows[state.selected].is_selectable());
+
+        // Move onto the first symbol row of the first file and jump to it.
+        app.outline_move(1);
+        let target = app.outline.as_ref().unwrap().rows[app.outline.as_ref().unwrap().selected]
+            .target()
+            .unwrap();
+        app.outline_jump();
+        assert!(app.outline.is_none());
+        assert_eq!(app.focused_hunk(), Some((target.0, target.1.unwrap_or(0))));
+    }
+
+    #[test]
+    fn big_diffs_open_in_the_outline_on_first_load_only() {
+        let mut app = test_app_with_files(&[]);
+        app.layout.content_width = 80;
+        app.layout.content_height = 20;
+        let many: Vec<FileDiff> = (0..super::OUTLINE_AUTO_OPEN_FILES)
+            .map(|i| file_with_hunks(&format!("src/f{i}.rs"), 1))
+            .collect();
+        app.apply_diff_result(0, Ok(many.clone()));
+        assert!(
+            app.outline.is_some(),
+            "first load of a big diff shows the outline"
+        );
+
+        app.close_outline();
+        app.apply_diff_result(0, Ok(many));
+        assert!(
+            app.outline.is_none(),
+            "later refreshes respect the user's choice"
+        );
+    }
+
+    #[test]
+    fn large_new_files_start_collapsed_and_stay_as_the_user_left_them() {
+        let mut app = test_app_with_files(&[]);
+        app.layout.content_width = 80;
+        app.layout.content_height = 20;
+        let mut big = file_with_hunks("new.rs", 1);
+        big.status = FileStatus::Untracked;
+        big.hunks[0].lines = (0..super::LARGE_WHOLE_FILE_LINES as u32 + 5)
+            .map(|n| DiffLine {
+                kind: LineKind::Addition,
+                content: format!("line {n}"),
+                old_lineno: None,
+                new_lineno: Some(n + 1),
+            })
+            .collect();
+        let mut small = file_with_hunks("small.rs", 1);
+        small.status = FileStatus::Added;
+        app.apply_diff_result(0, Ok(vec![big.clone(), small.clone()]));
+        assert!(app.repos[0].files[0].collapsed);
+        assert!(!app.repos[0].files[1].collapsed);
+
+        app.toggle_collapsed(0);
+        app.apply_diff_result(0, Ok(vec![big, small]));
+        assert!(
+            !app.repos[0].files[0].collapsed,
+            "explicit expand survives a refresh"
+        );
     }
 
     #[test]

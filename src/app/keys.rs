@@ -103,6 +103,9 @@ fn handle_key_with_set_mode(
         KeyCode::Char('v') => {
             app.toggle_view();
         }
+        KeyCode::Char('o') => {
+            app.toggle_outline();
+        }
 
         // Scrolling
         KeyCode::Char('j') | KeyCode::Down => {
@@ -302,6 +305,33 @@ fn handle_key_with_set_mode(
         _ => {}
     }
     false
+}
+
+/// Keys for the outline view. Returns false when the key is not an outline key, so the
+/// caller can pass it to the normal handler (mode switching, tabs, quitting still work).
+pub fn handle_outline_key(app: &mut App, key: event::KeyEvent) -> bool {
+    if app.outline.is_none() {
+        return false;
+    }
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('o') => app.close_outline(),
+        KeyCode::Char('j') | KeyCode::Down => app.outline_move(1),
+        KeyCode::Char('k') | KeyCode::Up => app.outline_move(-1),
+        KeyCode::Char('d') if ctrl => app.outline_move(app.half_page_size() as isize),
+        KeyCode::Char('u') if ctrl => app.outline_move(-(app.half_page_size() as isize)),
+        KeyCode::PageDown => app.outline_move(app.page_size() as isize),
+        KeyCode::PageUp => app.outline_move(-(app.page_size() as isize)),
+        KeyCode::Char('g') | KeyCode::Home => app.outline_jump_to_end(false),
+        KeyCode::Char('G') | KeyCode::End => app.outline_jump_to_end(true),
+        KeyCode::Enter => app.outline_jump(),
+        KeyCode::Char('y') => match app.outline_markdown() {
+            Some(text) => app.copy_to_clipboard(text, "change outline as markdown"),
+            None => app.set_status("Nothing to copy"),
+        },
+        _ => return false,
+    }
+    true
 }
 
 pub fn handle_file_picker_key(app: &mut App, key: event::KeyEvent) {

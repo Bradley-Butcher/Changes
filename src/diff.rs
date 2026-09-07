@@ -94,6 +94,14 @@ impl FileDiff {
         1 + hunk_lines
     }
 
+    /// A file added or deleted outright, where every line is on one side.
+    pub fn is_whole_file_change(&self) -> bool {
+        matches!(
+            self.status,
+            FileStatus::Added | FileStatus::Untracked | FileStatus::Deleted
+        )
+    }
+
     pub fn ensure_sbs_cache(&mut self) {
         if self.sbs_cache.is_none() {
             self.sbs_cache = Some(compute_side_by_side(&self.hunks));
