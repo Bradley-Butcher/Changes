@@ -350,6 +350,7 @@ const RUST_QUERY: &str = r#"
 (call_expression function: (generic_function function: (identifier) @name)) @call
 (call_expression function: (generic_function function: (scoped_identifier path: (_) @qualifier name: (identifier) @name))) @call
 (macro_invocation macro: (identifier) @name) @call
+(macro_invocation (token_tree) @macro_body)
 "#;
 
 const PYTHON_QUERY: &str = r#"
@@ -506,6 +507,10 @@ fn parse_source(parsers: &mut Parsers, lang: Lang, path: &str, source: &[u8]) ->
                 node = Some((capture.node, capture_names[capture.index as usize]));
             }
         }
+        if let Some((node, "macro_body")) = node {
+            raw_calls.extend(macro_body_calls(node, source));
+            continue;
+        }
         let (Some(name), Some((node, capture_name))) = (name, node) else {
             continue;
         };
@@ -549,6 +554,11 @@ fn parse_source(parsers: &mut Parsers, lang: Lang, path: &str, source: &[u8]) ->
 
     let calls = raw_calls
         .into_iter()
+        // `x.len()` on an unknown receiver is almost always the standard library, and
+        // would otherwise link every collection call to any local method named `len`.
+        .filter(|(name, _, _, qualifier)| {
+            !(matches!(qualifier, Qualifier::Unknown) && is_ubiquitous_method(name))
+        })
         .map(|(name, line, offset, qualifier)| {
             let enclosing = innermost_def(&defs, offset);
             let qualifier = match qualifier {
@@ -571,6 +581,118 @@ fn parse_source(parsers: &mut Parsers, lang: Lang, path: &str, source: &[u8]) ->
         defs,
         calls,
     }
+}
+
+/// Calls written inside a Rust macro invocation. tree-sitter parses `format!(...)` and
+/// friends as opaque token trees, so `name(`, `Type::name(` and `self.name(` are found by
+/// scanning the tokens in order.
+fn macro_body_calls(body: Node, source: &[u8]) -> Vec<(String, u32, usize, Qualifier)> {
+    let mut leaves: Vec<Node> = Vec::new();
+    collect_leaves(body, &mut leaves);
+    let text = |node: &Node| node.utf8_text(source).unwrap_or("");
+    let mut calls = Vec::new();
+    for (i, leaf) in leaves.iter().enumerate() {
+        if leaf.kind() != "identifier" || leaves.get(i + 1).map(|n| n.kind()) != Some("(") {
+            continue;
+        }
+        let name = text(leaf);
+        // `foo!(` is a nested macro, and `|x|(` / `if(` are not calls; the grammar
+        // already gives keywords their own kinds, so only `!` needs excluding.
+        if leaves.get(i + 1).is_some_and(|n| n.kind() == "!") {
+            continue;
+        }
+        let qualifier = match (
+            leaves.get(i.wrapping_sub(1)).map(|n| n.kind()),
+            leaves.get(i.wrapping_sub(2)),
+        ) {
+            (Some("::"), Some(owner)) if owner.kind() == "identifier" => {
+                let owner = text(owner);
+                match owner {
+                    "self" | "Self" => Qualifier::SelfType,
+                    _ if owner.starts_with(|c: char| c.is_uppercase()) => {
+                        Qualifier::Named(owner.to_string())
+                    }
+                    _ => Qualifier::Unknown,
+                }
+            }
+            (Some("."), Some(receiver)) if receiver.kind() == "self" => Qualifier::SelfType,
+            _ => Qualifier::Unknown,
+        };
+        calls.push((
+            name.to_string(),
+            leaf.start_position().row as u32 + 1,
+            leaf.start_byte(),
+            qualifier,
+        ));
+    }
+    calls
+}
+
+fn collect_leaves<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tree>>) {
+    if node.child_count() == 0 {
+        out.push(node);
+        return;
+    }
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        collect_leaves(child, out);
+    }
+}
+
+/// Method names so common in standard libraries that an unqualified call says nothing
+/// about which definition it targets.
+fn is_ubiquitous_method(name: &str) -> bool {
+    matches!(
+        name,
+        "len"
+            | "is_empty"
+            | "new"
+            | "default"
+            | "get"
+            | "set"
+            | "push"
+            | "pop"
+            | "insert"
+            | "remove"
+            | "contains"
+            | "clear"
+            | "iter"
+            | "into_iter"
+            | "map"
+            | "filter"
+            | "collect"
+            | "clone"
+            | "to_string"
+            | "to_owned"
+            | "as_ref"
+            | "as_str"
+            | "unwrap"
+            | "expect"
+            | "next"
+            | "first"
+            | "last"
+            | "join"
+            | "split"
+            | "trim"
+            | "find"
+            | "write"
+            | "read"
+            | "send"
+            | "append"
+            | "extend"
+            | "keys"
+            | "values"
+            | "items"
+            | "add"
+            | "update"
+            | "apply"
+            | "call"
+            | "then"
+            | "catch"
+            | "toString"
+            | "String"
+            | "format"
+    )
 }
 
 enum Qualifier {
@@ -681,9 +803,47 @@ fn main() { let app = App::new(); app.default_with(2); }
             .collect();
         assert!(calls.contains(&("default_with", 4, Some("App::new"))));
         assert!(calls.contains(&("helper", 4, Some("App::new"))));
-        assert!(calls.contains(&("format", 7, Some("helper"))));
+        // `format!` and `.len()` are ubiquitous and dropped; `new` with a stated receiver stays.
+        assert!(!calls.iter().any(|c| c.0 == "format" || c.0 == "len"));
         assert!(calls.contains(&("new", 8, Some("main"))));
         assert!(calls.contains(&("default_with", 8, Some("main"))));
+    }
+
+    #[test]
+    fn calls_inside_rust_macros_are_indexed() {
+        let source = r#"
+fn helper(x: u32) -> String { x.to_string() }
+struct T; impl T { fn size(&self) -> usize { 1 } fn go(&self) { println!("{}", self.size()); } }
+fn main() { println!("{} {}", helper(1), T::size(&T)); assert_eq!(helper(2), "2"); }
+"#;
+        let mut parsers = Parsers::default();
+        let file = parse_source(&mut parsers, Lang::Rust, "m.rs", source.as_bytes());
+        let calls: Vec<(&str, Option<&str>)> = file
+            .calls
+            .iter()
+            .filter(|c| c.name == "helper" || c.name == "size")
+            .map(|c| {
+                (
+                    c.name.as_str(),
+                    c.enclosing.map(|i| file.defs[i].display.as_str()),
+                )
+            })
+            .collect();
+        assert_eq!(
+            calls,
+            vec![
+                ("size", Some("T::go")),
+                ("helper", Some("main")),
+                ("size", Some("main")),
+                ("helper", Some("main")),
+            ]
+        );
+        let self_size = file
+            .calls
+            .iter()
+            .find(|c| c.name == "size" && c.line == 3)
+            .unwrap();
+        assert_eq!(self_size.qualifier.as_deref(), Some("T"));
     }
 
     #[test]

@@ -578,6 +578,42 @@ fn gutter_separator<'a>(focused: bool) -> Span<'a> {
     }
 }
 
+/// Style the inline caller / callee line: arrows in blue, warnings in yellow, names muted.
+fn call_context_spans(text: &str) -> Vec<Span<'static>> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, part) in text.split(" · ").enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(" · ", Style::default().fg(FG_MUTED)));
+        }
+        if let Some(rest) = part.strip_prefix('⚠') {
+            spans.push(Span::styled(
+                format!("⚠{rest}"),
+                Style::default()
+                    .fg(FG_STATUS_M)
+                    .add_modifier(Modifier::BOLD),
+            ));
+        } else if let Some(rest) = part.strip_prefix('↑').or_else(|| part.strip_prefix('↓')) {
+            let arrow = &part[..part.len() - rest.len()];
+            spans.push(Span::styled(
+                arrow.to_string(),
+                Style::default().fg(FG_HUNK),
+            ));
+            spans.push(Span::styled(
+                rest.to_string(),
+                Style::default().fg(FG_MUTED),
+            ));
+        } else {
+            spans.push(Span::styled(
+                part.to_string(),
+                Style::default()
+                    .fg(FG_PATH_DIR)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
+    }
+    spans
+}
+
 /// Row shown between hunks: an expand indicator when lines are hidden, otherwise a plain break.
 fn hunk_header_line<'a>(
     hunk: Option<&crate::diff::Hunk>,
@@ -681,6 +717,22 @@ fn draw_unified(
                         Span::styled(gutter, Style::default().fg(FG_COMMENT)),
                         Span::styled(format!(" {}", text), Style::default().fg(FG_COMMENT)),
                     ]));
+                }
+            }
+            RowRef::CallContext {
+                file_idx,
+                hunk_idx,
+                line_idx,
+            } => {
+                if let Some(text) = layout.call_context_text(file_idx, hunk_idx, line_idx) {
+                    let lno_w = layout.lineno_width(file_idx);
+                    let focused = focused_hunk == Some((file_idx, hunk_idx));
+                    let mut spans = vec![
+                        Span::raw(" ".repeat(lno_w * 2 + 1)),
+                        gutter_separator(focused),
+                    ];
+                    spans.extend(call_context_spans(text));
+                    lines.push(Line::from(spans));
                 }
             }
             RowRef::UnifiedLine {
@@ -930,6 +982,24 @@ fn draw_side_by_side(
                     ]);
                     left_lines.push(comment_line);
                     right_lines.push(Line::from(""));
+                    divider_lines.push(divider.clone());
+                }
+            }
+            RowRef::CallContext {
+                file_idx,
+                hunk_idx,
+                line_idx,
+            } => {
+                if let Some(text) = layout.call_context_text(file_idx, hunk_idx, line_idx) {
+                    let lno_w = layout.lineno_width(file_idx);
+                    let focused = focused_hunk == Some((file_idx, hunk_idx));
+                    let mut spans = vec![Span::raw(" ".repeat(lno_w)), gutter_separator(focused)];
+                    spans.extend(call_context_spans(text));
+                    left_lines.push(Line::from(spans));
+                    right_lines.push(Line::from(vec![
+                        Span::raw(" ".repeat(lno_w)),
+                        gutter_separator(focused),
+                    ]));
                     divider_lines.push(divider.clone());
                 }
             }

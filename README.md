@@ -15,7 +15,7 @@ I built this because I use lazygit — and it's great for git operations, but no
 It's also agent-agnostic. You shouldn't have to use a specific app or IDE just to get a good diff viewer — reviewing changes and running agents are two separate concerns. `changes` works with whatever you use: Claude Code, Codex, Cursor, Copilot, aider, or a shell script that calls `sed`. If it writes to files in a git repo, you can see the diff.
 
 - **Outline view** — press `o` for the shape of the change: a file tree with `+/-` counts and the functions, types and classes each hunk adds, removes or touches. Big diffs open here first
-- **Callers and callees** — every changed function shows who calls it and what it calls, resolved with tree-sitter across the whole repo (Rust, Python, Go, JS/TS). New functions nobody calls and deleted functions that are still called are flagged
+- **Callers and callees** — every changed function shows who calls it and what it calls, resolved with tree-sitter across the whole repo (Rust, Python, Go, JS/TS). In the diff it's one line under the hunk header; in the outline it expands into a call tree. New functions nobody calls and deleted functions that are still called are flagged
 - **Multi-repo tabs** — watch agent changes across repos simultaneously
 - **Two views that matter** — `m` for everything uncommitted, `b` for the whole branch against its base (uncommitted work included). `B` picks anything else: trunk, upstream, staged only, a typed ref
 - **Annotate hunks** — right-click to add review comments, `Y` to copy all as markdown for your agent

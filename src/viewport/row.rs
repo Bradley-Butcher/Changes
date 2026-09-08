@@ -39,6 +39,13 @@ pub enum RowRef {
         /// Index within the wrapped comment text lines.
         wrap_idx: usize,
     },
+    /// Callers / callees of a function the hunk changes, shown under its header.
+    CallContext {
+        file_idx: usize,
+        hunk_idx: usize,
+        /// Which of the hunk's changed functions this line describes.
+        line_idx: usize,
+    },
     Blank {
         file_idx: usize,
     },
@@ -53,6 +60,7 @@ impl RowRef {
             | RowRef::SideBySideLine { file_idx, .. }
             | RowRef::GapTail { file_idx, .. }
             | RowRef::Comment { file_idx, .. }
+            | RowRef::CallContext { file_idx, .. }
             | RowRef::Blank { file_idx } => file_idx,
         }
     }

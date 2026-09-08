@@ -1,6 +1,8 @@
 use super::row::{RowRef, ViewKind};
 use crate::app::HunkComment;
 use crate::diff::{FileDiff, gap_between_hunks};
+use crate::outline;
+use crate::symbols::SymbolIndex;
 use std::collections::HashMap;
 use std::ops::Range;
 use unicode_segmentation::UnicodeSegmentation;
@@ -13,6 +15,8 @@ pub struct DiffLayout {
     file_header_rows: Vec<usize>,
     /// Wrapped comment text lines, keyed by (file_idx, hunk_idx).
     comment_lines: HashMap<(usize, usize), Vec<String>>,
+    /// Inline caller / callee lines per hunk, keyed by (file_idx, hunk_idx).
+    call_context: HashMap<(usize, usize), Vec<String>>,
     /// Every hunk in display order with the rows it occupies (header through last line).
     hunk_rows: Vec<HunkRows>,
     /// Gutter digit count per file, computed once here instead of per rendered row.
@@ -49,6 +53,18 @@ impl DiffLayout {
         comments: &[HunkComment],
         content_width: usize,
     ) -> Self {
+        Self::build_with_index(files, view_kind, comments, content_width, None)
+    }
+
+    /// Like `build`, adding a call-context line under each hunk that changes a function
+    /// the index knows about.
+    pub fn build_with_index(
+        files: &[FileDiff],
+        view_kind: ViewKind,
+        comments: &[HunkComment],
+        content_width: usize,
+        index: Option<&SymbolIndex>,
+    ) -> Self {
         let mut rows = Vec::new();
         let mut chunk_starts: Vec<ChunkStarts> = Vec::new();
         let mut file_header_rows = Vec::with_capacity(files.len());
@@ -65,8 +81,18 @@ impl DiffLayout {
             );
         }
 
+        let mut call_context: HashMap<(usize, usize), Vec<String>> = HashMap::new();
+
         for (file_idx, file) in files.iter().enumerate() {
             let lno_w = lineno_widths[file_idx];
+            if let Some(index) = index
+                && !file.collapsed
+            {
+                let text_width = content_width.saturating_sub(lno_w * 2 + 5);
+                for (hunk_idx, lines) in hunk_call_context(index, file, text_width) {
+                    call_context.insert((file_idx, hunk_idx), lines);
+                }
+            }
             file_header_rows.push(rows.len());
             rows.push(RowRef::FileHeader { file_idx });
             chunk_starts.push(NO_CHUNKS);
@@ -90,6 +116,17 @@ impl DiffLayout {
                     gap_before,
                 });
                 chunk_starts.push(NO_CHUNKS);
+
+                if let Some(lines) = call_context.get(&(file_idx, hunk_idx)) {
+                    for line_idx in 0..lines.len() {
+                        rows.push(RowRef::CallContext {
+                            file_idx,
+                            hunk_idx,
+                            line_idx,
+                        });
+                        chunk_starts.push(NO_CHUNKS);
+                    }
+                }
 
                 // Emit comment rows after hunk header
                 if let Some(lines) = comment_lines.get(&(file_idx, hunk_idx)) {
@@ -216,10 +253,24 @@ impl DiffLayout {
             rows,
             file_header_rows,
             comment_lines,
+            call_context,
             hunk_rows,
             lineno_widths,
             chunk_starts,
         }
+    }
+
+    /// Text of a `CallContext` row.
+    pub fn call_context_text(
+        &self,
+        file_idx: usize,
+        hunk_idx: usize,
+        line_idx: usize,
+    ) -> Option<&str> {
+        self.call_context
+            .get(&(file_idx, hunk_idx))?
+            .get(line_idx)
+            .map(String::as_str)
     }
 
     /// Gutter digit count for a file, precomputed at build time.
@@ -296,6 +347,9 @@ impl DiffLayout {
             }
             | RowRef::Comment {
                 file_idx, hunk_idx, ..
+            }
+            | RowRef::CallContext {
+                file_idx, hunk_idx, ..
             } => Some((file_idx, hunk_idx)),
             _ => None,
         }
@@ -320,6 +374,11 @@ impl DiffLayout {
                     ..
                 }
                 | RowRef::Comment {
+                    file_idx: current_file,
+                    hunk_idx,
+                    ..
+                }
+                | RowRef::CallContext {
                     file_idx: current_file,
                     hunk_idx,
                     ..
@@ -397,6 +456,51 @@ impl DiffLayout {
     pub fn hunk_has_comment(&self, file_idx: usize, hunk_idx: usize) -> bool {
         self.comment_lines.contains_key(&(file_idx, hunk_idx))
     }
+}
+
+/// Call-context lines per hunk: one per changed function the index knows, at most three.
+fn hunk_call_context(
+    index: &SymbolIndex,
+    file: &FileDiff,
+    width: usize,
+) -> Vec<(usize, Vec<String>)> {
+    let symbols = outline::file_symbols(file);
+    let mut by_hunk: Vec<(usize, Vec<(String, outline::CallSummary<'_>)>)> = Vec::new();
+    for symbol in symbols {
+        let Some(ident) = symbol.ident.as_deref() else {
+            continue;
+        };
+        let Some(summary) = outline::call_summary(index, file, ident, symbol.change) else {
+            continue;
+        };
+        let entry = match by_hunk
+            .iter_mut()
+            .find(|(hunk, _)| *hunk == symbol.hunk_idx)
+        {
+            Some(entry) => entry,
+            None => {
+                by_hunk.push((symbol.hunk_idx, Vec::new()));
+                by_hunk.last_mut().expect("just pushed")
+            }
+        };
+        if entry.1.len() >= 3 {
+            continue;
+        }
+        entry.1.push((symbol.name.clone(), summary));
+    }
+    by_hunk
+        .into_iter()
+        .map(|(hunk_idx, entries)| {
+            let multiple = entries.len() > 1;
+            let lines = entries
+                .iter()
+                .map(|(name, summary)| {
+                    outline::inline_call_context(summary, multiple.then_some(name.as_str()), width)
+                })
+                .collect();
+            (hunk_idx, lines)
+        })
+        .collect()
 }
 
 pub(crate) fn line_number_width(file: &FileDiff) -> usize {

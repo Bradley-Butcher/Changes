@@ -392,29 +392,13 @@ fn push_call_rows(
     prefix: &str,
 ) {
     let file = &context.files[file_idx];
-    // Removed functions have no definition left; their remaining callers still matter.
-    let def = index
-        .defs_named(ident, &file.path)
-        .into_iter()
-        .find(|def| def.kind == DefKind::Function)
-        .cloned();
-    let callers = index.callers(ident, &file.path, def.as_ref());
-    let callees = def
-        .as_ref()
-        .map(|def| index.callees(def))
-        .unwrap_or_default();
-    if def.is_none() && callers.is_empty() {
+    let Some(CallSummary {
+        callers,
+        callees,
+        warning,
+    }) = call_summary(index, file, ident, change)
+    else {
         return; // unknown to the index (unsupported language, or only in the old tree)
-    }
-
-    let warning = match change {
-        SymbolChange::Added if callers.is_empty() && !is_entry_point(ident, &file.path) => {
-            Some("no callers".to_string())
-        }
-        SymbolChange::Removed if !callers.is_empty() => {
-            Some(format!("still called by {}", callers.len()))
-        }
-        _ => None,
     };
     let expanded = context
         .expanded
@@ -546,6 +530,118 @@ fn push_call_rows(
             },
         );
     }
+}
+
+/// What the index knows about one changed function.
+pub struct CallSummary<'a> {
+    pub callers: Vec<crate::symbols::Caller>,
+    pub callees: Vec<(String, Vec<&'a crate::symbols::Def>)>,
+    pub warning: Option<String>,
+}
+
+/// Callers, callees and the review warning for a function symbol, or None when the
+/// index has never seen it (unsupported language, or a name that only existed before).
+pub fn call_summary<'a>(
+    index: &'a SymbolIndex,
+    file: &FileDiff,
+    ident: &str,
+    change: SymbolChange,
+) -> Option<CallSummary<'a>> {
+    // Removed functions have no definition left; their remaining callers still matter.
+    let def = index
+        .defs_named(ident, &file.path)
+        .into_iter()
+        .find(|def| def.kind == DefKind::Function)
+        .cloned();
+    let callers = index.callers(ident, &file.path, def.as_ref());
+    let callees = def
+        .as_ref()
+        .map(|def| index.callees(def))
+        .unwrap_or_default();
+    if def.is_none() && callers.is_empty() {
+        return None;
+    }
+    let warning = match change {
+        SymbolChange::Added if callers.is_empty() && !is_entry_point(ident, &file.path) => {
+            Some("no callers".to_string())
+        }
+        SymbolChange::Removed if !callers.is_empty() => {
+            Some(format!("still called by {}", callers.len()))
+        }
+        _ => None,
+    };
+    Some(CallSummary {
+        callers,
+        callees,
+        warning,
+    })
+}
+
+/// One-line call context for a hunk, shown under its header in the diff:
+/// `fn parse · ↑ called by main, other · ↓ calls tokenize, +2 more`. `label` names the
+/// function when the hunk touches more than one. Fitted to `width` columns.
+pub fn inline_call_context(summary: &CallSummary<'_>, label: Option<&str>, width: usize) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(label) = label {
+        parts.push(label.to_string());
+    }
+    if let Some(warning) = &summary.warning {
+        parts.push(format!("⚠ {warning}"));
+    }
+    if !summary.callers.is_empty() {
+        let names: Vec<String> = summary
+            .callers
+            .iter()
+            .map(|c| c.from.clone().unwrap_or_else(|| "(top level)".to_string()))
+            .collect();
+        parts.push(format!("↑ called by {}", join_limited(&names, 4)));
+    } else if summary.warning.is_none() {
+        parts.push("↑ no callers".to_string());
+    }
+    if !summary.callees.is_empty() {
+        let names: Vec<String> = summary
+            .callees
+            .iter()
+            .map(|(_, targets)| targets[0].display.clone())
+            .collect();
+        parts.push(format!("↓ calls {}", join_limited(&names, 4)));
+    }
+    fit_width(&parts.join(" · "), width)
+}
+
+/// `a, b, c, +N more` — a deduplicated, capped list.
+fn join_limited(names: &[String], max: usize) -> String {
+    let mut unique: Vec<&String> = Vec::new();
+    for name in names {
+        if !unique.contains(&name) {
+            unique.push(name);
+        }
+    }
+    let shown: Vec<&str> = unique.iter().take(max).map(|s| s.as_str()).collect();
+    let mut out = shown.join(", ");
+    if unique.len() > max {
+        out.push_str(&format!(", +{} more", unique.len() - max));
+    }
+    out
+}
+
+fn fit_width(text: &str, width: usize) -> String {
+    use unicode_width::UnicodeWidthStr;
+    if width == 0 || UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w + 1 > width {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
 }
 
 /// Functions nobody is expected to call: program entry points and tests.

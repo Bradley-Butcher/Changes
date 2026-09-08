@@ -780,7 +780,13 @@ impl App {
         if view == ViewKind::SideBySide {
             crate::diff::ensure_sbs_caches(&mut repo.files);
         }
-        *layout_slot = Some(DiffLayout::build(&repo.files, view, &repo.comments, width));
+        *layout_slot = Some(DiffLayout::build_with_index(
+            &repo.files,
+            view,
+            &repo.comments,
+            width,
+            repo.symbols.as_deref(),
+        ));
         let total = layout_slot
             .as_ref()
             .map(DiffLayout::total_lines)
@@ -1430,11 +1436,17 @@ impl App {
             let changed = (!pending.is_empty()).then_some(pending);
             self.request_index(idx, changed);
         }
-        if idx == self.active_tab && self.outline.is_some() {
-            self.rebuild_outline();
-            return true;
+        // The diff view carries call-context lines, so its layout depends on the index.
+        self.invalidate_layouts(idx);
+        if idx != self.active_tab {
+            return false;
         }
-        false
+        self.prepare_active_layout();
+        self.clamp_active_viewport();
+        if self.outline.is_some() {
+            self.rebuild_outline();
+        }
+        true
     }
 
     pub fn refresh_repo_async(&self, idx: usize, diff_tx: &mpsc::UnboundedSender<DiffResult>) {
