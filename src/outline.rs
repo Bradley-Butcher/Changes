@@ -218,7 +218,7 @@ pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
     // Every changed function symbol across the diff, keyed for marking route steps.
     let mut changed: Vec<(usize, Symbol)> = Vec::new();
     for (file_idx, file) in files.iter().enumerate() {
-        for symbol in file_symbols(file) {
+        for symbol in file_symbols_with(file, Some(index)) {
             if symbol.ident.is_some() {
                 changed.push((file_idx, symbol));
             }
@@ -242,7 +242,9 @@ pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
         let file = &files[*file_idx];
         let ident = symbol.ident.as_deref().expect("filtered above");
         if symbol.change == SymbolChange::Removed {
-            removed.push((*file_idx, symbol.clone()));
+            if !ident.starts_with("test_") && !crate::symbols::is_test_path(&file.path) {
+                removed.push((*file_idx, symbol.clone()));
+            }
             continue;
         }
         let Some(def) = index
@@ -269,6 +271,7 @@ pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
             let root = &route.steps[0];
             (
                 is_auxiliary_path(&root.path),
+                route.ambiguous_edges(),
                 entry_point_rank(&root.name, &root.path),
                 route.steps.len(),
             )
@@ -283,6 +286,33 @@ pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
             insert_route(forest, &route.steps, files, &change_of, other_routes);
         }
     }
+
+    // A changed function nothing calls may still be the root of routes to other changed
+    // code (it calls them). Warn on that root rather than listing it twice.
+    unreachable.retain(|(file_idx, symbol)| {
+        let path = &files[*file_idx].path;
+        let ident = symbol.ident.as_deref().unwrap_or_default();
+        let Some(def) = index
+            .defs_named(ident, path)
+            .into_iter()
+            .find(|d| d.path == *path)
+        else {
+            return true;
+        };
+        match roots
+            .iter_mut()
+            .find(|root| root.path == def.path && root.line == def.line)
+        {
+            Some(root) => {
+                root.warning = Some(match symbol.change {
+                    SymbolChange::Added => "no callers".to_string(),
+                    _ => "no callers found (registered by name?)".to_string(),
+                });
+                false
+            }
+            None => true,
+        }
+    });
 
     // Product entry points first, examples and benches last, more changed code first.
     roots.sort_by_key(|root| {
@@ -318,6 +348,12 @@ pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
                 .first()
                 .map(|def| def.display.clone())
                 .unwrap_or_else(|| ident.to_string());
+            // A modified function nothing calls is usually registered by name (a
+            // decorator, a route table, a plugin hook) rather than forgotten.
+            let warning = match symbol.change {
+                SymbolChange::Added => "no callers",
+                _ => "no callers found (registered by name?)",
+            };
             rows.push(OutlineRow::Flow {
                 depth: 1,
                 name: display,
@@ -326,7 +362,7 @@ pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
                 file_idx: Some(file_idx),
                 hunk_idx: Some(symbol.hunk_idx),
                 is_target: true,
-                warning: Some("no callers".to_string()),
+                warning: Some(warning.to_string()),
             });
         }
     }
@@ -358,6 +394,9 @@ struct FlowNode {
     path: String,
     line: u32,
     name: String,
+    /// The edge from this node to its child was matched by name only.
+    ambiguous: bool,
+    warning: Option<String>,
     mark: Option<SymbolChange>,
     file_idx: Option<usize>,
     hunk_idx: Option<usize>,
@@ -374,17 +413,17 @@ impl FlowNode {
     }
 
     fn emit(&self, depth: usize, rows: &mut Vec<OutlineRow>) {
-        let location = if self.other_routes > 0 {
-            format!(
-                "{}:{}  ({} other route{})",
-                self.path,
-                self.line,
+        let mut location = format!("{}:{}", self.path, self.line);
+        if self.ambiguous {
+            location.push_str("  (next step matched by name only)");
+        }
+        if self.other_routes > 0 {
+            location.push_str(&format!(
+                "  ({} other route{})",
                 self.other_routes,
                 if self.other_routes == 1 { "" } else { "s" }
-            )
-        } else {
-            format!("{}:{}", self.path, self.line)
-        };
+            ));
+        }
         rows.push(OutlineRow::Flow {
             depth,
             name: self.name.clone(),
@@ -393,7 +432,7 @@ impl FlowNode {
             file_idx: self.file_idx,
             hunk_idx: self.hunk_idx,
             is_target: self.is_target,
-            warning: None,
+            warning: self.warning.clone(),
         });
         for child in &self.children {
             child.emit(depth + 1, rows);
@@ -429,6 +468,8 @@ fn insert_route(
                     path: step.path.clone(),
                     line: step.line,
                     name: step.display.clone(),
+                    ambiguous: step.ambiguous,
+                    warning: None,
                     mark,
                     file_idx,
                     hunk_idx,
@@ -630,7 +671,7 @@ fn render_dir(
             additions: file.additions,
             deletions: file.deletions,
         });
-        let mut symbols = file_symbols(file);
+        let mut symbols = file_symbols_with(file, context.index);
         let hidden = symbols.len().saturating_sub(MAX_SYMBOLS_PER_FILE);
         symbols.truncate(MAX_SYMBOLS_PER_FILE);
         let count = symbols.len() + usize::from(hidden > 0);
@@ -1048,8 +1089,90 @@ fn connectors(prefix: &str, last: bool, is_root: bool) -> (String, String) {
     }
 }
 
+/// Record a declaration; a name removed then added in the same diff is one rewrite.
+fn push_symbol(symbols: &mut Vec<Symbol>, name: String, change: SymbolChange, hunk_idx: usize) {
+    if let Some(existing) = symbols.iter_mut().find(|s| s.name == name) {
+        if existing.change != change {
+            existing.change = SymbolChange::Modified;
+        }
+        return;
+    }
+    let ident = function_ident(&name);
+    symbols.push(Symbol {
+        name,
+        change,
+        hunk_idx,
+        ident,
+    });
+}
+
+/// Add a modified function found via the index, unless the hunk already declared it.
+fn push_ident(symbols: &mut Vec<Symbol>, name: String, ident: String, hunk_idx: usize) {
+    if symbols
+        .iter()
+        .any(|s| s.ident.as_deref() == Some(ident.as_str()))
+    {
+        return;
+    }
+    symbols.push(Symbol {
+        name,
+        change: SymbolChange::Modified,
+        hunk_idx,
+        ident: Some(ident),
+    });
+}
+
+/// New-side line numbers a hunk touches: its added lines, or for a pure deletion the
+/// line where the deleted block used to be.
+fn hunk_changed_lines(hunk: &crate::diff::Hunk) -> Vec<u32> {
+    let mut lines: Vec<u32> = hunk
+        .lines
+        .iter()
+        .filter(|l| l.kind == LineKind::Addition)
+        .filter_map(|l| l.new_lineno)
+        .collect();
+    if lines.is_empty() {
+        // The context line right after the deletion sits where the block was.
+        let mut after_deletion = false;
+        for l in &hunk.lines {
+            if l.kind == LineKind::Deletion {
+                after_deletion = true;
+            } else if after_deletion && let Some(n) = l.new_lineno {
+                lines.push(n);
+                break;
+            }
+        }
+        if lines.is_empty()
+            && let Some(n) = hunk.first_new_lineno()
+        {
+            lines.push(n);
+        }
+    }
+    lines.dedup();
+    lines
+}
+
+/// `fn App::open_outline` / `def Widget.render`: the index's display name with the
+/// language's declaration keyword, matching what hunk lines produce.
+fn declaration_label(display: &str, path: &str) -> String {
+    let keyword = match path.rsplit('.').next() {
+        Some("py" | "pyi") => "def",
+        Some("go") => "func",
+        Some("js" | "jsx" | "mjs" | "cjs" | "ts" | "tsx" | "mts" | "cts") => "function",
+        _ => "fn",
+    };
+    format!("{keyword} {display}")
+}
+
 /// Declarations a file's hunks add, remove, or sit inside, in hunk order.
 pub fn file_symbols(file: &FileDiff) -> Vec<Symbol> {
+    file_symbols_with(file, None)
+}
+
+/// Like `file_symbols`, but with an index the function enclosing each body edit is
+/// found from parsed line ranges rather than git's hunk-header heuristic, which names
+/// the nearest unindented line: a `class` or `impl` rather than the method inside it.
+pub fn file_symbols_with(file: &FileDiff, index: Option<&SymbolIndex>) -> Vec<Symbol> {
     // Whole-file additions or deletions: list what the file declares, all one kind.
     let whole_file = match file.status {
         FileStatus::Added | FileStatus::Untracked => Some(SymbolChange::Added),
@@ -1058,22 +1181,6 @@ pub fn file_symbols(file: &FileDiff) -> Vec<Symbol> {
     };
 
     let mut symbols: Vec<Symbol> = Vec::new();
-    let mut push = |name: String, change: SymbolChange, hunk_idx: usize| {
-        if let Some(existing) = symbols.iter_mut().find(|s| s.name == name) {
-            // Removed then added in the same diff is a rewrite, not two events.
-            if existing.change != change {
-                existing.change = SymbolChange::Modified;
-            }
-            return;
-        }
-        let ident = function_ident(&name);
-        symbols.push(Symbol {
-            name,
-            change,
-            hunk_idx,
-            ident,
-        });
-    };
 
     let markdown = is_markdown_path(&file.path);
     let symbol_name = |line: &str| {
@@ -1107,7 +1214,7 @@ pub fn file_symbols(file: &FileDiff) -> Vec<Symbol> {
             };
             seen_change = true;
             if let Some(name) = symbol_name(&line.content) {
-                push(name, change, hunk_idx);
+                push_symbol(&mut symbols, name, change, hunk_idx);
                 declared_here = true;
             }
         }
@@ -1115,8 +1222,25 @@ pub fn file_symbols(file: &FileDiff) -> Vec<Symbol> {
             && whole_file.is_none()
             && let Some(section) = enclosing_section
         {
-            push(section, SymbolChange::Modified, hunk_idx);
+            push_symbol(&mut symbols, section, SymbolChange::Modified, hunk_idx);
             continue;
+        }
+        // With an index, attribute a body edit to the parsed function around it.
+        if !declared_here
+            && whole_file.is_none()
+            && let Some(index) = index
+        {
+            let mut found = false;
+            for line in hunk_changed_lines(hunk) {
+                if let Some(def) = index.function_at(&file.path, line) {
+                    let name = declaration_label(&def.display, &file.path);
+                    push_ident(&mut symbols, name, def.name.clone(), hunk_idx);
+                    found = true;
+                }
+            }
+            if found {
+                continue;
+            }
         }
         // A hunk that edits the body of something is a modification of the enclosing
         // declaration, which git names in the hunk header.
@@ -1130,7 +1254,7 @@ pub fn file_symbols(file: &FileDiff) -> Vec<Symbol> {
             && !name.starts_with("module ")
             && !name.starts_with("use ")
         {
-            push(name, SymbolChange::Modified, hunk_idx);
+            push_symbol(&mut symbols, name, SymbolChange::Modified, hunk_idx);
         }
     }
     symbols

@@ -614,7 +614,7 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
         let text = if state.flow && indexing {
             "  Indexing calls… the flow view appears when the index is ready"
         } else if state.flow {
-            "  No changed functions the index can trace (unsupported language?)"
+            "  No changed functions to trace: types, data and prose have no call routes"
         } else {
             "  No changes to outline"
         };

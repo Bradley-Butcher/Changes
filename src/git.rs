@@ -261,6 +261,12 @@ pub fn compute_diff(
                     .path()
                     .map(|p| p.to_string_lossy().to_string())
                     .unwrap_or_default();
+                // An untracked node_modules or build directory (no .gitignore yet) is
+                // tens of thousands of files that nobody reviews; reading them would
+                // stall every refresh.
+                if crate::symbols::is_vendored_path(&file_path) {
+                    continue;
+                }
                 files.push(FileDiff {
                     path: file_path,
                     old_path: None,

@@ -103,6 +103,9 @@ pub struct PathStep {
     pub name: String,
     pub path: String,
     pub line: u32,
+    /// The call from this step to the next one down was matched by name alone and
+    /// several definitions could be its target.
+    pub ambiguous: bool,
 }
 
 /// A route from a root of the call graph (something nothing calls, or top-level code)
@@ -112,6 +115,13 @@ pub struct PathStep {
 pub struct CallPath {
     pub steps: Vec<PathStep>,
     pub complete: bool,
+}
+
+impl CallPath {
+    /// Edges matched by name alone; fewer means a more trustworthy route.
+    pub fn ambiguous_edges(&self) -> usize {
+        self.steps.iter().filter(|s| s.ambiguous).count()
+    }
 }
 
 /// Longest route followed upward before giving up on reaching a root. Product routes
@@ -144,34 +154,50 @@ impl SymbolIndex {
     }
 
     fn reindex(&mut self, root: &Path, paths: &[String]) {
+        // Lookups are maintained per file, so a refresh costs only the changed files:
+        // a full rebuild over tens of thousands of files would be felt on every edit.
         for path in paths {
-            self.files.remove(path);
+            if let Some(old) = self.files.remove(path) {
+                self.remove_from_lookups(&old);
+            }
         }
         let parsed = parse_files(root, paths);
         for file in parsed {
+            self.add_to_lookups(&file);
             self.files.insert(file.path.clone(), Arc::new(file));
         }
-        self.rebuild_lookups();
     }
 
-    fn rebuild_lookups(&mut self) {
-        self.defs_by_name.clear();
-        self.calls_by_name.clear();
-        let mut paths: Vec<&String> = self.files.keys().collect();
-        paths.sort();
-        for path in paths {
-            let file = &self.files[path];
-            for (idx, def) in file.defs.iter().enumerate() {
-                self.defs_by_name
-                    .entry(def.name.clone())
-                    .or_default()
-                    .push((path.clone(), idx));
+    fn add_to_lookups(&mut self, file: &FileSymbols) {
+        for (idx, def) in file.defs.iter().enumerate() {
+            self.defs_by_name
+                .entry(def.name.clone())
+                .or_default()
+                .push((file.path.clone(), idx));
+        }
+        for (idx, call) in file.calls.iter().enumerate() {
+            self.calls_by_name
+                .entry(call.name.clone())
+                .or_default()
+                .push((file.path.clone(), idx));
+        }
+    }
+
+    fn remove_from_lookups(&mut self, file: &FileSymbols) {
+        for def in &file.defs {
+            if let Some(entries) = self.defs_by_name.get_mut(&def.name) {
+                entries.retain(|(path, _)| path != &file.path);
+                if entries.is_empty() {
+                    self.defs_by_name.remove(&def.name);
+                }
             }
-            for (idx, call) in file.calls.iter().enumerate() {
-                self.calls_by_name
-                    .entry(call.name.clone())
-                    .or_default()
-                    .push((path.clone(), idx));
+        }
+        for call in &file.calls {
+            if let Some(entries) = self.calls_by_name.get_mut(&call.name) {
+                entries.retain(|(path, _)| path != &file.path);
+                if entries.is_empty() {
+                    self.calls_by_name.remove(&call.name);
+                }
             }
         }
     }
@@ -182,6 +208,16 @@ impl SymbolIndex {
 
     pub fn def_count(&self) -> usize {
         self.files.values().map(|f| f.defs.len()).sum()
+    }
+
+    /// The innermost function whose span contains line `line` of `path`, if any.
+    pub fn function_at(&self, path: &str, line: u32) -> Option<&Def> {
+        self.files
+            .get(path)?
+            .defs
+            .iter()
+            .filter(|def| def.kind == DefKind::Function && def.line <= line && line <= def.end_line)
+            .min_by_key(|def| def.end_line - def.line)
     }
 
     /// Definitions of `name`, the one in `prefer_path` first.
@@ -203,16 +239,32 @@ impl SymbolIndex {
     /// Every call site that may target `name` (or `def` precisely, when known), outside
     /// the definition itself. Same-file callers first.
     pub fn callers(&self, name: &str, def_path: &str, def: Option<&Def>) -> Vec<Caller> {
-        let Some(entries) = self.calls_by_name.get(name) else {
+        // A constructor is invoked through its class: `Recorder(...)`, `new Store()`.
+        let constructor_class = def
+            .filter(|d| matches!(d.name.as_str(), "__init__" | "__new__" | "constructor"))
+            .and_then(|d| d.container.clone());
+        let mut entries: Vec<&(String, usize)> = self
+            .calls_by_name
+            .get(name)
+            .map(|v| v.iter().collect())
+            .unwrap_or_default();
+        if let Some(class) = &constructor_class
+            && let Some(class_calls) = self.calls_by_name.get(class)
+        {
+            entries.extend(class_calls.iter());
+        }
+        if entries.is_empty() {
             return Vec::new();
-        };
+        }
         let def_line = def.map(|d| d.line);
         let mut callers: Vec<Caller> = entries
-            .iter()
+            .into_iter()
             .filter_map(|(path, idx)| {
                 let file = &self.files[path];
                 let call = &file.calls[*idx];
+                let is_class_call = constructor_class.as_deref() == Some(call.name.as_str());
                 if let Some(def) = def
+                    && !is_class_call
                     && !call.may_target(def)
                 {
                     return None;
@@ -253,6 +305,25 @@ impl SymbolIndex {
     fn calling_defs(&self, def: &Def) -> Vec<PathStep> {
         let mut steps: Vec<PathStep> = Vec::new();
         for caller in self.production_callers(&def.name, &def.path, Some(def)) {
+            // Could this call site have meant a different `name`? Recover the call to
+            // ask what it says about its receiver.
+            let ambiguous = self
+                .files
+                .get(&caller.path)
+                .and_then(|file| {
+                    file.calls
+                        .iter()
+                        .find(|c| c.name == def.name && c.line == caller.line)
+                })
+                .is_some_and(|call| {
+                    call.qualifier.is_none()
+                        && self
+                            .defs_named(&def.name, &def.path)
+                            .iter()
+                            .filter(|d| d.kind == DefKind::Function && call.may_target(d))
+                            .count()
+                            > 1
+                });
             let step = match &caller.from {
                 Some(from) => {
                     let Some(enclosing) = self.files.get(&caller.path).and_then(|file| {
@@ -267,6 +338,7 @@ impl SymbolIndex {
                         name: enclosing.name.clone(),
                         path: enclosing.path.clone(),
                         line: enclosing.line,
+                        ambiguous,
                     }
                 }
                 None => PathStep {
@@ -274,6 +346,7 @@ impl SymbolIndex {
                     name: String::new(),
                     path: caller.path.clone(),
                     line: caller.line,
+                    ambiguous,
                 },
             };
             if !steps
@@ -297,6 +370,7 @@ impl SymbolIndex {
             name: def.name.clone(),
             path: def.path.clone(),
             line: def.line,
+            ambiguous: false,
         };
         // Chains are stored deepest-first (the changed function at index 0) and reversed
         // on output so paths read highest → deepest.
@@ -435,7 +509,35 @@ enum Lang {
     Tsx,
 }
 
+/// Dependency and build output directories: never part of the change under review, and
+/// large enough to dominate indexing when an untracked app lacks a `.gitignore` yet.
+pub fn is_vendored_path(path: &str) -> bool {
+    path.split('/').any(|segment| {
+        matches!(
+            segment,
+            "node_modules"
+                | "vendor"
+                | "target"
+                | "dist"
+                | "build"
+                | ".venv"
+                | "venv"
+                | "site-packages"
+                | "__pycache__"
+                | ".next"
+                | ".nuxt"
+                | ".react-router"
+                | ".turbo"
+                | ".cache"
+                | "coverage"
+        )
+    })
+}
+
 fn language_for_path(path: &str) -> Option<Lang> {
+    if is_vendored_path(path) {
+        return None;
+    }
     let ext = Path::new(path).extension()?.to_str()?;
     Some(match ext {
         "rs" => Lang::Rust,

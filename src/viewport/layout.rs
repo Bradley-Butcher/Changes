@@ -464,7 +464,7 @@ fn hunk_call_context(
     file: &FileDiff,
     width: usize,
 ) -> Vec<(usize, Vec<String>)> {
-    let symbols = outline::file_symbols(file);
+    let symbols = outline::file_symbols_with(file, Some(index));
     let mut by_hunk: Vec<(usize, Vec<(String, outline::CallSummary<'_>)>)> = Vec::new();
     for symbol in symbols {
         let Some(ident) = symbol.ident.as_deref() else {
