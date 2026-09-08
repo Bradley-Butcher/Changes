@@ -278,26 +278,55 @@ pub fn file_symbols(file: &FileDiff) -> Vec<Symbol> {
         });
     };
 
+    let markdown = is_markdown_path(&file.path);
+    let symbol_name = |line: &str| {
+        if markdown {
+            heading_name(line)
+        } else {
+            declaration_name(line)
+        }
+    };
+
     for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
         let mut declared_here = false;
+        // In prose, an unchanged heading inside the hunk tells us which section was
+        // edited; code gets the same from git's hunk-header context instead.
+        let mut enclosing_section: Option<String> = None;
+        let mut seen_change = false;
         for line in &hunk.lines {
             let change = match (line.kind, whole_file) {
                 (_, Some(change)) => change,
                 (LineKind::Addition, None) => SymbolChange::Added,
                 (LineKind::Deletion, None) => SymbolChange::Removed,
-                (LineKind::Context, None) => continue,
+                (LineKind::Context, None) => {
+                    if markdown
+                        && !seen_change
+                        && let Some(heading) = heading_name(&line.content)
+                    {
+                        enclosing_section = Some(heading);
+                    }
+                    continue;
+                }
             };
-            if let Some(name) = declaration_name(&line.content) {
+            seen_change = true;
+            if let Some(name) = symbol_name(&line.content) {
                 push(name, change, hunk_idx);
                 declared_here = true;
             }
+        }
+        if !declared_here
+            && whole_file.is_none()
+            && let Some(section) = enclosing_section
+        {
+            push(section, SymbolChange::Modified, hunk_idx);
+            continue;
         }
         // A hunk that edits the body of something is a modification of the enclosing
         // declaration, which git names in the hunk header.
         if !declared_here
             && whole_file.is_none()
             && let Some(context) = hunk_context(&hunk.header)
-            && let Some(name) = declaration_name(context).or_else(|| short_context(context))
+            && let Some(name) = symbol_name(context).or_else(|| short_context(context))
             // `mod x;` / `use` lines are what git picks as context for import edits; they
             // are not the item being modified.
             && !name.starts_with("mod ")
@@ -308,6 +337,30 @@ pub fn file_symbols(file: &FileDiff) -> Vec<Symbol> {
         }
     }
     symbols
+}
+
+fn is_markdown_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower.ends_with(".md") || lower.ends_with(".markdown") || lower.ends_with(".mdx")
+}
+
+/// ATX headings are the declarations of a markdown file: `## Install` stays as written,
+/// level included, so the outline reads like the document's table of contents.
+pub fn heading_name(line: &str) -> Option<String> {
+    let trimmed = line.trim_start();
+    let level = trimmed.bytes().take_while(|&b| b == b'#').count();
+    if level == 0 || level > 6 {
+        return None;
+    }
+    let rest = &trimmed[level..];
+    if !rest.starts_with([' ', '\t']) {
+        return None; // `#hashtag`, not a heading
+    }
+    let text = rest.trim().trim_end_matches('#').trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(format!("{} {text}", "#".repeat(level)))
 }
 
 /// The function context git appends after the second `@@` of a hunk header.
@@ -604,6 +657,50 @@ mod tests {
                 ("fn old_name".into(), SymbolChange::Removed, 1),
                 ("fn new_name".into(), SymbolChange::Added, 1),
                 ("fn resize".into(), SymbolChange::Modified, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn markdown_headings_are_the_symbols_of_prose_files() {
+        use super::heading_name;
+        assert_eq!(heading_name("## Install"), Some("## Install".into()));
+        assert_eq!(heading_name("# Title ##"), Some("# Title".into()));
+        assert_eq!(heading_name("#hashtag"), None);
+        assert_eq!(heading_name("####### too deep"), None);
+        assert_eq!(heading_name("plain text"), None);
+
+        let f = file(
+            "docs/README.md",
+            FileStatus::Modified,
+            vec![
+                Hunk {
+                    header: "@@ -1,3 +1,4 @@".to_string(),
+                    lines: vec![
+                        line(LineKind::Context, "## Install"),
+                        line(LineKind::Context, ""),
+                        line(LineKind::Addition, "Run `brew install changes`."),
+                    ],
+                },
+                Hunk {
+                    header: "@@ -20,2 +21,3 @@ Some paragraph text".to_string(),
+                    lines: vec![
+                        line(LineKind::Deletion, "## Keybindings"),
+                        line(LineKind::Addition, "## Keys"),
+                    ],
+                },
+            ],
+        );
+        let names: Vec<(String, SymbolChange)> = file_symbols(&f)
+            .into_iter()
+            .map(|s| (s.name, s.change))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                ("## Install".into(), SymbolChange::Modified),
+                ("## Keybindings".into(), SymbolChange::Removed),
+                ("## Keys".into(), SymbolChange::Added),
             ]
         );
     }
