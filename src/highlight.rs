@@ -9,12 +9,51 @@ use syntect::parsing::{SyntaxReference, SyntaxSet};
 const MAX_SYNTAX_CACHE_ENTRIES: usize = 128;
 const MAX_HIGHLIGHT_CACHE_ENTRIES: usize = 4096;
 
+type HighlightKey = (String, String);
+
+/// Two-generation cache: lookups check `current` then `previous`, promoting hits. When
+/// `current` fills up it becomes `previous`, so the lines on screen survive eviction
+/// instead of being wiped along with everything else.
+#[derive(Default)]
+struct HighlightCache {
+    current: HashMap<HighlightKey, Vec<CachedSpan>>,
+    previous: HashMap<HighlightKey, Vec<CachedSpan>>,
+}
+
+impl HighlightCache {
+    fn get(&mut self, key: &HighlightKey) -> Option<Vec<CachedSpan>> {
+        if let Some(spans) = self.current.get(key) {
+            return Some(spans.clone());
+        }
+        let spans = self.previous.remove(key)?;
+        self.insert(key.clone(), spans.clone());
+        Some(spans)
+    }
+
+    fn insert(&mut self, key: HighlightKey, spans: Vec<CachedSpan>) {
+        if self.current.len() >= MAX_HIGHLIGHT_CACHE_ENTRIES {
+            self.previous = std::mem::take(&mut self.current);
+        }
+        self.current.insert(key, spans);
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.current.len() + self.previous.len()
+    }
+
+    fn clear(&mut self) {
+        self.current.clear();
+        self.previous.clear();
+    }
+}
+
 pub struct Highlighter {
     syntax_set: SyntaxSet,
     theme_set: ThemeSet,
     /// Maps file extensions, or extensionless file names, to syntax names.
     syntax_cache: std::cell::RefCell<HashMap<String, String>>,
-    highlight_cache: std::cell::RefCell<HashMap<(String, String), Vec<CachedSpan>>>,
+    highlight_cache: std::cell::RefCell<HighlightCache>,
 }
 
 impl Default for Highlighter {
@@ -29,12 +68,13 @@ impl Highlighter {
             syntax_set: SyntaxSet::load_defaults_newlines(),
             theme_set: ThemeSet::load_defaults(),
             syntax_cache: std::cell::RefCell::new(HashMap::new()),
-            highlight_cache: std::cell::RefCell::new(HashMap::new()),
+            highlight_cache: std::cell::RefCell::new(HighlightCache::default()),
         }
     }
 
-    /// Clear the highlight cache. Call when diff content changes to prevent unbounded growth.
-    /// The syntax cache (ext -> syntax name) is kept — it's bounded by extension count.
+    /// Drop every cached highlight. Growth is already bounded by generation eviction, and
+    /// keys are content-addressed, so a diff refresh does not need this: unchanged lines
+    /// simply keep hitting the cache.
     pub fn clear_highlight_cache(&self) {
         self.highlight_cache.borrow_mut().clear();
     }
@@ -88,10 +128,10 @@ impl Highlighter {
         let syntax = self.get_syntax(file_path);
         let cache_key = (syntax.name.clone(), text.to_string());
 
-        let cached = if let Some(cached) = self.highlight_cache.borrow().get(&cache_key) {
-            cached.clone()
+        let cached = if let Some(cached) = self.highlight_cache.borrow_mut().get(&cache_key) {
+            cached
         } else {
-            let theme = &self.theme_set.themes["base16-ocean.dark"];
+            let theme = &self.theme_set.themes[crate::theme::theme().syntax];
             let mut h = HighlightLines::new(syntax, theme);
             let regions = match h.highlight_line(text, &self.syntax_set) {
                 Ok(regions) => regions,
@@ -119,12 +159,9 @@ impl Highlighter {
                     modifiers: syntect_modifiers(style.font_style),
                 })
                 .collect();
-            let mut cache = self.highlight_cache.borrow_mut();
-            if cache.len() >= MAX_HIGHLIGHT_CACHE_ENTRIES {
-                // ponytail: whole-cache eviction avoids an LRU dependency.
-                cache.clear();
-            }
-            cache.insert(cache_key, cached.clone());
+            self.highlight_cache
+                .borrow_mut()
+                .insert(cache_key, cached.clone());
             cached
         };
 
@@ -154,10 +191,25 @@ mod tests {
         highlighter.highlight_line_content("two", "second/Dockerfile", None);
         assert_eq!(highlighter.syntax_cache.borrow().len(), 2);
 
-        for index in 0..=MAX_HIGHLIGHT_CACHE_ENTRIES {
+        for index in 0..=MAX_HIGHLIGHT_CACHE_ENTRIES * 3 {
             highlighter.highlight_line_content(&index.to_string(), "file.rs", None);
         }
-        assert!(highlighter.highlight_cache.borrow().len() <= MAX_HIGHLIGHT_CACHE_ENTRIES);
+        assert!(highlighter.highlight_cache.borrow().len() <= MAX_HIGHLIGHT_CACHE_ENTRIES * 2);
+    }
+
+    #[test]
+    fn recently_used_lines_survive_eviction() {
+        let highlighter = Highlighter::new();
+        highlighter.highlight_line_content("fn keep() {}", "file.rs", None);
+        for index in 0..MAX_HIGHLIGHT_CACHE_ENTRIES {
+            highlighter.highlight_line_content(&index.to_string(), "file.rs", None);
+            // Touch the hot line every so often, as a visible row would be each frame.
+            if index % 100 == 0 {
+                highlighter.highlight_line_content("fn keep() {}", "file.rs", None);
+            }
+        }
+        let key = ("Rust".to_string(), "fn keep() {}".to_string());
+        assert!(highlighter.highlight_cache.borrow_mut().get(&key).is_some());
     }
 }
 
