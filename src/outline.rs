@@ -72,6 +72,12 @@ pub enum OutlineRow {
         warning: Option<String>,
         expanded: bool,
     },
+    /// Heading inside an expanded symbol: "called by (2)" or "calls (33)".
+    Section {
+        prefix: String,
+        label: &'static str,
+        count: usize,
+    },
     /// One caller or callee of an expanded symbol.
     Call {
         prefix: String,
@@ -100,7 +106,7 @@ pub const MAX_SYMBOLS_PER_FILE: usize = 12;
 impl OutlineRow {
     /// Rows the cursor can land on; directories are grouping only.
     pub fn is_selectable(&self) -> bool {
-        !matches!(self, OutlineRow::Dir { .. })
+        !matches!(self, OutlineRow::Dir { .. } | OutlineRow::Section { .. })
     }
 
     pub fn target(&self) -> Option<(usize, Option<usize>)> {
@@ -111,7 +117,7 @@ impl OutlineRow {
                 file_idx, symbol, ..
             } => Some((*file_idx, Some(symbol.hunk_idx))),
             OutlineRow::More { file_idx, .. } => Some((*file_idx, None)),
-            OutlineRow::Summary { .. } => None,
+            OutlineRow::Summary { .. } | OutlineRow::Section { .. } => None,
             OutlineRow::Call {
                 file_idx, hunk_idx, ..
             } => file_idx.map(|file_idx| (file_idx, *hunk_idx)),
@@ -233,22 +239,24 @@ pub fn outline_markdown(rows: &[OutlineRow]) -> String {
                 };
                 out.push_str(&format!("{prefix}{text}\n"));
             }
+            OutlineRow::Section {
+                prefix,
+                label,
+                count,
+            } => {
+                out.push_str(&format!("{prefix}{label} ({count})\n"));
+            }
             OutlineRow::Call {
                 prefix,
-                direction,
                 name,
                 location,
                 mark,
                 ..
             } => {
-                let arrow = match direction {
-                    CallDirection::Incoming => "←",
-                    CallDirection::Outgoing => "→",
-                };
                 let mark = mark
                     .map(|m| format!("{} ", change_glyph(m)))
                     .unwrap_or_default();
-                out.push_str(&format!("{prefix}{arrow} {mark}{name}  {location}\n"));
+                out.push_str(&format!("{prefix}{mark}{name}  {location}\n"));
             }
         }
     }
@@ -419,59 +427,26 @@ fn push_call_rows(
     }
 
     let parent = (file_idx, ident.to_string());
-    let shown_callers = callers.len().min(MAX_CALLS_SHOWN);
-    let shown_callees = callees.len().min(MAX_CALLS_SHOWN);
-    let total = shown_callers
-        + usize::from(callers.len() > shown_callers)
-        + shown_callees
-        + usize::from(callees.len() > shown_callees);
-    let mut position = 0usize;
-    let mut next_branch = |rows: &mut Vec<OutlineRow>, row: OutlineRow| {
-        position += 1;
-        let (branch, _) = connectors(&tree_prefix, position == total, false);
-        rows.push(match row {
-            OutlineRow::Call {
-                direction,
-                name,
-                location,
-                mark,
-                file_idx,
-                hunk_idx,
-                parent,
-                parent_path,
-                ..
-            } => OutlineRow::Call {
-                prefix: branch,
-                direction,
-                name,
-                location,
-                mark,
-                file_idx,
-                hunk_idx,
-                parent,
-                parent_path,
-            },
-            OutlineRow::More {
-                file_idx, count, ..
-            } => OutlineRow::More {
-                prefix: branch,
-                file_idx,
-                count,
-            },
-            other => other,
-        });
-    };
 
-    for caller in callers.iter().take(shown_callers) {
-        let (target_file, hunk_idx, mark) = locate_in_diff(
-            context.files,
-            &caller.path,
-            caller.line,
-            caller.from_name.as_deref(),
-        );
-        next_branch(
-            rows,
-            OutlineRow::Call {
+    // Two labelled groups, each its own subtree, so the counts in the summary line
+    // match what is listed under each heading.
+    struct Group {
+        label: &'static str,
+        count: usize,
+        rows: Vec<OutlineRow>,
+    }
+    let mut groups: Vec<Group> = Vec::new();
+
+    if !callers.is_empty() {
+        let mut group_rows = Vec::new();
+        for caller in callers.iter().take(MAX_CALLS_SHOWN) {
+            let (target_file, hunk_idx, mark) = locate_in_diff(
+                context.files,
+                &caller.path,
+                caller.line,
+                caller.from_name.as_deref(),
+            );
+            group_rows.push(OutlineRow::Call {
                 prefix: String::new(),
                 direction: CallDirection::Incoming,
                 name: caller
@@ -484,30 +459,32 @@ fn push_call_rows(
                 hunk_idx,
                 parent: parent.clone(),
                 parent_path: file.path.clone(),
-            },
-        );
-    }
-    if callers.len() > shown_callers {
-        next_branch(
-            rows,
-            OutlineRow::More {
+            });
+        }
+        if callers.len() > MAX_CALLS_SHOWN {
+            group_rows.push(OutlineRow::More {
                 prefix: String::new(),
                 file_idx,
-                count: callers.len() - shown_callers,
-            },
-        );
-    }
-    for (name, targets) in callees.iter().take(shown_callees) {
-        let target = targets[0];
-        let (target_file, hunk_idx, mark) =
-            locate_in_diff(context.files, &target.path, target.line, Some(name));
-        let mut display = target.display.clone();
-        if targets.len() > 1 {
-            display.push_str(&format!(" (+{} more definitions)", targets.len() - 1));
+                count: callers.len() - MAX_CALLS_SHOWN,
+            });
         }
-        next_branch(
-            rows,
-            OutlineRow::Call {
+        groups.push(Group {
+            label: "called by",
+            count: callers.len(),
+            rows: group_rows,
+        });
+    }
+    if !callees.is_empty() {
+        let mut group_rows = Vec::new();
+        for (name, targets) in callees.iter().take(MAX_CALLS_SHOWN) {
+            let target = targets[0];
+            let (target_file, hunk_idx, mark) =
+                locate_in_diff(context.files, &target.path, target.line, Some(name));
+            let mut display = target.display.clone();
+            if targets.len() > 1 {
+                display.push_str(&format!(" (+{} more definitions)", targets.len() - 1));
+            }
+            group_rows.push(OutlineRow::Call {
                 prefix: String::new(),
                 direction: CallDirection::Outgoing,
                 name: display,
@@ -517,18 +494,65 @@ fn push_call_rows(
                 hunk_idx,
                 parent: parent.clone(),
                 parent_path: file.path.clone(),
-            },
-        );
-    }
-    if callees.len() > shown_callees {
-        next_branch(
-            rows,
-            OutlineRow::More {
+            });
+        }
+        if callees.len() > MAX_CALLS_SHOWN {
+            group_rows.push(OutlineRow::More {
                 prefix: String::new(),
                 file_idx,
-                count: callees.len() - shown_callees,
-            },
-        );
+                count: callees.len() - MAX_CALLS_SHOWN,
+            });
+        }
+        groups.push(Group {
+            label: "calls",
+            count: callees.len(),
+            rows: group_rows,
+        });
+    }
+
+    let group_count = groups.len();
+    for (g, group) in groups.into_iter().enumerate() {
+        let (heading_branch, item_prefix) = connectors(&tree_prefix, g + 1 == group_count, false);
+        rows.push(OutlineRow::Section {
+            prefix: heading_branch,
+            label: group.label,
+            count: group.count,
+        });
+        let items = group.rows.len();
+        for (i, row) in group.rows.into_iter().enumerate() {
+            let (branch, _) = connectors(&item_prefix, i + 1 == items, false);
+            rows.push(match row {
+                OutlineRow::Call {
+                    prefix: _,
+                    direction,
+                    name,
+                    location,
+                    mark,
+                    file_idx,
+                    hunk_idx,
+                    parent,
+                    parent_path,
+                } => OutlineRow::Call {
+                    prefix: branch,
+                    direction,
+                    name,
+                    location,
+                    mark,
+                    file_idx,
+                    hunk_idx,
+                    parent,
+                    parent_path,
+                },
+                OutlineRow::More {
+                    file_idx, count, ..
+                } => OutlineRow::More {
+                    prefix: branch,
+                    file_idx,
+                    count,
+                },
+                other => other,
+            });
+        }
     }
 }
 
@@ -578,7 +602,7 @@ pub fn call_summary<'a>(
 }
 
 /// One-line call context for a hunk, shown under its header in the diff:
-/// `fn parse · ↑ called by main, other · ↓ calls tokenize, +2 more`. `label` names the
+/// `fn parse · called by main, other · calls tokenize, +2 more`. `label` names the
 /// function when the hunk touches more than one. Fitted to `width` columns.
 pub fn inline_call_context(summary: &CallSummary<'_>, label: Option<&str>, width: usize) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -594,9 +618,9 @@ pub fn inline_call_context(summary: &CallSummary<'_>, label: Option<&str>, width
             .iter()
             .map(|c| c.from.clone().unwrap_or_else(|| "(top level)".to_string()))
             .collect();
-        parts.push(format!("↑ called by {}", join_limited(&names, 4)));
+        parts.push(format!("called by {}", join_limited(&names, 4)));
     } else if summary.warning.is_none() {
-        parts.push("↑ no callers".to_string());
+        parts.push("no callers".to_string());
     }
     if !summary.callees.is_empty() {
         let names: Vec<String> = summary
@@ -604,7 +628,7 @@ pub fn inline_call_context(summary: &CallSummary<'_>, label: Option<&str>, width
             .iter()
             .map(|(_, targets)| targets[0].display.clone())
             .collect();
-        parts.push(format!("↓ calls {}", join_limited(&names, 4)));
+        parts.push(format!("calls {}", join_limited(&names, 4)));
     }
     fit_width(&parts.join(" · "), width)
 }
@@ -916,6 +940,18 @@ pub fn declaration_name(line: &str) -> Option<String> {
         {
             return Some(binding);
         }
+        // Rust / TS constants: `const NAME: Type = ...`, `static NAME: Type`.
+        if matches!(word, "const" | "static")
+            && let Some(name) = identifier(rest[word.len()..].trim_start())
+            && name
+                .chars()
+                .all(|c| c.is_uppercase() || c == '_' || c.is_ascii_digit())
+            && rest[word.len()..].trim_start()[name.len()..]
+                .trim_start()
+                .starts_with(':')
+        {
+            return Some(format!("const {name}"));
+        }
         if DECL_MODIFIERS.contains(&word) || word.starts_with("pub(") || word.starts_with('@') {
             rest = rest[word.len()..].trim_start();
             continue;
@@ -1080,6 +1116,14 @@ mod tests {
             Some("handler".into())
         );
         assert_eq!(declaration_name("const total = items.length;"), None);
+        assert_eq!(
+            declaration_name("pub const MAX_SYMBOLS: usize = 12;"),
+            Some("const MAX_SYMBOLS".into())
+        );
+        assert_eq!(
+            declaration_name("static COUNTER: AtomicU32 = AtomicU32::new(0);"),
+            Some("const COUNTER".into())
+        );
         assert_eq!(declaration_name("let x = 5;"), None);
         assert_eq!(declaration_name("            fn deeply_nested() {}"), None);
         assert_eq!(declaration_name("    return type_name;"), None);

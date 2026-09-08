@@ -2,7 +2,7 @@ use crate::app::{App, CompareRow};
 use crate::diff::{FileStatus, LineKind};
 use crate::git::{Base, BaseCandidates, DiffMode};
 use crate::highlight::Highlighter;
-use crate::outline::{self, CallDirection, OutlineRow, SymbolChange, hunk_context};
+use crate::outline::{self, OutlineRow, SymbolChange, hunk_context};
 use crate::viewport::{RowRef, chunk_end, side_by_side_gutter_width, side_by_side_pane_widths};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -323,7 +323,7 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
     let title = if indexing {
         " Outline — ↵ open · y copy as markdown · o full diff · indexing calls… "
     } else {
-        " Outline — ↵ open · →/← callers & callees · y copy as markdown · o full diff "
+        " Outline — ↵ open · →/← expand callers & callees · y copy as markdown · o full diff "
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -469,9 +469,23 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 None
             }
+            OutlineRow::Section {
+                prefix,
+                label,
+                count,
+            } => {
+                spans.push(Span::styled(
+                    prefix.clone(),
+                    with_bg(Style::default().fg(FG_MUTED)),
+                ));
+                spans.push(Span::styled(
+                    format!("{label} ({count})"),
+                    with_bg(Style::default().fg(FG_HUNK).add_modifier(Modifier::BOLD)),
+                ));
+                None
+            }
             OutlineRow::Call {
                 prefix,
-                direction,
                 name,
                 location,
                 mark,
@@ -482,11 +496,6 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
                     prefix.clone(),
                     with_bg(Style::default().fg(FG_MUTED)),
                 ));
-                let arrow = match direction {
-                    CallDirection::Incoming => "← ",
-                    CallDirection::Outgoing => "→ ",
-                };
-                spans.push(Span::styled(arrow, with_bg(Style::default().fg(FG_HUNK))));
                 if let Some(mark) = mark {
                     let color = match mark {
                         SymbolChange::Added => FG_ADD,
