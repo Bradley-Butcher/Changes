@@ -773,12 +773,6 @@ impl App {
             .unwrap_or(0..0)
     }
 
-    pub fn warm_row_range(&self, total_lines: usize, viewport_height: usize) -> Range<usize> {
-        self.current_viewport()
-            .map(|viewport| viewport.warm_range(total_lines, viewport_height))
-            .unwrap_or(0..0)
-    }
-
     fn ensure_layout(&mut self, idx: usize, view: ViewKind) {
         let height = self.viewport_height();
         let width = self.layout.content_width.max(1) as usize;

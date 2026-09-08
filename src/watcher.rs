@@ -1,7 +1,7 @@
 use anyhow::Result;
 use git2::Repository;
-use notify::RecursiveMode;
-use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
+use notify_debouncer_mini::notify::RecursiveMode;
+use notify_debouncer_mini::{DebouncedEventKind, new_debouncer, notify};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
