@@ -310,19 +310,37 @@ fn draw_empty_state(frame: &mut Frame, app: &App, area: Rect) {
         .map(|r| format!("watching {}", r.info.path.display()))
         .unwrap_or_default();
 
-    // A small wordmark, the state, and what to do next: nothing that competes with a
-    // diff once one appears.
-    let lines: Vec<Line> = vec![
-        Line::from(Span::styled(
+    let logo = [
+        r#"██████╗  ██╗  ██╗  █████╗  ███╗   ██╗  ██████╗  ███████╗ ███████╗"#,
+        r#"██╔════╝  ██║  ██║ ██╔══██╗ ████╗  ██║ ██╔════╝  ██╔════╝ ██╔════╝"#,
+        r#"██║       ███████║ ███████║ ██╔██╗ ██║ ██║  ███╗ █████╗   ███████╗"#,
+        r#"██║       ██╔══██║ ██╔══██║ ██║╚██╗██║ ██║   ██║ ██╔══╝   ╚════██║"#,
+        r#"╚██████╗  ██║  ██║ ██║  ██║ ██║ ╚████║ ╚██████╔╝ ███████╗ ███████║"#,
+        r#" ╚═════╝  ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═══╝  ╚═════╝  ╚══════╝ ╚══════╝"#,
+    ];
+    let logo_fits = inner.height >= 12 && inner.width as usize >= logo[0].chars().count() + 2;
+
+    // The logo when there is room, otherwise a small wordmark; then the state and what
+    // to do next in quiet text.
+    let mut lines: Vec<Line> = Vec::new();
+    if logo_fits {
+        for row in logo {
+            lines.push(Line::from(Span::styled(
+                row,
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            )));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
             "changes",
             Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(headline, t.text_style())),
-        Line::from(Span::styled(hint, t.muted_style())),
-        Line::from(""),
-        Line::from(Span::styled(watching, t.muted_style())),
-    ];
+        )));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(headline, t.text_style())));
+    lines.push(Line::from(Span::styled(hint, t.muted_style())));
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(watching, t.muted_style())));
     let top_pad = inner.height.saturating_sub(lines.len() as u16) / 2;
     let area = Rect::new(
         inner.x,
