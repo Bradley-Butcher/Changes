@@ -316,10 +316,10 @@ fn bench_git(files: usize, lines: usize, changed_every: usize) {
         n
     });
     let unstaged = time("compute_diff Unstaged", 3, || {
-        git::compute_diff(&root, DiffMode::Unstaged, None).unwrap()
+        git::compute_diff(&root, &DiffMode::Unstaged, None).unwrap()
     });
     time("compute_diff Staged (nothing staged)", 3, || {
-        git::compute_diff(&root, DiffMode::Staged, None).unwrap()
+        git::compute_diff(&root, &DiffMode::Staged, None).unwrap()
     });
     println!("   -> {} files in unstaged diff", unstaged.len());
     let _ = std::fs::remove_dir_all(&root);

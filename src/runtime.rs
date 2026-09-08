@@ -251,6 +251,13 @@ fn handle_event(
                 *needs_redraw = true;
                 return Ok(false);
             }
+            if app.compare_picker.is_some() {
+                if let Some(mode) = keys::handle_compare_picker_key(app, key) {
+                    app.set_mode_bounded(mode, &ch.diff_tx);
+                }
+                *needs_redraw = true;
+                return Ok(false);
+            }
             if app.repo_adder.is_some() {
                 let added = keys::handle_repo_adder_key(app, key);
                 for new_idx in added.into_iter().rev() {
@@ -291,7 +298,7 @@ fn handle_event(
             *needs_redraw = true;
         }
         AppEvent::Terminal(Event::Mouse(m)) => {
-            if mouse::handle_mouse_bounded(app, m, &ch.diff_tx, &ch.gap_tx) {
+            if mouse::handle_mouse_bounded(app, m, &ch.gap_tx) {
                 *needs_redraw = true;
             }
         }

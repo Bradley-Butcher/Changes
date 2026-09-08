@@ -10,31 +10,101 @@ const GRAPHITE_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_mi
 const MAX_UNTRACKED_FILE_BYTES: u64 = 5 * 1024 * 1024;
 const MAX_UNTRACKED_LINES: usize = 100_000;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a repo tab is comparing. Two of these matter day to day: `Local` answers "what
+/// has the agent done that isn't committed", `Branch` answers "what does this unit of
+/// work look like against its base". The rest are reachable from the compare picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiffMode {
-    Unstaged,
+    /// Everything uncommitted: HEAD → working tree, untracked files included.
+    Local,
+    /// HEAD → index.
     Staged,
-    Branch,
+    /// Index → working tree.
+    Unstaged,
+    /// Fork point with `base` → working tree, or → HEAD when `commits_only`.
+    Branch { base: Base, commits_only: bool },
+}
+
+/// Which branch a `DiffMode::Branch` compares against, before it is resolved to a name.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Base {
+    /// The stack parent when Graphite knows one, otherwise trunk.
+    Parent,
+    /// The repository's main line: origin's default branch or a common name for it.
+    Trunk,
+    /// The current branch's remote tracking branch.
+    Upstream,
+    /// A ref the user typed.
+    Ref(String),
+}
+
+/// The branches a repo could be compared against, detected once per refresh.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BaseCandidates {
+    /// Graphite's parent of the current branch, when `gt` knows one.
+    pub parent: Option<String>,
+    pub trunk: Option<String>,
+    /// Remote tracking branch of the current branch, e.g. `origin/feature`.
+    pub upstream: Option<String>,
+    pub branch: Option<String>,
+}
+
+impl BaseCandidates {
+    /// The branch name `base` stands for here, or None when nothing fits. Comparing a
+    /// branch with itself is never useful, so a base that names the current branch (being
+    /// on main with base main) falls through to its upstream, which shows unpushed work.
+    pub fn resolve(&self, base: &Base) -> Option<String> {
+        let name = match base {
+            Base::Parent => self.parent.clone().or_else(|| self.trunk.clone())?,
+            Base::Trunk => self.trunk.clone()?,
+            Base::Upstream => return self.upstream.clone(),
+            Base::Ref(name) => name.clone(),
+        };
+        if self.branch.as_deref() == Some(name.as_str()) {
+            return self.upstream.clone();
+        }
+        Some(name)
+    }
+}
+
+/// Where the "new" side of a diff lives; decides how file contents are read back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NewSide {
+    Workdir,
+    Index,
+    Head,
 }
 
 impl DiffMode {
-    pub fn label(&self, base_branch: Option<&str>) -> Cow<'static, str> {
+    pub fn label(&self, bases: &BaseCandidates) -> Cow<'static, str> {
         match self {
-            DiffMode::Unstaged => Cow::Borrowed("Modified"),
+            DiffMode::Local => Cow::Borrowed("Local"),
             DiffMode::Staged => Cow::Borrowed("Staged"),
-            DiffMode::Branch => match base_branch {
-                Some(base) => Cow::Owned(format!("vs {}", base)),
+            DiffMode::Unstaged => Cow::Borrowed("Unstaged"),
+            DiffMode::Branch { base, commits_only } => match bases.resolve(base) {
+                Some(name) if *commits_only => Cow::Owned(format!("vs {name}, commits only")),
+                Some(name) => Cow::Owned(format!("vs {name}")),
                 None => Cow::Borrowed("Branch"),
             },
         }
     }
 
-    pub fn next(&self) -> Self {
+    pub fn new_side(&self) -> NewSide {
         match self {
-            DiffMode::Unstaged => DiffMode::Staged,
-            DiffMode::Staged => DiffMode::Branch,
-            DiffMode::Branch => DiffMode::Unstaged,
+            DiffMode::Local | DiffMode::Unstaged => NewSide::Workdir,
+            DiffMode::Staged => NewSide::Index,
+            DiffMode::Branch { commits_only, .. } => {
+                if *commits_only {
+                    NewSide::Head
+                } else {
+                    NewSide::Workdir
+                }
+            }
         }
+    }
+
+    pub fn is_branch(&self) -> bool {
+        matches!(self, DiffMode::Branch { .. })
     }
 }
 
@@ -82,19 +152,32 @@ pub fn discover_repos(root: &Path) -> Result<Vec<RepoInfo>> {
     Ok(repos)
 }
 
-pub fn current_branch(repo_path: &Path) -> Option<String> {
-    let repo = Repository::open(repo_path).ok()?;
-    let head = repo.head().ok()?;
-    head.shorthand().map(|s| s.to_string())
-}
-
 /// The two snapshots a diff compares, resolved once so worker threads can rebuild an
 /// identical `Diff` without repeating branch lookups.
 #[derive(Debug, Clone, Copy)]
 enum DiffSpec {
     IndexToWorkdir,
-    TreeToIndex { head_tree: Option<Oid> },
-    TreeToTree { old_tree: Oid, new_tree: Oid },
+    TreeToIndex {
+        head_tree: Option<Oid>,
+    },
+    /// A commit's tree against the files on disk, the index consulted for renames and
+    /// staged additions. `None` is the empty tree of an unborn HEAD.
+    TreeToWorkdir {
+        old_tree: Option<Oid>,
+    },
+    TreeToTree {
+        old_tree: Oid,
+        new_tree: Oid,
+    },
+}
+
+impl DiffSpec {
+    fn new_side_is_workdir(self) -> bool {
+        matches!(
+            self,
+            DiffSpec::IndexToWorkdir | DiffSpec::TreeToWorkdir { .. }
+        )
+    }
 }
 
 /// Diffs with at least this many changed files are patched on several threads.
@@ -105,7 +188,7 @@ const MAX_PATCH_THREADS: usize = 8;
 
 fn diff_options(spec: DiffSpec) -> DiffOptions {
     let mut opts = DiffOptions::new();
-    opts.include_untracked(matches!(spec, DiffSpec::IndexToWorkdir));
+    opts.include_untracked(spec.new_side_is_workdir());
     opts.recurse_untracked_dirs(true);
     opts.context_lines(3);
     opts
@@ -119,6 +202,10 @@ fn build_diff(repo: &Repository, spec: DiffSpec) -> Result<git2::Diff<'_>> {
             let tree = head_tree.map(|id| repo.find_tree(id)).transpose()?;
             repo.diff_tree_to_index(tree.as_ref(), None, Some(&mut opts))?
         }
+        DiffSpec::TreeToWorkdir { old_tree } => {
+            let tree = old_tree.map(|id| repo.find_tree(id)).transpose()?;
+            repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut opts))?
+        }
         DiffSpec::TreeToTree { old_tree, new_tree } => {
             let old = repo.find_tree(old_tree)?;
             let new = repo.find_tree(new_tree)?;
@@ -128,36 +215,45 @@ fn build_diff(repo: &Repository, spec: DiffSpec) -> Result<git2::Diff<'_>> {
     Ok(diff)
 }
 
+/// Diff `repo_path` in `mode`. `bases` is what the app has detected so far; `None` means
+/// detection hasn't finished and branch modes detect synchronously instead.
 pub fn compute_diff(
     repo_path: &Path,
-    mode: DiffMode,
-    base_branch: Option<&str>,
+    mode: &DiffMode,
+    bases: Option<&BaseCandidates>,
 ) -> Result<Vec<FileDiff>> {
     let repo = Repository::open(repo_path)
         .with_context(|| format!("Failed to open repo: {}", repo_path.display()))?;
+    let head_tree = repo
+        .head()
+        .ok()
+        .and_then(|h| h.peel_to_tree().ok())
+        .map(|tree| tree.id());
 
     let spec = match mode {
-        DiffMode::Unstaged => DiffSpec::IndexToWorkdir,
-        DiffMode::Staged => DiffSpec::TreeToIndex {
-            head_tree: repo
-                .head()
-                .ok()
-                .and_then(|h| h.peel_to_tree().ok())
-                .map(|tree| tree.id()),
+        DiffMode::Local => DiffSpec::TreeToWorkdir {
+            old_tree: head_tree,
         },
-        DiffMode::Branch => {
-            let Some(branch) = resolve_base_branch(&repo, repo_path, base_branch) else {
+        DiffMode::Unstaged => DiffSpec::IndexToWorkdir,
+        DiffMode::Staged => DiffSpec::TreeToIndex { head_tree },
+        DiffMode::Branch { base, commits_only } => {
+            let detected = match bases {
+                Some(bases) => Cow::Borrowed(bases),
+                None => Cow::Owned(detect_bases(repo_path)),
+            };
+            let Some(base_ref) = detected.resolve(base) else {
                 return Ok(Vec::new());
             };
-            branch_diff_spec(&repo, &branch)?
+            branch_diff_spec(&repo, &base_ref, *commits_only)?
         }
     };
     let diff = build_diff(&repo, spec)?;
+    let new_side = mode.new_side();
 
     // Pre-populate untracked files from deltas — patches skip them because there's no
     // patch content for untracked files.
     let mut files: Vec<FileDiff> = Vec::new();
-    if mode == DiffMode::Unstaged {
+    if new_side == NewSide::Workdir {
         for delta in diff.deltas() {
             if delta.status() == Delta::Untracked {
                 let file_path = delta
@@ -182,8 +278,8 @@ pub fn compute_diff(
 
     files.extend(collect_files(repo_path, &diff, spec)?);
 
-    // Handle untracked files in unstaged mode - read their content as all-additions
-    if mode == DiffMode::Unstaged {
+    // Untracked files have no patch; read their content as all-additions.
+    if new_side == NewSide::Workdir {
         for file in &mut files {
             if file.status == FileStatus::Untracked && file.hunks.is_empty() {
                 match read_untracked_lines(&repo_path.join(&file.path)) {
@@ -216,8 +312,8 @@ pub fn compute_diff(
         if matches!(file.status, FileStatus::Deleted | FileStatus::Untracked) {
             continue;
         }
-        match mode {
-            DiffMode::Unstaged => {
+        match new_side {
+            NewSide::Workdir => {
                 let path = repo_path.join(&file.path);
                 // Some platforms allow directories to be opened as files. Skip all
                 // non-regular paths before the streaming line count.
@@ -228,8 +324,8 @@ pub fn compute_diff(
                     file.total_new_lines = line_count;
                 }
             }
-            DiffMode::Staged | DiffMode::Branch => {
-                if let Ok(blob) = new_side_blob(&repo, Path::new(&file.path), mode) {
+            NewSide::Index | NewSide::Head => {
+                if let Ok(blob) = new_side_blob(&repo, Path::new(&file.path), new_side) {
                     file.total_new_lines = count_blob_lines(&blob);
                 }
             }
@@ -541,19 +637,18 @@ fn collect_files_via_print(diff: &git2::Diff<'_>) -> Result<Vec<FileDiff>> {
     Ok(files)
 }
 
-/// Content of `rel_path` on the "new" side of a diff in `mode`: the index entry for
-/// staged diffs, the HEAD commit's file for branch diffs. Unstaged diffs read the
-/// working tree directly instead.
-pub fn new_side_blob(repo: &Repository, rel_path: &Path, mode: DiffMode) -> Result<Vec<u8>> {
-    let oid = match mode {
-        DiffMode::Unstaged => anyhow::bail!("unstaged diffs read the working tree"),
-        DiffMode::Staged => {
+/// Content of `rel_path` from the index or the HEAD commit. Working-tree sides are read
+/// from disk instead.
+pub fn new_side_blob(repo: &Repository, rel_path: &Path, side: NewSide) -> Result<Vec<u8>> {
+    let oid = match side {
+        NewSide::Workdir => anyhow::bail!("working-tree diffs read files from disk"),
+        NewSide::Index => {
             repo.index()?
                 .get_path(rel_path, 0)
                 .with_context(|| format!("{} is not in the index", rel_path.display()))?
                 .id
         }
-        DiffMode::Branch => repo
+        NewSide::Head => repo
             .head()?
             .peel_to_tree()?
             .get_path(rel_path)
@@ -567,15 +662,15 @@ pub fn new_side_blob(repo: &Repository, rel_path: &Path, mode: DiffMode) -> Resu
 pub fn read_new_side_lines(
     repo_path: &Path,
     rel_path: &Path,
-    mode: DiffMode,
+    mode: &DiffMode,
     start: usize,
     end: usize,
 ) -> Result<Vec<String>> {
     use std::io::BufRead;
     let count = end.saturating_sub(start) + 1;
     let skip = start.saturating_sub(1);
-    match mode {
-        DiffMode::Unstaged => {
+    match mode.new_side() {
+        NewSide::Workdir => {
             let file = std::fs::File::open(repo_path.join(rel_path))?;
             Ok(std::io::BufReader::new(file)
                 .lines()
@@ -584,9 +679,9 @@ pub fn read_new_side_lines(
                 .map(|line| line.unwrap_or_default())
                 .collect())
         }
-        DiffMode::Staged | DiffMode::Branch => {
+        side @ (NewSide::Index | NewSide::Head) => {
             let repo = Repository::open(repo_path)?;
-            let blob = new_side_blob(&repo, rel_path, mode)?;
+            let blob = new_side_blob(&repo, rel_path, side)?;
             Ok(String::from_utf8_lossy(&blob)
                 .lines()
                 .skip(skip)
@@ -606,61 +701,75 @@ fn count_blob_lines(bytes: &[u8]) -> usize {
     }
 }
 
-pub fn find_base_branch(repo_path: &Path) -> Option<String> {
-    // Try Graphite first (with timeout so it can't hang the UI)
-    if let Ok(mut child) = Command::new("gt")
+/// Everything the current branch could be compared against. Runs `gt parent` (bounded
+/// by a timeout), so it belongs off the UI thread.
+pub fn detect_bases(repo_path: &Path) -> BaseCandidates {
+    let parent = graphite_parent(repo_path);
+    let Ok(repo) = Repository::open(repo_path) else {
+        return BaseCandidates {
+            parent,
+            ..BaseCandidates::default()
+        };
+    };
+    let branch = repo
+        .head()
+        .ok()
+        .and_then(|head| head.shorthand().map(str::to_string));
+    let trunk = remote_default_branch(&repo).or_else(|| find_common_base_branch(&repo));
+    let upstream = branch.as_deref().and_then(|name| upstream_of(&repo, name));
+    BaseCandidates {
+        parent,
+        trunk,
+        upstream,
+        branch,
+    }
+}
+
+/// The parent Graphite records for the current branch, if `gt` is installed and answers
+/// within the timeout.
+fn graphite_parent(repo_path: &Path) -> Option<String> {
+    let mut child = Command::new("gt")
         .arg("parent")
         .current_dir(repo_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::null())
         .stdin(std::process::Stdio::null())
         .spawn()
-    {
-        // Poll with a 2-second deadline
-        let deadline = std::time::Instant::now() + GRAPHITE_TIMEOUT;
-        loop {
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    if status.success()
-                        && let Some(mut stdout) = child.stdout.take()
-                    {
-                        let mut buf = String::new();
-                        if std::io::Read::read_to_string(&mut stdout, &mut buf).is_ok() {
-                            let parent = buf.trim().to_string();
-                            if !parent.is_empty() {
-                                return Some(parent);
-                            }
-                        }
-                    }
-                    break;
+        .ok()?;
+    let deadline = std::time::Instant::now() + GRAPHITE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if !status.success() {
+                    return None;
                 }
-                Ok(None) => {
-                    if std::time::Instant::now() >= deadline {
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        break;
-                    }
-                    std::thread::sleep(GRAPHITE_POLL_INTERVAL);
-                }
-                Err(_) => {
+                let mut stdout = child.stdout.take()?;
+                let mut buf = String::new();
+                std::io::Read::read_to_string(&mut stdout, &mut buf).ok()?;
+                let parent = buf.trim();
+                return (!parent.is_empty()).then(|| parent.to_string());
+            }
+            Ok(None) => {
+                if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
-                    break;
+                    return None;
                 }
+                std::thread::sleep(GRAPHITE_POLL_INTERVAL);
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
             }
         }
     }
+}
 
-    let repo = match Repository::open(repo_path) {
-        Ok(r) => r,
-        Err(_) => return None,
-    };
-
-    if let Some(branch) = remote_default_branch(&repo) {
-        return Some(branch);
-    }
-
-    find_common_base_branch(&repo)
+fn upstream_of(repo: &Repository, branch: &str) -> Option<String> {
+    let local = repo.find_branch(branch, git2::BranchType::Local).ok()?;
+    let upstream = local.upstream().ok()?;
+    upstream.name().ok().flatten().map(str::to_string)
 }
 
 fn read_untracked_lines(path: &Path) -> Option<Vec<DiffLine>> {
@@ -709,20 +818,6 @@ fn count_lines(path: &Path) -> std::io::Result<usize> {
     Ok(count + usize::from(has_bytes && !ends_with_newline))
 }
 
-fn resolve_base_branch(
-    repo: &Repository,
-    repo_path: &Path,
-    preferred: Option<&str>,
-) -> Option<String> {
-    if let Some(branch) = preferred
-        && branch_exists(repo, branch)
-    {
-        return Some(branch.to_string());
-    }
-
-    find_base_branch(repo_path)
-}
-
 fn remote_default_branch(repo: &Repository) -> Option<String> {
     let reference = repo.find_reference("refs/remotes/origin/HEAD").ok()?;
     let target = reference.symbolic_target()?;
@@ -747,63 +842,52 @@ fn branch_exists(repo: &Repository, branch: &str) -> bool {
             .is_ok()
 }
 
-fn branch_diff_spec(repo: &Repository, base_branch: &str) -> Result<DiffSpec> {
+/// Fork point of `base_ref` and HEAD → HEAD, or → the working tree unless `commits_only`.
+fn branch_diff_spec(repo: &Repository, base_ref: &str, commits_only: bool) -> Result<DiffSpec> {
     let head = repo.head()?.peel_to_commit()?;
-    let head_tree = head.tree()?.id();
-    let head_branch = repo
-        .head()
-        .ok()
-        .and_then(|h| h.shorthand().map(|s| s.to_string()));
-
-    // If we're on the same branch as the base (e.g. on master, base=master),
-    // try diffing against the remote tracking branch to show unpushed commits.
-    let is_same_branch = head_branch.as_deref() == Some(base_branch);
-
-    let base_commit = if is_same_branch {
-        // Try remote tracking branch (e.g. origin/master)
-        let remote_name = format!("origin/{}", base_branch);
-        match repo.find_branch(&remote_name, git2::BranchType::Remote) {
-            Ok(remote_ref) => remote_ref.get().peel_to_commit()?,
-            Err(_) => {
-                // No remote — nothing meaningful to diff against
-                return Ok(DiffSpec::TreeToTree {
-                    old_tree: head_tree,
-                    new_tree: head_tree,
-                });
-            }
-        }
-    } else {
-        // Prefer origin/<base> — it's almost always at or ahead of the rebase
-        // point, so merge-base will correctly find the fork point. Local <base>
-        // often lags behind after a rebase onto origin/<base>.
-        let remote_name = format!("origin/{}", base_branch);
-        if let Ok(remote_ref) = repo.find_branch(&remote_name, git2::BranchType::Remote) {
-            remote_ref.get().peel_to_commit()?
-        } else if let Ok(local_ref) = repo.find_branch(base_branch, git2::BranchType::Local) {
-            local_ref.get().peel_to_commit()?
-        } else {
-            anyhow::bail!("Branch '{}' not found", base_branch)
-        }
-    };
-
+    let base_commit = base_commit(repo, base_ref)?;
     let merge_base = repo.merge_base(base_commit.id(), head.id())?;
     let merge_base_tree = repo.find_commit(merge_base)?.tree()?.id();
 
-    Ok(DiffSpec::TreeToTree {
-        old_tree: merge_base_tree,
-        new_tree: head_tree,
-    })
+    if commits_only {
+        Ok(DiffSpec::TreeToTree {
+            old_tree: merge_base_tree,
+            new_tree: head.tree()?.id(),
+        })
+    } else {
+        Ok(DiffSpec::TreeToWorkdir {
+            old_tree: Some(merge_base_tree),
+        })
+    }
+}
+
+/// The commit `base_ref` names. Prefers `origin/<base_ref>`: it's almost always at or
+/// ahead of the rebase point, so merge-base finds the fork point, whereas the local
+/// branch often lags after a rebase onto origin. Falls back to whatever git can parse,
+/// so typed refs like `origin/main`, tags and SHAs work too.
+fn base_commit<'repo>(repo: &'repo Repository, base_ref: &str) -> Result<git2::Commit<'repo>> {
+    let remote_name = format!("origin/{base_ref}");
+    if let Ok(remote_ref) = repo.find_branch(&remote_name, git2::BranchType::Remote) {
+        return Ok(remote_ref.get().peel_to_commit()?);
+    }
+    if let Ok(local_ref) = repo.find_branch(base_ref, git2::BranchType::Local) {
+        return Ok(local_ref.get().peel_to_commit()?);
+    }
+    repo.revparse_single(base_ref)
+        .and_then(|object| object.peel_to_commit())
+        .with_context(|| format!("'{base_ref}' is not a branch, tag or commit"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        DiffMode, DiffSpec, MAX_UNTRACKED_FILE_BYTES, MAX_UNTRACKED_LINES, PARALLEL_MIN_DELTAS,
-        build_diff, collect_files_parallel, collect_files_serial, collect_files_via_print,
-        compute_diff, count_lines, delta_path, read_untracked_lines,
+        Base, BaseCandidates, DiffMode, DiffSpec, MAX_UNTRACKED_FILE_BYTES, MAX_UNTRACKED_LINES,
+        PARALLEL_MIN_DELTAS, build_diff, collect_files_parallel, collect_files_serial,
+        collect_files_via_print, compute_diff, count_lines, delta_path, read_untracked_lines,
     };
     use crate::diff::{FileDiff, FileStatus, LineKind};
     use git2::Delta;
+    use std::path::Path;
 
     fn temp_path(name: &str) -> std::path::PathBuf {
         std::env::temp_dir().join(format!(
@@ -814,6 +898,226 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ))
+    }
+
+    /// Stage every path and commit the index; returns the new commit.
+    fn commit_all(repo: &git2::Repository, message: &str) -> git2::Oid {
+        let mut index = repo.index().unwrap();
+        index
+            .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+            .unwrap();
+        index.write().unwrap();
+        let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        let parent = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
+        let parents: Vec<&git2::Commit> = parent.iter().collect();
+        repo.commit(
+            Some("HEAD"),
+            &signature,
+            &signature,
+            message,
+            &tree,
+            &parents,
+        )
+        .unwrap()
+    }
+
+    fn statuses(files: &[FileDiff]) -> Vec<(String, FileStatus)> {
+        let mut out: Vec<(String, FileStatus)> = files
+            .iter()
+            .map(|file| (file.path.clone(), file.status))
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
+    #[test]
+    fn local_mode_merges_staged_unstaged_and_untracked_against_head() {
+        let root = temp_path("local-mode");
+        std::fs::create_dir(&root).unwrap();
+        let repo = git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("staged.txt"), "one\n").unwrap();
+        std::fs::write(root.join("unstaged.txt"), "one\n").unwrap();
+        std::fs::write(root.join("both.txt"), "one\ntwo\n").unwrap();
+        commit_all(&repo, "initial");
+
+        std::fs::write(root.join("staged.txt"), "one\nstaged\n").unwrap();
+        std::fs::write(root.join("both.txt"), "one\nstaged\n").unwrap();
+        let mut index = repo.index().unwrap();
+        index.add_path(Path::new("staged.txt")).unwrap();
+        index.add_path(Path::new("both.txt")).unwrap();
+        index.write().unwrap();
+        drop(index);
+        std::fs::write(root.join("unstaged.txt"), "one\nunstaged\n").unwrap();
+        std::fs::write(root.join("both.txt"), "one\nstaged\nunstaged\n").unwrap();
+        std::fs::write(root.join("untracked.txt"), "new\n").unwrap();
+        drop(repo);
+
+        let local = compute_diff(&root, &DiffMode::Local, None).unwrap();
+        let staged = compute_diff(&root, &DiffMode::Staged, None).unwrap();
+        let unstaged = compute_diff(&root, &DiffMode::Unstaged, None).unwrap();
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(
+            statuses(&local),
+            [
+                ("both.txt".to_string(), FileStatus::Modified),
+                ("staged.txt".to_string(), FileStatus::Modified),
+                ("unstaged.txt".to_string(), FileStatus::Modified),
+                ("untracked.txt".to_string(), FileStatus::Untracked),
+            ]
+        );
+        // The file edited in both places is one net diff against HEAD, not two hunks.
+        let both = local.iter().find(|f| f.path == "both.txt").unwrap();
+        assert_eq!((both.additions, both.deletions), (2, 1));
+        assert_eq!(both.total_new_lines, 3);
+        let untracked = local.iter().find(|f| f.path == "untracked.txt").unwrap();
+        assert_eq!(untracked.additions, 1);
+
+        assert_eq!(
+            statuses(&staged),
+            [
+                ("both.txt".to_string(), FileStatus::Modified),
+                ("staged.txt".to_string(), FileStatus::Modified),
+            ]
+        );
+        assert_eq!(
+            statuses(&unstaged),
+            [
+                ("both.txt".to_string(), FileStatus::Modified),
+                ("unstaged.txt".to_string(), FileStatus::Modified),
+                ("untracked.txt".to_string(), FileStatus::Untracked),
+            ]
+        );
+    }
+
+    #[test]
+    fn branch_mode_includes_uncommitted_work_unless_commits_only() {
+        let root = temp_path("branch-mode");
+        std::fs::create_dir(&root).unwrap();
+        let repo = git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("committed.txt"), "one\n").unwrap();
+        std::fs::write(root.join("dirty.txt"), "one\n").unwrap();
+        let base = commit_all(&repo, "initial");
+        repo.branch("main", &repo.find_commit(base).unwrap(), true)
+            .unwrap();
+        repo.branch("feature", &repo.find_commit(base).unwrap(), true)
+            .unwrap();
+        repo.set_head("refs/heads/feature").unwrap();
+
+        std::fs::write(root.join("committed.txt"), "one\ntwo\n").unwrap();
+        commit_all(&repo, "feature work");
+        std::fs::write(root.join("dirty.txt"), "one\nedited\n").unwrap();
+        std::fs::write(root.join("new.txt"), "brand new\n").unwrap();
+        drop(repo);
+
+        let bases = BaseCandidates {
+            parent: None,
+            trunk: Some("main".to_string()),
+            upstream: None,
+            branch: Some("feature".to_string()),
+        };
+        let with_local = DiffMode::Branch {
+            base: Base::Parent,
+            commits_only: false,
+        };
+        let commits_only = DiffMode::Branch {
+            base: Base::Parent,
+            commits_only: true,
+        };
+        let typed = DiffMode::Branch {
+            base: Base::Ref("main".to_string()),
+            commits_only: true,
+        };
+        let everything = compute_diff(&root, &with_local, Some(&bases)).unwrap();
+        let committed = compute_diff(&root, &commits_only, Some(&bases)).unwrap();
+        let via_ref = compute_diff(&root, &typed, Some(&bases)).unwrap();
+        let missing = compute_diff(
+            &root,
+            &DiffMode::Branch {
+                base: Base::Ref("nope".to_string()),
+                commits_only: true,
+            },
+            Some(&bases),
+        );
+        std::fs::remove_dir_all(&root).unwrap();
+
+        assert_eq!(
+            statuses(&everything),
+            [
+                ("committed.txt".to_string(), FileStatus::Modified),
+                ("dirty.txt".to_string(), FileStatus::Modified),
+                ("new.txt".to_string(), FileStatus::Untracked),
+            ]
+        );
+        assert_eq!(
+            statuses(&committed),
+            [("committed.txt".to_string(), FileStatus::Modified)]
+        );
+        assert_eq!(statuses(&via_ref), statuses(&committed));
+        assert!(missing.is_err(), "an unknown ref must surface as an error");
+    }
+
+    #[test]
+    fn base_resolution_prefers_parent_and_avoids_comparing_a_branch_with_itself() {
+        let stacked = BaseCandidates {
+            parent: Some("pr2".to_string()),
+            trunk: Some("main".to_string()),
+            upstream: Some("origin/pr3".to_string()),
+            branch: Some("pr3".to_string()),
+        };
+        assert_eq!(stacked.resolve(&Base::Parent).as_deref(), Some("pr2"));
+        assert_eq!(stacked.resolve(&Base::Trunk).as_deref(), Some("main"));
+        assert_eq!(
+            stacked.resolve(&Base::Upstream).as_deref(),
+            Some("origin/pr3")
+        );
+        assert_eq!(
+            stacked.resolve(&Base::Ref("v1".to_string())).as_deref(),
+            Some("v1")
+        );
+
+        let on_main = BaseCandidates {
+            parent: None,
+            trunk: Some("main".to_string()),
+            upstream: Some("origin/main".to_string()),
+            branch: Some("main".to_string()),
+        };
+        assert_eq!(
+            on_main.resolve(&Base::Parent).as_deref(),
+            Some("origin/main")
+        );
+        assert_eq!(
+            on_main.resolve(&Base::Trunk).as_deref(),
+            Some("origin/main")
+        );
+        assert_eq!(
+            on_main.resolve(&Base::Ref("main".to_string())).as_deref(),
+            Some("origin/main")
+        );
+
+        let unpushed_main = BaseCandidates {
+            trunk: Some("main".to_string()),
+            branch: Some("main".to_string()),
+            ..BaseCandidates::default()
+        };
+        assert_eq!(unpushed_main.resolve(&Base::Parent), None);
+        assert_eq!(
+            DiffMode::Branch {
+                base: Base::Parent,
+                commits_only: false
+            }
+            .label(&unpushed_main),
+            "Branch"
+        );
+        assert_eq!(
+            DiffMode::Branch {
+                base: Base::Trunk,
+                commits_only: true
+            }
+            .label(&stacked),
+            "vs main, commits only"
+        );
     }
 
     fn describe(files: &[FileDiff]) -> Vec<String> {
@@ -941,7 +1245,7 @@ mod tests {
         drop(repo);
 
         std::fs::write(&file_path, "first  \nsecond\t\t\n").unwrap();
-        let files = compute_diff(&repo_path, DiffMode::Unstaged, None).unwrap();
+        let files = compute_diff(&repo_path, &DiffMode::Unstaged, None).unwrap();
         let added_lines: Vec<&str> = files[0]
             .hunks
             .iter()

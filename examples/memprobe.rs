@@ -19,7 +19,7 @@ fn main() {
     println!("baseline {:.1} MB", rss_mb());
     for round in 1..=4 {
         for _ in 0..10 {
-            let _ = git::compute_diff(&repo, DiffMode::Unstaged, None).unwrap();
+            let _ = git::compute_diff(&repo, &DiffMode::Unstaged, None).unwrap();
         }
         println!(
             "same thread, {:>3} calls                {:7.1} MB",
@@ -32,7 +32,7 @@ fn main() {
             let repo = repo.clone();
             let (tx, rx) = std::sync::mpsc::channel();
             std::thread::spawn(move || {
-                let files = git::compute_diff(&repo, DiffMode::Unstaged, None).unwrap();
+                let files = git::compute_diff(&repo, &DiffMode::Unstaged, None).unwrap();
                 let _ = tx.send(files);
             });
             let files = rx.recv().unwrap();
@@ -48,7 +48,7 @@ fn main() {
         for _ in 0..10 {
             let repo = repo.clone();
             std::thread::spawn(move || {
-                let files = git::compute_diff(&repo, DiffMode::Unstaged, None).unwrap();
+                let files = git::compute_diff(&repo, &DiffMode::Unstaged, None).unwrap();
                 drop(files); // freed on the worker itself
             })
             .join()

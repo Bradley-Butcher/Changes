@@ -1,8 +1,8 @@
 use super::{
-    App, CommentBrowserState, DiffResult, FilePickerState, FlashState, MarkdownPreviewState,
-    RepoAdderState,
+    App, CommentBrowserState, CompareRow, DiffResult, FilePickerState, FlashState,
+    MarkdownPreviewState, RepoAdderState,
 };
-use crate::git::DiffMode;
+use crate::git::{Base, DiffMode};
 use crossterm::event::{self, KeyCode, KeyModifiers};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
@@ -90,13 +90,14 @@ fn handle_key_with_set_mode(
 
         // Mode switching
         KeyCode::Char('m') => {
-            set_mode(app, DiffMode::Unstaged);
-        }
-        KeyCode::Char('s') => {
-            set_mode(app, DiffMode::Staged);
+            set_mode(app, DiffMode::Local);
         }
         KeyCode::Char('b') => {
-            set_mode(app, DiffMode::Branch);
+            let mode = app.branch_mode();
+            set_mode(app, mode);
+        }
+        KeyCode::Char('B') => {
+            app.open_compare_picker();
         }
 
         // View toggle
@@ -334,6 +335,86 @@ pub fn handle_outline_key(app: &mut App, key: event::KeyEvent) -> bool {
         _ => return false,
     }
     true
+}
+
+/// Keys for the `B` popup. Returns a mode to switch to, which the caller applies; the
+/// popup itself stays open only for the commits-only checkbox.
+pub fn handle_compare_picker_key(app: &mut App, key: event::KeyEvent) -> Option<DiffMode> {
+    let rows = app.compare_rows();
+    let picker = app.compare_picker.as_mut()?;
+    let last = rows.len().saturating_sub(1);
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    match key.code {
+        KeyCode::Esc => {
+            app.compare_picker = None;
+            None
+        }
+        KeyCode::Up | KeyCode::BackTab => {
+            picker.selected = picker.selected.saturating_sub(1);
+            None
+        }
+        KeyCode::Down | KeyCode::Tab => {
+            picker.selected = (picker.selected + 1).min(last);
+            None
+        }
+        KeyCode::Char('p' | 'k') if ctrl => {
+            picker.selected = picker.selected.saturating_sub(1);
+            None
+        }
+        KeyCode::Char('n' | 'j') if ctrl => {
+            picker.selected = (picker.selected + 1).min(last);
+            None
+        }
+        KeyCode::Backspace => {
+            picker.query.pop();
+            None
+        }
+        KeyCode::Char(' ') if rows.get(picker.selected) != Some(&CompareRow::CustomRef) => {
+            toggle_commits_only(app)
+        }
+        KeyCode::Enter => {
+            let row = rows.get(picker.selected)?.clone();
+            let commits_only = app.repos[app.active_tab].commits_only;
+            let chosen = match row {
+                CompareRow::Base { base, .. } => Some(DiffMode::Branch { base, commits_only }),
+                CompareRow::Staged => Some(DiffMode::Staged),
+                CompareRow::Unstaged => Some(DiffMode::Unstaged),
+                CompareRow::CommitsOnly => return toggle_commits_only(app),
+                CompareRow::CustomRef => {
+                    let name = picker.query.trim().to_string();
+                    if name.is_empty() {
+                        return None;
+                    }
+                    Some(DiffMode::Branch {
+                        base: Base::Ref(name),
+                        commits_only,
+                    })
+                }
+            };
+            app.compare_picker = None;
+            chosen
+        }
+        KeyCode::Char(c) => {
+            picker.query.push(c);
+            picker.selected = last;
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Flip the commits-only checkbox. The picker stays open; when a branch comparison is
+/// already showing, it refreshes so the change is visible behind the popup.
+fn toggle_commits_only(app: &mut App) -> Option<DiffMode> {
+    let repo = &mut app.repos[app.active_tab];
+    repo.commits_only = !repo.commits_only;
+    match &repo.mode {
+        DiffMode::Branch { base, .. } => Some(DiffMode::Branch {
+            base: base.clone(),
+            commits_only: repo.commits_only,
+        }),
+        _ => None,
+    }
 }
 
 pub fn handle_file_picker_key(app: &mut App, key: event::KeyEvent) {
@@ -843,12 +924,12 @@ pub fn handle_comment_browser_key(app: &mut App, key: event::KeyEvent) {
 #[cfg(test)]
 mod tests {
     use super::{
-        MAX_MARKDOWN_PREVIEW_BYTES, handle_comment_browser_key, next_char_boundary,
-        previous_char_boundary, read_markdown_preview,
+        MAX_MARKDOWN_PREVIEW_BYTES, handle_comment_browser_key, handle_compare_picker_key,
+        next_char_boundary, previous_char_boundary, read_markdown_preview,
     };
-    use crate::app::{App, CommentBrowserState, HunkComment};
+    use crate::app::{App, CommentBrowserState, CompareRow, HunkComment};
     use crate::diff::{FileDiff, FileStatus};
-    use crate::git::RepoInfo;
+    use crate::git::{Base, BaseCandidates, DiffMode, RepoInfo};
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -994,5 +1075,150 @@ mod tests {
             .unwrap();
         assert!(read_markdown_preview(&path).is_err());
         std::fs::remove_file(path).unwrap();
+    }
+
+    fn stacked_app() -> App {
+        let mut app = App::new(vec![RepoInfo {
+            name: "repo".to_string(),
+            path: PathBuf::from("/repo"),
+        }]);
+        app.repos[0].bases = Some(BaseCandidates {
+            parent: Some("pr2".to_string()),
+            trunk: Some("main".to_string()),
+            upstream: Some("origin/pr3".to_string()),
+            branch: Some("pr3".to_string()),
+        });
+        app
+    }
+
+    fn key(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn compare_rows_list_each_distinct_base_once() {
+        let mut app = stacked_app();
+        let names: Vec<String> = app
+            .compare_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                CompareRow::Base { name, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["pr2", "main", "origin/pr3"]);
+
+        // On main, trunk and upstream both mean origin/main: one row, not two.
+        app.repos[0].bases = Some(BaseCandidates {
+            parent: None,
+            trunk: Some("main".to_string()),
+            upstream: Some("origin/main".to_string()),
+            branch: Some("main".to_string()),
+        });
+        let rows = app.compare_rows();
+        assert_eq!(
+            rows,
+            [
+                CompareRow::Base {
+                    base: Base::Trunk,
+                    name: "origin/main".to_string(),
+                    detail: "trunk",
+                },
+                CompareRow::Staged,
+                CompareRow::Unstaged,
+                CompareRow::CommitsOnly,
+                CompareRow::CustomRef,
+            ]
+        );
+    }
+
+    #[test]
+    fn compare_picker_selects_bases_and_remembers_commits_only() {
+        let mut app = stacked_app();
+        app.open_compare_picker();
+        assert_eq!(app.compare_picker.as_ref().unwrap().selected, 0);
+
+        // Down to trunk, Enter: a branch comparison with the working tree included.
+        assert_eq!(
+            handle_compare_picker_key(&mut app, key(KeyCode::Down)),
+            None
+        );
+        let chosen = handle_compare_picker_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(
+            chosen,
+            Some(DiffMode::Branch {
+                base: Base::Trunk,
+                commits_only: false,
+            })
+        );
+        assert!(
+            app.compare_picker.is_none(),
+            "choosing a base closes the popup"
+        );
+
+        // Reopen on the current base, tick commits only (stays open), pick parent.
+        app.repos[0].mode = chosen.unwrap();
+        app.open_compare_picker();
+        assert_eq!(app.compare_picker.as_ref().unwrap().selected, 1);
+        assert_eq!(
+            handle_compare_picker_key(&mut app, key(KeyCode::Char(' '))),
+            Some(DiffMode::Branch {
+                base: Base::Trunk,
+                commits_only: true
+            })
+        );
+        assert!(app.compare_picker.is_some());
+        assert!(app.repos[0].commits_only);
+        assert_eq!(handle_compare_picker_key(&mut app, key(KeyCode::Up)), None);
+        assert_eq!(
+            handle_compare_picker_key(&mut app, key(KeyCode::Enter)),
+            Some(DiffMode::Branch {
+                base: Base::Parent,
+                commits_only: true,
+            })
+        );
+        assert_eq!(
+            app.branch_mode(),
+            DiffMode::Branch {
+                base: Base::Parent,
+                commits_only: true,
+            },
+            "b keeps the commits-only choice"
+        );
+    }
+
+    #[test]
+    fn compare_picker_typing_targets_the_custom_ref_row() {
+        let mut app = stacked_app();
+        app.open_compare_picker();
+        for c in "v1.2".chars() {
+            assert_eq!(
+                handle_compare_picker_key(&mut app, key(KeyCode::Char(c))),
+                None
+            );
+        }
+        let rows = app.compare_rows();
+        assert_eq!(
+            app.compare_picker.as_ref().unwrap().selected,
+            rows.len() - 1
+        );
+        assert_eq!(
+            handle_compare_picker_key(&mut app, key(KeyCode::Enter)),
+            Some(DiffMode::Branch {
+                base: Base::Ref("v1.2".to_string()),
+                commits_only: false,
+            })
+        );
+
+        // An empty custom ref is not a comparison; Enter does nothing.
+        app.open_compare_picker();
+        app.compare_picker.as_mut().unwrap().selected = rows.len() - 1;
+        assert_eq!(
+            handle_compare_picker_key(&mut app, key(KeyCode::Enter)),
+            None
+        );
+        assert!(app.compare_picker.is_some());
+        assert_eq!(handle_compare_picker_key(&mut app, key(KeyCode::Esc)), None);
+        assert!(app.compare_picker.is_none());
     }
 }

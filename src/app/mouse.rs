@@ -1,4 +1,4 @@
-use super::{App, DOUBLE_CLICK_MS, DOUBLE_CLICK_SLOP, DiffResult, GapExpandResult, SCROLL_SPEED};
+use super::{App, DOUBLE_CLICK_MS, DOUBLE_CLICK_SLOP, GapExpandResult, SCROLL_SPEED};
 use crate::viewport::RowRef;
 use crossterm::event::{self, MouseButton, MouseEventKind};
 use std::time::{Duration, Instant};
@@ -27,37 +27,20 @@ impl GapSender {
 pub fn handle_mouse(
     app: &mut App,
     mouse: event::MouseEvent,
-    diff_tx: &mpsc::UnboundedSender<DiffResult>,
     gap_tx: &mpsc::UnboundedSender<GapExpandResult>,
 ) -> bool {
-    handle_mouse_with_senders(
-        app,
-        mouse,
-        |app, mode| app.set_mode(mode, diff_tx),
-        GapSender::Unbounded(gap_tx.clone()),
-    )
+    handle_mouse_with_sender(app, mouse, GapSender::Unbounded(gap_tx.clone()))
 }
 
 pub(crate) fn handle_mouse_bounded(
     app: &mut App,
     mouse: event::MouseEvent,
-    diff_tx: &mpsc::Sender<DiffResult>,
     gap_tx: &mpsc::Sender<GapExpandResult>,
 ) -> bool {
-    handle_mouse_with_senders(
-        app,
-        mouse,
-        |app, mode| app.set_mode_bounded(mode, diff_tx),
-        GapSender::Bounded(gap_tx.clone()),
-    )
+    handle_mouse_with_sender(app, mouse, GapSender::Bounded(gap_tx.clone()))
 }
 
-fn handle_mouse_with_senders(
-    app: &mut App,
-    mouse: event::MouseEvent,
-    mut set_mode: impl FnMut(&mut App, crate::git::DiffMode),
-    gap_tx: GapSender,
-) -> bool {
+fn handle_mouse_with_sender(app: &mut App, mouse: event::MouseEvent, gap_tx: GapSender) -> bool {
     // Scroll wheel in markdown preview
     if app.markdown_preview.is_some() {
         match mouse.kind {
@@ -145,8 +128,7 @@ fn handle_mouse_with_senders(
                 let (ms, me) = app.layout.mode_badge_pos;
                 let (vs, ve) = app.layout.view_badge_pos;
                 if click_col >= ms && click_col < me {
-                    let next = app.current_mode().next();
-                    set_mode(app, next);
+                    app.open_compare_picker();
                     return true;
                 }
                 if click_col >= vs && click_col < ve {
@@ -278,7 +260,6 @@ mod tests {
             anchor_row: 0,
         });
 
-        let (diff_tx, _diff_rx) = tokio::sync::mpsc::channel(1);
         let (gap_tx, _gap_rx) = tokio::sync::mpsc::channel(1);
         let click = MouseEvent {
             kind: MouseEventKind::Down(MouseButton::Left),
@@ -286,7 +267,7 @@ mod tests {
             row: 0,
             modifiers: KeyModifiers::NONE,
         };
-        assert!(!handle_mouse_bounded(&mut app, click, &diff_tx, &gap_tx));
+        assert!(!handle_mouse_bounded(&mut app, click, &gap_tx));
         assert_eq!(
             app.active_tab, 0,
             "a tab click must not switch repos mid-edit"

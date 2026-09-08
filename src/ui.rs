@@ -1,5 +1,6 @@
-use crate::app::App;
+use crate::app::{App, CompareRow};
 use crate::diff::{FileStatus, LineKind};
+use crate::git::{Base, BaseCandidates, DiffMode};
 use crate::highlight::Highlighter;
 use crate::outline::{self, CallDirection, OutlineRow, SymbolChange, hunk_context};
 use crate::viewport::{RowRef, chunk_end, side_by_side_gutter_width, side_by_side_pane_widths};
@@ -91,6 +92,8 @@ pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut
         draw_repo_adder(frame, app);
     } else if app.file_picker.is_some() {
         draw_file_picker(frame, app);
+    } else if app.compare_picker.is_some() {
+        draw_compare_picker(frame, app);
     } else if app.show_help {
         draw_help_overlay(frame);
     }
@@ -226,29 +229,14 @@ fn draw_empty_state(frame: &mut Frame, app: &App, area: Rect) {
     ];
 
     let repo = app.repos.get(app.active_tab);
-    let base = repo.and_then(|r| r.base_branch.as_deref());
     let loaded = repo.is_none_or(|r| r.loaded);
-    let (headline, hint) = match (app.current_mode(), base) {
-        _ if !loaded => (
+    let (headline, hint) = if loaded {
+        empty_state_text(app.current_mode(), &app.current_bases())
+    } else {
+        (
             "> computing diff ...".to_string(),
             "Reading the repository. Large repos can take a few seconds.",
-        ),
-        (crate::git::DiffMode::Unstaged, _) => (
-            "> I see no changes ... working tree clean".to_string(),
-            "Watching for edits. Press s for staged changes or b for the branch diff.",
-        ),
-        (crate::git::DiffMode::Staged, _) => (
-            "> nothing staged".to_string(),
-            "Press m to see unstaged changes or b for the branch diff.",
-        ),
-        (crate::git::DiffMode::Branch, Some(base)) => (
-            format!("> no changes vs {base}"),
-            "Press m to see unstaged changes or s for staged changes.",
-        ),
-        (crate::git::DiffMode::Branch, None) => (
-            "> base branch not detected".to_string(),
-            "No main/master branch or gt parent found. Press m for unstaged changes.",
-        ),
+        )
     };
     let watching = repo
         .map(|r| format!("watching {}", r.info.path.display()))
@@ -1413,8 +1401,8 @@ fn format_expand_indicator(gap: usize, numbers_width: usize) -> String {
 
 fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rect) {
     let repo = app.repos.get(app.active_tab);
-    let base = repo.and_then(|r| r.base_branch.as_deref());
-    let mode = app.current_mode().label(base);
+    let bases = app.current_bases();
+    let mode = app.current_mode().label(&bases);
     let view = if app.outline.is_some() {
         "outline"
     } else if app.side_by_side {
@@ -1423,9 +1411,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
         "unified"
     };
 
-    let branch_name = repo
-        .and_then(|r| r.branch_name.as_deref())
-        .unwrap_or("HEAD");
+    let branch_name = bases.branch.as_deref().unwrap_or("HEAD");
     let file_count = repo.map(|r| r.files.len()).unwrap_or(0);
     let note_count = repo.map(|r| r.comments.len()).unwrap_or(0);
     let (total_add, total_del): (usize, usize) = repo
@@ -1505,9 +1491,9 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
         Some((msg.clone(), Style::default().fg(FG_COMMENT)))
     } else if let Some(ref err) = app.last_error {
         Some((err.clone(), Style::default().fg(Color::Red)))
-    } else if app.current_mode() == crate::git::DiffMode::Branch && base.is_none() {
+    } else if !app.branch_base_resolved() {
         Some((
-            "base branch not detected — press m for unstaged".to_string(),
+            "nothing to compare against — press B to pick a base or m for local".to_string(),
             Style::default().fg(Color::Yellow),
         ))
     } else {
@@ -1531,7 +1517,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
                 ("j/k", "move"),
                 ("y", "copy outline"),
                 ("o", "full diff"),
-                ("m/s/b", "mode"),
+                ("m/b/B", "compare"),
                 ("f", "find"),
                 ("?", "help"),
                 ("q", "quit"),
@@ -1574,6 +1560,125 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
     let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_STATUS));
 
     frame.render_widget(status, area);
+}
+
+/// Headline and hint for a loaded diff with no files in it.
+fn empty_state_text(mode: &DiffMode, bases: &BaseCandidates) -> (String, &'static str) {
+    match mode {
+        DiffMode::Local => (
+            "> I see no changes ... working tree clean".to_string(),
+            "Watching for edits. Press b for the branch diff or B to pick what to compare.",
+        ),
+        DiffMode::Staged => (
+            "> nothing staged".to_string(),
+            "Press m for local changes or b for the branch diff.",
+        ),
+        DiffMode::Unstaged => (
+            "> no unstaged changes".to_string(),
+            "Press m for local changes or b for the branch diff.",
+        ),
+        DiffMode::Branch { base, commits_only } => match bases.resolve(base) {
+            Some(name) if *commits_only => (
+                format!("> no commits vs {name}"),
+                "Press B and untick commits only to include uncommitted work, or m for local changes.",
+            ),
+            Some(name) => (
+                format!("> no changes vs {name}"),
+                "Press m for local changes or B to compare against something else.",
+            ),
+            None => match base {
+                Base::Upstream => (
+                    format!(
+                        "> no upstream for {}",
+                        bases.branch.as_deref().unwrap_or("this branch")
+                    ),
+                    "Push the branch first, or press B to pick another base.",
+                ),
+                Base::Ref(name) => (
+                    format!("> {name} not found"),
+                    "Press B to pick another base.",
+                ),
+                Base::Parent | Base::Trunk => (
+                    "> base branch not detected".to_string(),
+                    "No main/master branch or gt parent found. Press B to type a ref, or m for local changes.",
+                ),
+            },
+        },
+    }
+}
+
+fn draw_compare_picker(frame: &mut Frame, app: &App) {
+    let Some(picker) = app.compare_picker.as_ref() else {
+        return;
+    };
+    let rows = app.compare_rows();
+    let current = app.current_mode();
+    let commits_only = app
+        .repos
+        .get(app.active_tab)
+        .is_some_and(|r| r.commits_only);
+
+    let area = frame.area();
+    let width = 62u16.min(area.width.saturating_sub(4));
+    let height = (rows.len() as u16 + 2).min(area.height.saturating_sub(4));
+    let x = (area.width.saturating_sub(width)) / 2;
+    let y = area.height.saturating_sub(height) / 3;
+    let popup_area = Rect::new(x, y, width, height);
+
+    frame.render_widget(Clear, popup_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Compare against  — ↑↓ move · ↵ select · Esc close ")
+        .style(Style::default().bg(BG_POPUP));
+    let inner = block.inner(popup_area);
+    frame.render_widget(block, popup_area);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (idx, row) in rows.iter().enumerate().take(inner.height as usize) {
+        let is_selected = idx == picker.selected;
+        let is_current = match (row, current) {
+            (CompareRow::Base { base, .. }, DiffMode::Branch { base: cur, .. }) => base == cur,
+            (CompareRow::Staged, DiffMode::Staged) | (CompareRow::Unstaged, DiffMode::Unstaged) => {
+                true
+            }
+            _ => false,
+        };
+        let marker = if is_current { "▸" } else { " " };
+        let (name, detail): (String, String) = match row {
+            CompareRow::Base { name, detail, .. } => (name.clone(), (*detail).to_string()),
+            CompareRow::Staged => ("Staged".to_string(), "index only".to_string()),
+            CompareRow::Unstaged => ("Unstaged".to_string(), "working tree vs index".to_string()),
+            CompareRow::CommitsOnly => (
+                format!("[{}] commits only", if commits_only { "x" } else { " " }),
+                "exclude uncommitted work".to_string(),
+            ),
+            CompareRow::CustomRef => (
+                format!("> {}_", picker.query),
+                if picker.query.is_empty() {
+                    "type a branch, tag or commit".to_string()
+                } else {
+                    "↵ compare against this ref".to_string()
+                },
+            ),
+        };
+        let name_width = 20usize;
+        let padded = format!(
+            " {marker} {name:<name_width$} {detail}",
+            name_width = name_width
+        );
+        let style = if is_selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::Rgb(100, 180, 255))
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::White).bg(BG_POPUP)
+        };
+        lines.push(Line::from(Span::styled(padded, style)));
+    }
+    let list = Paragraph::new(lines).style(Style::default().bg(BG_POPUP));
+    frame.render_widget(list, inner);
 }
 
 fn draw_file_picker(frame: &mut Frame, app: &App) {
@@ -1868,7 +1973,10 @@ fn help_section<'a>(title: &'a str, rows: &[(&'a str, &'a str)]) -> Vec<Line<'a>
     ))];
     for (key, action) in rows {
         lines.push(Line::from(vec![
-            Span::styled(format!("  {key:<14}"), Style::default().fg(Color::Yellow)),
+            Span::styled(
+                format!("  {key:<width$}", width = HELP_KEY_WIDTH - 2),
+                Style::default().fg(Color::Yellow),
+            ),
             Span::styled(*action, Style::default().fg(Color::White)),
         ]));
     }
@@ -1876,11 +1984,16 @@ fn help_section<'a>(title: &'a str, rows: &[(&'a str, &'a str)]) -> Vec<Line<'a>
     lines
 }
 
-fn draw_help_overlay(frame: &mut Frame) {
-    let area = frame.area();
+/// One help column: titled sections of (key, action) rows.
+type HelpColumn = &'static [(&'static str, &'static [(&'static str, &'static str)])];
 
-    let mut left: Vec<Line> = Vec::new();
-    left.extend(help_section(
+/// Width of one help column when two fit side by side.
+const HELP_COLUMN_WIDTH: u16 = 44;
+/// Columns the key label occupies in each row, including the two-space indent.
+const HELP_KEY_WIDTH: usize = 16;
+
+const HELP_LEFT: HelpColumn = &[
+    (
         "Navigation",
         &[
             ("j/k  ↑/↓", "Scroll one line"),
@@ -1893,17 +2006,19 @@ fn draw_help_overlay(frame: &mut Frame) {
             ("Enter", "Collapse / expand file"),
             ("c/e", "Collapse / expand all"),
         ],
-    ));
-    left.extend(help_section(
-        "Modes & views",
+    ),
+    (
+        "Compare & views",
         &[
-            ("m/s/b", "Modified / staged / branch"),
+            ("m", "Local: uncommitted vs HEAD"),
+            ("b", "Branch: all work vs base"),
+            ("B", "Pick what to compare against"),
             ("v", "Unified ↔ side-by-side"),
-            ("o", "Outline: files, symbols, callers"),
+            ("o", "Outline: files and symbols"),
             ("p", "Preview focused .md file"),
         ],
-    ));
-    left.extend(help_section(
+    ),
+    (
         "Repos",
         &[
             ("Tab/Shift+Tab", "Cycle tabs"),
@@ -1911,10 +2026,11 @@ fn draw_help_overlay(frame: &mut Frame) {
             ("a", "Add repo"),
             ("x", "Remove current tab"),
         ],
-    ));
+    ),
+];
 
-    let mut right: Vec<Line> = Vec::new();
-    right.extend(help_section(
+const HELP_RIGHT: HelpColumn = &[
+    (
         "Review",
         &[
             ("y", "Copy focused hunk"),
@@ -1924,8 +2040,8 @@ fn draw_help_overlay(frame: &mut Frame) {
             ("C", "Browse notes"),
             ("D", "Clear all notes"),
         ],
-    ));
-    right.extend(help_section(
+    ),
+    (
         "Mouse",
         &[
             ("Click", "Select hunk / toggle file"),
@@ -1933,23 +2049,37 @@ fn draw_help_overlay(frame: &mut Frame) {
             ("Right-click", "Add note to hunk"),
             ("Middle-click", "Copy focused hunk"),
             ("Click ↕ N", "Expand hidden lines"),
-            ("Click badge", "Cycle mode / view"),
+            ("Click badge", "Compare picker / cycle view"),
         ],
-    ));
-    right.extend(help_section(
+    ),
+    (
         "General",
         &[
             ("?", "Toggle this help"),
             ("Esc", "Close popup"),
             ("q  Ctrl+C", "Quit"),
         ],
-    ));
+    ),
+];
+
+fn help_column_lines(column: HelpColumn) -> Vec<Line<'static>> {
+    column
+        .iter()
+        .flat_map(|(title, rows)| help_section(title, rows))
+        .collect()
+}
+
+fn draw_help_overlay(frame: &mut Frame) {
+    let area = frame.area();
+
+    let left = help_column_lines(HELP_LEFT);
+    let mut right = help_column_lines(HELP_RIGHT);
     right.push(Line::from(Span::styled(
         "The ┃ gutter bar marks the hunk y / n act on.",
         Style::default().fg(FG_MUTED),
     )));
 
-    let column_width = 44u16;
+    let column_width = HELP_COLUMN_WIDTH;
     let two_columns = area.width >= column_width * 2 + 6;
     let (width, body): (u16, Vec<Line>) = if two_columns {
         let height = left.len().max(right.len());
@@ -2274,7 +2404,10 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{LayoutHints, chunk_end, draw, ranges_for_chunk};
+    use super::{
+        HELP_COLUMN_WIDTH, HELP_KEY_WIDTH, HELP_LEFT, HELP_RIGHT, LayoutHints, chunk_end, draw,
+        ranges_for_chunk,
+    };
     use crate::app::App;
     use crate::diff::{DiffLine, FileDiff, FileStatus, Hunk, LineKind, SideBySideLine};
     use crate::git::RepoInfo;
@@ -2282,6 +2415,7 @@ mod tests {
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use std::path::PathBuf;
+    use unicode_width::UnicodeWidthStr;
 
     #[test]
     fn wraps_on_utf8_display_width_boundaries() {
@@ -2424,5 +2558,23 @@ mod tests {
             screen.contains("ijkl"),
             "screen did not contain the right pane's final chunk: {screen:?}"
         );
+    }
+
+    #[test]
+    fn help_rows_fit_their_column() {
+        let key_budget = HELP_KEY_WIDTH - 2;
+        let action_budget = HELP_COLUMN_WIDTH as usize - HELP_KEY_WIDTH;
+        for (title, rows) in HELP_LEFT.iter().chain(HELP_RIGHT) {
+            for (key, action) in rows.iter() {
+                assert!(
+                    UnicodeWidthStr::width(*key) <= key_budget,
+                    "{title}: key {key:?} overflows its {key_budget} columns"
+                );
+                assert!(
+                    UnicodeWidthStr::width(*action) <= action_budget,
+                    "{title}: {action:?} is wider than {action_budget} columns and breaks the second column"
+                );
+            }
+        }
     }
 }

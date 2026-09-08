@@ -2,7 +2,7 @@ pub mod keys;
 pub mod mouse;
 
 use crate::diff::{DiffLine, FileDiff, LineKind};
-use crate::git::{self, DiffMode, RepoInfo};
+use crate::git::{self, Base, BaseCandidates, DiffMode, RepoInfo};
 use crate::outline::{self, OutlineRow};
 use crate::symbols::SymbolIndex;
 use crate::ui::LayoutHints;
@@ -77,8 +77,11 @@ pub struct RepoState {
     pub info: RepoInfo,
     pub mode: DiffMode,
     pub files: Vec<FileDiff>,
-    pub base_branch: Option<String>,
-    pub branch_name: Option<String>,
+    /// Branches this repo can be compared against; None until detection has run once.
+    pub bases: Option<BaseCandidates>,
+    /// Whether branch comparisons leave uncommitted work out. Remembered across mode
+    /// switches so `b` comes back to the same view the picker last set up.
+    pub commits_only: bool,
     pub unified_layout: Option<DiffLayout>,
     pub sbs_layout: Option<DiffLayout>,
     pub unified_viewport: ViewportState,
@@ -104,6 +107,30 @@ pub struct FlashState {
 pub struct FilePickerState {
     pub query: String,
     pub selected: usize,
+}
+
+/// The `B` popup: everything the active repo could be compared against.
+pub struct ComparePickerState {
+    pub selected: usize,
+    /// A ref being typed for the custom row.
+    pub query: String,
+}
+
+/// One line of the compare picker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompareRow {
+    /// A branch comparison, with the name `base` resolves to and a short reason to pick it.
+    Base {
+        base: Base,
+        name: String,
+        detail: &'static str,
+    },
+    Staged,
+    Unstaged,
+    /// The checkbox that leaves uncommitted work out of branch comparisons.
+    CommitsOnly,
+    /// Free-text ref entry.
+    CustomRef,
 }
 
 pub struct RepoAdderState {
@@ -153,6 +180,7 @@ pub struct App {
     pub status_message: Option<(String, Instant)>,
     pub show_help: bool,
     pub file_picker: Option<FilePickerState>,
+    pub compare_picker: Option<ComparePickerState>,
     pub repo_adder: Option<RepoAdderState>,
     pub comment_input: Option<CommentInputState>,
     pub comment_browser: Option<CommentBrowserState>,
@@ -174,10 +202,10 @@ impl App {
             .map(|(i, info)| RepoState {
                 id: i as u64,
                 info,
-                mode: DiffMode::Unstaged,
+                mode: DiffMode::Local,
                 files: Vec::new(),
-                base_branch: None,
-                branch_name: None,
+                bases: None,
+                commits_only: false,
                 unified_layout: None,
                 sbs_layout: None,
                 unified_viewport: ViewportState::default(),
@@ -214,6 +242,7 @@ impl App {
             status_message: None,
             show_help: false,
             file_picker: None,
+            compare_picker: None,
             repo_adder: None,
             comment_input: None,
             comment_browser: None,
@@ -227,8 +256,90 @@ impl App {
         }
     }
 
-    pub fn current_mode(&self) -> DiffMode {
-        self.repos[self.active_tab].mode
+    pub fn current_mode(&self) -> &DiffMode {
+        &self.repos[self.active_tab].mode
+    }
+
+    /// Detected bases for the active repo, empty until detection has run.
+    pub fn current_bases(&self) -> BaseCandidates {
+        self.repos[self.active_tab]
+            .bases
+            .clone()
+            .unwrap_or_default()
+    }
+
+    /// Whether the active repo's `DiffMode::Branch` has a base to compare against.
+    pub fn branch_base_resolved(&self) -> bool {
+        match self.current_mode() {
+            DiffMode::Branch { base, .. } => self.current_bases().resolve(base).is_some(),
+            _ => true,
+        }
+    }
+
+    /// The `b` view for the active repo: everything since the fork point with the stack
+    /// parent (or trunk), uncommitted work included unless the picker turned it off.
+    pub fn branch_mode(&self) -> DiffMode {
+        DiffMode::Branch {
+            base: Base::Parent,
+            commits_only: self.repos[self.active_tab].commits_only,
+        }
+    }
+
+    /// Rows for the compare picker, in display order. Bases that resolve to the same
+    /// branch appear once (on main, trunk and upstream are both `origin/main`).
+    pub fn compare_rows(&self) -> Vec<CompareRow> {
+        let bases = self.current_bases();
+        let mut rows: Vec<CompareRow> = Vec::new();
+        let mut seen: Vec<String> = Vec::new();
+        let mut push_base = |base: Base, detail: &'static str| {
+            let Some(name) = bases.resolve(&base) else {
+                return;
+            };
+            if seen.contains(&name) {
+                return;
+            }
+            seen.push(name.clone());
+            rows.push(CompareRow::Base { base, name, detail });
+        };
+        if bases.parent.is_some() {
+            push_base(Base::Parent, "stack parent");
+            push_base(Base::Trunk, "trunk, whole stack");
+        } else {
+            push_base(Base::Trunk, "trunk");
+        }
+        push_base(Base::Upstream, "upstream, unpushed");
+        rows.push(CompareRow::Staged);
+        rows.push(CompareRow::Unstaged);
+        rows.push(CompareRow::CommitsOnly);
+        rows.push(CompareRow::CustomRef);
+        rows
+    }
+
+    /// Open the `B` popup with the cursor on whatever is showing now. A typed ref that is
+    /// active comes back into the custom row so it can be edited rather than retyped.
+    pub fn open_compare_picker(&mut self) {
+        let rows = self.compare_rows();
+        let current = self.current_mode().clone();
+        let query = match &current {
+            DiffMode::Branch {
+                base: Base::Ref(name),
+                ..
+            } => name.clone(),
+            _ => String::new(),
+        };
+        let selected = rows
+            .iter()
+            .position(|row| match (row, &current) {
+                (CompareRow::Base { base, .. }, DiffMode::Branch { base: current, .. }) => {
+                    base == current
+                }
+                (CompareRow::CustomRef, _) => !query.is_empty(),
+                (CompareRow::Staged, DiffMode::Staged) => true,
+                (CompareRow::Unstaged, DiffMode::Unstaged) => true,
+                _ => false,
+            })
+            .unwrap_or(0);
+        self.compare_picker = Some(ComparePickerState { selected, query });
     }
 
     /// True while a popup owns the keyboard; mouse clicks on the diff are ignored then.
@@ -236,6 +347,7 @@ impl App {
         self.comment_input.is_some()
             || self.comment_browser.is_some()
             || self.file_picker.is_some()
+            || self.compare_picker.is_some()
             || self.repo_adder.is_some()
             || self.markdown_preview.is_some()
             || self.show_help
@@ -522,15 +634,23 @@ impl App {
     }
 
     pub fn set_mode(&mut self, mode: DiffMode, diff_tx: &mpsc::UnboundedSender<DiffResult>) {
+        self.remember_mode(&mode);
         self.repos[self.active_tab].mode = mode;
         self.refresh_repo_async(self.active_tab, diff_tx);
         self.jump_active_viewport_top();
     }
 
     pub(crate) fn set_mode_bounded(&mut self, mode: DiffMode, diff_tx: &mpsc::Sender<DiffResult>) {
+        self.remember_mode(&mode);
         self.repos[self.active_tab].mode = mode;
         self.refresh_repo_async_bounded(self.active_tab, diff_tx);
         self.jump_active_viewport_top();
+    }
+
+    fn remember_mode(&mut self, mode: &DiffMode) {
+        if let DiffMode::Branch { commits_only, .. } = mode {
+            self.repos[self.active_tab].commits_only = *commits_only;
+        }
     }
 
     pub fn toggle_view(&mut self) {
@@ -918,7 +1038,7 @@ impl App {
             file_idx,
             gap_idx,
             repo_path: repo.info.path.clone(),
-            mode: repo.mode,
+            mode: repo.mode.clone(),
             diff_file_path: file.path.clone(),
             gap_start,
             gap_end,
@@ -1073,10 +1193,10 @@ impl App {
                 name,
                 path: canonical,
             },
-            mode: DiffMode::Unstaged,
+            mode: DiffMode::Local,
             files: Vec::new(),
-            base_branch: None,
-            branch_name: None,
+            bases: None,
+            commits_only: false,
             unified_layout: None,
             sbs_layout: None,
             unified_viewport: ViewportState::default(),
@@ -1233,8 +1353,8 @@ impl App {
         let job = DiffJob {
             repo_id: id,
             path: repo.info.path.clone(),
-            mode: repo.mode,
-            base: repo.base_branch.clone(),
+            mode: repo.mode.clone(),
+            bases: repo.bases.clone(),
         };
         if let Some(worker) = &self.diff_worker
             && worker.submit(job.clone())
@@ -1321,11 +1441,11 @@ impl App {
         let repo = &self.repos[idx];
         let id = repo.id;
         let path = repo.info.path.clone();
-        let mode = repo.mode;
-        let base = repo.base_branch.clone();
+        let mode = repo.mode.clone();
+        let bases = repo.bases.clone();
         let tx = diff_tx.clone();
         std::thread::spawn(move || {
-            let result = git::compute_diff(&path, mode, base.as_deref());
+            let result = git::compute_diff(&path, &mode, bases.as_ref());
             let _ = tx.send(DiffResult {
                 repo_id: id,
                 mode,
@@ -1372,13 +1492,8 @@ impl App {
         let path = repo.info.path.clone();
         let tx = base_tx.clone();
         std::thread::spawn(move || {
-            let branch = git::find_base_branch(&path);
-            let branch_name = git::current_branch(&path);
-            let _ = tx.blocking_send(BaseBranchResult {
-                repo_id: id,
-                branch,
-                branch_name,
-            });
+            let bases = git::detect_bases(&path);
+            let _ = tx.blocking_send(BaseBranchResult { repo_id: id, bases });
         });
     }
 
@@ -1398,10 +1513,9 @@ impl App {
             .or_default()
             .complete();
         if !pending {
-            let changed = self.repos[idx].base_branch != result.branch;
-            self.repos[idx].base_branch = result.branch;
-            self.repos[idx].branch_name = result.branch_name;
-            if changed && self.repos[idx].mode == DiffMode::Branch {
+            let changed = self.repos[idx].bases.as_ref() != Some(&result.bases);
+            self.repos[idx].bases = Some(result.bases);
+            if changed && self.repos[idx].mode.is_branch() {
                 self.refresh_repo_async_bounded(idx, diff_tx);
             }
         } else {
@@ -1796,12 +1910,12 @@ struct DiffJob {
     repo_id: u64,
     path: PathBuf,
     mode: DiffMode,
-    base: Option<String>,
+    bases: Option<BaseCandidates>,
 }
 
 impl DiffJob {
     fn run(self) -> DiffResult {
-        let result = git::compute_diff(&self.path, self.mode, self.base.as_deref());
+        let result = git::compute_diff(&self.path, &self.mode, self.bases.as_ref());
         DiffResult {
             repo_id: self.repo_id,
             mode: self.mode,
@@ -1896,8 +2010,7 @@ impl IndexWorker {
 
 pub struct BaseBranchResult {
     pub repo_id: u64,
-    pub branch: Option<String>,
-    pub branch_name: Option<String>,
+    pub bases: BaseCandidates,
 }
 
 pub struct GapExpandRequest {
@@ -1929,7 +2042,7 @@ impl GapExpandRequest {
         let lines = git::read_new_side_lines(
             &self.repo_path,
             Path::new(&self.diff_file_path),
-            self.mode,
+            &self.mode,
             self.gap_start,
             self.gap_end,
         )
@@ -2086,7 +2199,7 @@ mod tests {
         let mut app = test_app_with_files(&[]);
         app.repos[0].info.path = root.clone();
         app.repos[0].mode = DiffMode::Staged;
-        let files = crate::git::compute_diff(&root, DiffMode::Staged, None).expect("diff");
+        let files = crate::git::compute_diff(&root, &DiffMode::Staged, None).expect("diff");
         app.apply_diff_result(0, Ok(files));
         assert_eq!(app.repos[0].files[0].total_new_lines, 10);
 
@@ -2328,7 +2441,7 @@ mod tests {
         let mut stale = test_app_with_files(&["stale.rs"]);
         let result = DiffResult {
             repo_id: app.repos[0].id,
-            mode: app.repos[0].mode,
+            mode: app.repos[0].mode.clone(),
             result: Ok(stale.repos.remove(0).files),
         };
 
