@@ -3,7 +3,8 @@
 //! lines, and it is derived purely from the diff text — no language servers involved.
 
 use crate::diff::{FileDiff, FileStatus, LineKind};
-use std::collections::BTreeMap;
+use crate::symbols::{DefKind, SymbolIndex};
+use std::collections::{BTreeMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolChange {
@@ -14,9 +15,20 @@ pub enum SymbolChange {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Symbol {
+    /// As shown: `fn parse`, `class Widget`, `## Install`.
     pub name: String,
     pub change: SymbolChange,
     pub hunk_idx: usize,
+    /// Bare identifier for function-like symbols, the key into the call index.
+    pub ident: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallDirection {
+    /// A place that calls the symbol.
+    Incoming,
+    /// Something the symbol calls.
+    Outgoing,
 }
 
 /// One rendered row of the outline. `depth` is the tree nesting level for indentation and
@@ -40,6 +52,7 @@ pub enum OutlineRow {
     Symbol {
         prefix: String,
         file_idx: usize,
+        path: String,
         symbol: Symbol,
     },
     /// Stands in for declarations beyond `MAX_SYMBOLS_PER_FILE`.
@@ -48,7 +61,38 @@ pub enum OutlineRow {
         file_idx: usize,
         count: usize,
     },
+    /// Caller / callee counts under a function symbol; Enter expands it.
+    Summary {
+        prefix: String,
+        file_idx: usize,
+        path: String,
+        ident: String,
+        callers: usize,
+        callees: usize,
+        warning: Option<String>,
+        expanded: bool,
+    },
+    /// One caller or callee of an expanded symbol.
+    Call {
+        prefix: String,
+        direction: CallDirection,
+        /// Qualified function name, e.g. `App::open_outline`.
+        name: String,
+        /// `path:line`, for display and for the "outside this diff" message.
+        location: String,
+        /// How this end of the edge relates to the diff, if at all.
+        mark: Option<SymbolChange>,
+        /// Set when the location is inside the diff and can be jumped to.
+        file_idx: Option<usize>,
+        hunk_idx: Option<usize>,
+        /// Owning symbol, so collapse works from any row of the tree.
+        parent: (usize, String),
+        parent_path: String,
+    },
 }
+
+/// Callers or callees listed per direction before "… N more".
+pub const MAX_CALLS_SHOWN: usize = 8;
 
 /// Long new files declare dozens of items; past this many the list stops adding signal.
 pub const MAX_SYMBOLS_PER_FILE: usize = 12;
@@ -67,12 +111,51 @@ impl OutlineRow {
                 file_idx, symbol, ..
             } => Some((*file_idx, Some(symbol.hunk_idx))),
             OutlineRow::More { file_idx, .. } => Some((*file_idx, None)),
+            OutlineRow::Summary { .. } => None,
+            OutlineRow::Call {
+                file_idx, hunk_idx, ..
+            } => file_idx.map(|file_idx| (file_idx, *hunk_idx)),
+        }
+    }
+
+    /// The (file index, identifier) of the function symbol this row belongs to.
+    pub fn symbol_index_key(&self) -> Option<(usize, &str)> {
+        match self {
+            OutlineRow::Symbol {
+                file_idx, symbol, ..
+            } => symbol.ident.as_deref().map(|ident| (*file_idx, ident)),
+            OutlineRow::Summary {
+                file_idx, ident, ..
+            } => Some((*file_idx, ident.as_str())),
+            OutlineRow::Call { parent, .. } => Some((parent.0, parent.1.as_str())),
+            _ => None,
+        }
+    }
+
+    /// Like `symbol_index_key` but keyed by path, stable across diff refreshes.
+    pub fn symbol_key(&self) -> Option<(&str, &str)> {
+        match self {
+            OutlineRow::Symbol { path, symbol, .. } => {
+                symbol.ident.as_deref().map(|ident| (path.as_str(), ident))
+            }
+            OutlineRow::Summary { path, ident, .. } => Some((path.as_str(), ident.as_str())),
+            OutlineRow::Call {
+                parent_path,
+                parent,
+                ..
+            } => Some((parent_path.as_str(), parent.1.as_str())),
+            _ => None,
         }
     }
 }
 
-/// Build the outline rows for a set of files.
-pub fn build_outline(files: &[FileDiff]) -> Vec<OutlineRow> {
+/// Build the outline rows for a set of files. With a symbol index, function symbols get a
+/// summary of their callers and callees, expanded for keys in `expanded`.
+pub fn build_outline(
+    files: &[FileDiff],
+    index: Option<&SymbolIndex>,
+    expanded: &HashSet<(String, String)>,
+) -> Vec<OutlineRow> {
     let mut root = DirNode::default();
     for (file_idx, file) in files.iter().enumerate() {
         let mut parts: Vec<&str> = file.path.split('/').collect();
@@ -85,9 +168,20 @@ pub fn build_outline(files: &[FileDiff]) -> Vec<OutlineRow> {
     }
     root.collapse_chains();
 
+    let context = Context {
+        files,
+        index,
+        expanded,
+    };
     let mut rows = Vec::new();
-    render_dir(&root, files, "", true, &mut rows);
+    render_dir(&root, &context, "", true, &mut rows);
     rows
+}
+
+struct Context<'a> {
+    files: &'a [FileDiff],
+    index: Option<&'a SymbolIndex>,
+    expanded: &'a HashSet<(String, String)>,
 }
 
 /// Markdown rendering of the outline, for pasting into an agent prompt or PR body.
@@ -125,6 +219,36 @@ pub fn outline_markdown(rows: &[OutlineRow]) -> String {
             }
             OutlineRow::More { prefix, count, .. } => {
                 out.push_str(&format!("{prefix}… {count} more\n"));
+            }
+            OutlineRow::Summary {
+                prefix,
+                callers,
+                callees,
+                warning,
+                ..
+            } => {
+                let text = match warning {
+                    Some(warning) => format!("⚠ {warning}"),
+                    None => format!("called by {callers} · calls {callees}"),
+                };
+                out.push_str(&format!("{prefix}{text}\n"));
+            }
+            OutlineRow::Call {
+                prefix,
+                direction,
+                name,
+                location,
+                mark,
+                ..
+            } => {
+                let arrow = match direction {
+                    CallDirection::Incoming => "←",
+                    CallDirection::Outgoing => "→",
+                };
+                let mark = mark
+                    .map(|m| format!("{} ", change_glyph(m)))
+                    .unwrap_or_default();
+                out.push_str(&format!("{prefix}{arrow} {mark}{name}  {location}\n"));
             }
         }
     }
@@ -187,11 +311,12 @@ impl DirNode {
 
 fn render_dir(
     node: &DirNode,
-    files: &[FileDiff],
+    context: &Context<'_>,
     prefix: &str,
     is_root: bool,
     rows: &mut Vec<OutlineRow>,
 ) {
+    let files = context.files;
     let dir_count = node.dirs.len();
     let total = dir_count + node.files.len();
     for (position, (name, child)) in node.dirs.iter().enumerate() {
@@ -204,7 +329,7 @@ fn render_dir(
             additions,
             deletions,
         });
-        render_dir(child, files, &child_prefix, false, rows);
+        render_dir(child, context, &child_prefix, false, rows);
     }
     for (position, (name, file_idx)) in node.files.iter().enumerate() {
         let last = dir_count + position + 1 == total;
@@ -223,12 +348,27 @@ fn render_dir(
         symbols.truncate(MAX_SYMBOLS_PER_FILE);
         let count = symbols.len() + usize::from(hidden > 0);
         for (position, symbol) in symbols.into_iter().enumerate() {
-            let (branch, _) = connectors(&child_prefix, position + 1 == count, false);
+            let is_last = position + 1 == count;
+            let (branch, symbol_prefix) = connectors(&child_prefix, is_last, false);
+            let ident = symbol.ident.clone();
+            let change = symbol.change;
             rows.push(OutlineRow::Symbol {
                 prefix: branch,
                 file_idx: *file_idx,
+                path: file.path.clone(),
                 symbol,
             });
+            if let (Some(index), Some(ident)) = (context.index, ident) {
+                push_call_rows(
+                    rows,
+                    context,
+                    index,
+                    *file_idx,
+                    &ident,
+                    change,
+                    &symbol_prefix,
+                );
+            }
         }
         if hidden > 0 {
             let (branch, _) = connectors(&child_prefix, true, false);
@@ -239,6 +379,223 @@ fn render_dir(
             });
         }
     }
+}
+
+/// Summary line plus, when expanded, the callers and callees of one function symbol.
+fn push_call_rows(
+    rows: &mut Vec<OutlineRow>,
+    context: &Context<'_>,
+    index: &SymbolIndex,
+    file_idx: usize,
+    ident: &str,
+    change: SymbolChange,
+    prefix: &str,
+) {
+    let file = &context.files[file_idx];
+    // Removed functions have no definition left; their remaining callers still matter.
+    let def = index
+        .defs_named(ident, &file.path)
+        .into_iter()
+        .find(|def| def.kind == DefKind::Function)
+        .cloned();
+    let callers = index.callers(ident, &file.path, def.as_ref());
+    let callees = def
+        .as_ref()
+        .map(|def| index.callees(def))
+        .unwrap_or_default();
+    if def.is_none() && callers.is_empty() {
+        return; // unknown to the index (unsupported language, or only in the old tree)
+    }
+
+    let warning = match change {
+        SymbolChange::Added if callers.is_empty() && !is_entry_point(ident, &file.path) => {
+            Some("no callers".to_string())
+        }
+        SymbolChange::Removed if !callers.is_empty() => {
+            Some(format!("still called by {}", callers.len()))
+        }
+        _ => None,
+    };
+    let expanded = context
+        .expanded
+        .contains(&(file.path.clone(), ident.to_string()));
+    let (branch, tree_prefix) = connectors(prefix, true, false);
+    rows.push(OutlineRow::Summary {
+        prefix: branch,
+        file_idx,
+        path: file.path.clone(),
+        ident: ident.to_string(),
+        callers: callers.len(),
+        callees: callees.len(),
+        warning,
+        expanded,
+    });
+    if !expanded {
+        return;
+    }
+
+    let parent = (file_idx, ident.to_string());
+    let shown_callers = callers.len().min(MAX_CALLS_SHOWN);
+    let shown_callees = callees.len().min(MAX_CALLS_SHOWN);
+    let total = shown_callers
+        + usize::from(callers.len() > shown_callers)
+        + shown_callees
+        + usize::from(callees.len() > shown_callees);
+    let mut position = 0usize;
+    let mut next_branch = |rows: &mut Vec<OutlineRow>, row: OutlineRow| {
+        position += 1;
+        let (branch, _) = connectors(&tree_prefix, position == total, false);
+        rows.push(match row {
+            OutlineRow::Call {
+                direction,
+                name,
+                location,
+                mark,
+                file_idx,
+                hunk_idx,
+                parent,
+                parent_path,
+                ..
+            } => OutlineRow::Call {
+                prefix: branch,
+                direction,
+                name,
+                location,
+                mark,
+                file_idx,
+                hunk_idx,
+                parent,
+                parent_path,
+            },
+            OutlineRow::More {
+                file_idx, count, ..
+            } => OutlineRow::More {
+                prefix: branch,
+                file_idx,
+                count,
+            },
+            other => other,
+        });
+    };
+
+    for caller in callers.iter().take(shown_callers) {
+        let (target_file, hunk_idx, mark) = locate_in_diff(
+            context.files,
+            &caller.path,
+            caller.line,
+            caller.from_name.as_deref(),
+        );
+        next_branch(
+            rows,
+            OutlineRow::Call {
+                prefix: String::new(),
+                direction: CallDirection::Incoming,
+                name: caller
+                    .from
+                    .clone()
+                    .unwrap_or_else(|| "(top level)".to_string()),
+                location: format!("{}:{}", caller.path, caller.line),
+                mark,
+                file_idx: target_file,
+                hunk_idx,
+                parent: parent.clone(),
+                parent_path: file.path.clone(),
+            },
+        );
+    }
+    if callers.len() > shown_callers {
+        next_branch(
+            rows,
+            OutlineRow::More {
+                prefix: String::new(),
+                file_idx,
+                count: callers.len() - shown_callers,
+            },
+        );
+    }
+    for (name, targets) in callees.iter().take(shown_callees) {
+        let target = targets[0];
+        let (target_file, hunk_idx, mark) =
+            locate_in_diff(context.files, &target.path, target.line, Some(name));
+        let mut display = target.display.clone();
+        if targets.len() > 1 {
+            display.push_str(&format!(" (+{} more definitions)", targets.len() - 1));
+        }
+        next_branch(
+            rows,
+            OutlineRow::Call {
+                prefix: String::new(),
+                direction: CallDirection::Outgoing,
+                name: display,
+                location: format!("{}:{}", target.path, target.line),
+                mark,
+                file_idx: target_file,
+                hunk_idx,
+                parent: parent.clone(),
+                parent_path: file.path.clone(),
+            },
+        );
+    }
+    if callees.len() > shown_callees {
+        next_branch(
+            rows,
+            OutlineRow::More {
+                prefix: String::new(),
+                file_idx,
+                count: callees.len() - shown_callees,
+            },
+        );
+    }
+}
+
+/// Functions nobody is expected to call: program entry points and tests.
+fn is_entry_point(ident: &str, path: &str) -> bool {
+    ident == "main"
+        || ident.starts_with("test_")
+        || path.contains("/tests/")
+        || path.starts_with("tests/")
+        || path.ends_with("_test.go")
+        || path.ends_with(".test.ts")
+        || path.ends_with(".test.js")
+        || path.ends_with(".spec.ts")
+        || path.ends_with(".spec.js")
+}
+
+/// Where a `path:line` from the index sits in the diff: the file index and the hunk that
+/// contains the line, plus how the diff touched it. `+` when that very line was added,
+/// `~` when the enclosing function `ident` is one of the file's changed symbols.
+fn locate_in_diff(
+    files: &[FileDiff],
+    path: &str,
+    line: u32,
+    ident: Option<&str>,
+) -> (Option<usize>, Option<usize>, Option<SymbolChange>) {
+    let Some((file_idx, file)) = files.iter().enumerate().find(|(_, f)| f.path == path) else {
+        return (None, None, None);
+    };
+    let mut containing_hunk = None;
+    let mut line_added = false;
+    for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+        for diff_line in &hunk.lines {
+            if diff_line.new_lineno == Some(line) {
+                containing_hunk = Some(hunk_idx);
+                line_added = diff_line.kind == LineKind::Addition;
+            }
+        }
+    }
+    let symbol_change = ident.and_then(|ident| {
+        file_symbols(file)
+            .into_iter()
+            .find(|symbol| symbol.ident.as_deref() == Some(ident))
+            .map(|symbol| (symbol.change, symbol.hunk_idx))
+    });
+    let mark = if line_added {
+        Some(SymbolChange::Added)
+    } else {
+        symbol_change.map(|(change, _)| change)
+    };
+    let hunk_idx = containing_hunk.or(symbol_change.map(|(_, hunk_idx)| hunk_idx));
+    (Some(file_idx), hunk_idx, mark)
 }
 
 /// Tree connectors: the branch drawn before this entry, and the prefix its children get.
@@ -271,10 +628,12 @@ pub fn file_symbols(file: &FileDiff) -> Vec<Symbol> {
             }
             return;
         }
+        let ident = function_ident(&name);
         symbols.push(Symbol {
             name,
             change,
             hunk_idx,
+            ident,
         });
     };
 
@@ -337,6 +696,19 @@ pub fn file_symbols(file: &FileDiff) -> Vec<Symbol> {
         }
     }
     symbols
+}
+
+/// The bare identifier of a function-like symbol name (`fn parse` → `parse`, Go method
+/// `Start` → `Start`); None for types, impls, headings, and prose contexts.
+fn function_ident(name: &str) -> Option<String> {
+    match name.split_once(' ') {
+        Some((keyword, rest)) => {
+            matches!(keyword, "fn" | "def" | "func" | "function" | "macro_rules!")
+                .then(|| rest.to_string())
+        }
+        None if name.starts_with('#') || name.contains('…') => None,
+        None => Some(name.to_string()),
+    }
 }
 
 fn is_markdown_path(path: &str) -> bool {
@@ -532,6 +904,7 @@ mod tests {
         outline_markdown,
     };
     use crate::diff::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
+    use std::collections::HashSet;
 
     fn line(kind: LineKind, content: &str) -> DiffLine {
         DiffLine {
@@ -741,7 +1114,7 @@ mod tests {
             file("README.md", FileStatus::Modified, vec![]),
             file("docs/guide/intro.md", FileStatus::Added, vec![]),
         ];
-        let rows = build_outline(&files);
+        let rows = build_outline(&files, None, &HashSet::new());
         let rendered: Vec<String> = rows
             .iter()
             .map(|row| match row {
@@ -749,6 +1122,7 @@ mod tests {
                 OutlineRow::File { prefix, name, .. } => format!("{prefix}{name}"),
                 OutlineRow::Symbol { prefix, symbol, .. } => format!("{prefix}{}", symbol.name),
                 OutlineRow::More { prefix, count, .. } => format!("{prefix}… {count} more"),
+                other => panic!("unexpected row without an index: {other:?}"),
             })
             .collect();
         assert_eq!(

@@ -15,6 +15,7 @@ I built this because I use lazygit — and it's great for git operations, but no
 It's also agent-agnostic. You shouldn't have to use a specific app or IDE just to get a good diff viewer — reviewing changes and running agents are two separate concerns. `changes` works with whatever you use: Claude Code, Codex, Cursor, Copilot, aider, or a shell script that calls `sed`. If it writes to files in a git repo, you can see the diff.
 
 - **Outline view** — press `o` for the shape of the change: a file tree with `+/-` counts and the functions, types and classes each hunk adds, removes or touches. Big diffs open here first
+- **Callers and callees** — every changed function shows who calls it and what it calls, resolved with tree-sitter across the whole repo (Rust, Python, Go, JS/TS). New functions nobody calls and deleted functions that are still called are flagged
 - **Multi-repo tabs** — watch agent changes across repos simultaneously
 - **Three diff modes** — unstaged, staged, or branch diff (vs main / parent branch)
 - **Annotate hunks** — right-click to add review comments, `Y` to copy all as markdown for your agent
@@ -107,7 +108,7 @@ The `┃` gutter bar marks the hunk that `y` / `n` / `N` act on. Click a hunk or
 |-----|--------|
 | `m` / `s` / `b` | Switch mode: modified, staged, branch diff |
 | `v` | Toggle unified / side-by-side view |
-| `o` | Outline: file tree + changed symbols (`Enter` opens, `y` copies as markdown) |
+| `o` | Outline: file tree + changed symbols (`Enter` opens, `→`/`←` show/hide callers and callees, `y` copies as markdown) |
 | `j` / `k`, `Ctrl+D` / `Ctrl+U`, `PgDn` / `PgUp` | Scroll by line, half page, page |
 | `g` / `G` | Jump to top / bottom |
 | `]` / `[` | Next / previous hunk |

@@ -4,10 +4,12 @@ pub mod mouse;
 use crate::diff::{DiffLine, FileDiff, LineKind};
 use crate::git::{self, DiffMode, RepoInfo};
 use crate::outline::{self, OutlineRow};
+use crate::symbols::SymbolIndex;
 use crate::ui::LayoutHints;
 use crate::viewport::{DiffLayout, RowRef, ViewKind, ViewportState};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::mpsc;
 
@@ -84,6 +86,11 @@ pub struct RepoState {
     pub comments: Vec<HunkComment>,
     /// False until the first diff computation for this repo has finished (or failed).
     pub loaded: bool,
+    /// Call-site index of the working tree, built in the background; None until ready.
+    pub symbols: Option<Arc<SymbolIndex>>,
+    index_in_flight: bool,
+    /// Paths to re-index once the in-flight job finishes; `Some(empty)` means everything.
+    index_pending: Option<Vec<String>>,
     diff_generation: u64,
     pending_gap_expansions: std::collections::HashSet<GapExpansionKey>,
 }
@@ -119,6 +126,8 @@ pub struct OutlineState {
     /// Index into `rows`; always a selectable row when any exist.
     pub selected: usize,
     pub scroll: usize,
+    /// Symbols whose callers and callees are shown, keyed by (file path, identifier).
+    pub expanded: std::collections::HashSet<(String, String)>,
 }
 
 /// Diffs with at least this many files open in the outline first, so the shape of the
@@ -154,6 +163,7 @@ pub struct App {
     pub layout: LayoutHints,
     pub last_click: Option<(u16, u16, Instant)>,
     diff_worker: Option<DiffWorker>,
+    index_worker: Option<IndexWorker>,
 }
 
 impl App {
@@ -174,6 +184,9 @@ impl App {
                 sbs_viewport: ViewportState::default(),
                 comments: Vec::new(),
                 loaded: false,
+                symbols: None,
+                index_in_flight: false,
+                index_pending: None,
                 diff_generation: 0,
                 pending_gap_expansions: std::collections::HashSet::new(),
             })
@@ -210,6 +223,7 @@ impl App {
             layout: LayoutHints::default(),
             last_click: None,
             diff_worker: None,
+            index_worker: None,
         }
     }
 
@@ -259,16 +273,60 @@ impl App {
     // -- Outline (change shape) view --
 
     pub fn open_outline(&mut self) {
+        let expanded = self
+            .outline
+            .take()
+            .map(|state| state.expanded)
+            .unwrap_or_default();
         let rows = self
-            .current_files()
-            .map(|files| outline::build_outline(files))
+            .repos
+            .get(self.active_tab)
+            .map(|repo| outline::build_outline(&repo.files, repo.symbols.as_deref(), &expanded))
             .unwrap_or_default();
         let selected = rows.iter().position(OutlineRow::is_selectable).unwrap_or(0);
         self.outline = Some(OutlineState {
             rows,
             selected,
             scroll: 0,
+            expanded,
         });
+    }
+
+    /// Show or hide the callers and callees of the symbol the cursor is on.
+    pub fn outline_set_expanded(&mut self, expand: bool) {
+        let Some(state) = &self.outline else {
+            return;
+        };
+        let Some(key) = state
+            .rows
+            .get(state.selected)
+            .and_then(OutlineRow::symbol_key)
+            .map(|(path, ident)| (path.to_string(), ident.to_string()))
+        else {
+            return;
+        };
+        let Some(state) = &mut self.outline else {
+            return;
+        };
+        let changed = if expand {
+            state.expanded.insert(key.clone())
+        } else {
+            state.expanded.remove(&key)
+        };
+        if !changed {
+            return;
+        }
+        self.rebuild_outline();
+        // Land on the symbol row itself, which exists in either state.
+        if let Some(state) = &mut self.outline
+            && let Some(index) = state.rows.iter().position(|row| {
+                matches!(row, OutlineRow::Symbol { .. })
+                    && row.symbol_key() == Some((key.0.as_str(), key.1.as_str()))
+            })
+        {
+            state.selected = index;
+        }
+        self.keep_outline_selection_visible();
     }
 
     pub fn close_outline(&mut self) {
@@ -289,20 +347,36 @@ impl App {
             return;
         };
         let previous_target = state.rows.get(state.selected).and_then(OutlineRow::target);
+        let previous_key = state
+            .rows
+            .get(state.selected)
+            .and_then(OutlineRow::symbol_key)
+            .map(|(path, ident)| (path.to_string(), ident.to_string()));
         let previous_path = previous_target.and_then(|(file_idx, _)| {
             self.current_files()
                 .and_then(|files| files.get(file_idx))
                 .map(|file| file.path.clone())
         });
+        let previous_scroll = state.scroll;
         self.open_outline();
-        if let (Some(path), Some(state)) = (previous_path, &mut self.outline) {
-            let same_file = state.rows.iter().position(|row| {
-                matches!(row, OutlineRow::File { file_idx, .. }
-                    if self.repos[self.active_tab].files.get(*file_idx).is_some_and(|f| f.path == path))
+        let files = &self.repos[self.active_tab].files;
+        if let Some(state) = &mut self.outline {
+            let same_symbol = previous_key.as_ref().and_then(|key| {
+                state.rows.iter().position(|row| {
+                    matches!(row, OutlineRow::Symbol { .. })
+                        && row.symbol_key() == Some((key.0.as_str(), key.1.as_str()))
+                })
             });
-            if let Some(index) = same_file {
+            let same_file = previous_path.as_ref().and_then(|path| {
+                state.rows.iter().position(|row| {
+                    matches!(row, OutlineRow::File { file_idx, .. }
+                        if files.get(*file_idx).is_some_and(|f| &f.path == path))
+                })
+            });
+            if let Some(index) = same_symbol.or(same_file) {
                 state.selected = index;
             }
+            state.scroll = previous_scroll;
         }
         self.keep_outline_selection_visible();
     }
@@ -379,14 +453,29 @@ impl App {
         }
     }
 
-    /// Leave the outline and scroll the diff to the selected file or hunk.
+    /// Leave the outline and scroll the diff to the selected file or hunk. On a symbol's
+    /// summary row this expands or collapses its call tree instead.
     pub fn outline_jump(&mut self) {
-        let Some(target) = self
+        let selected_row = self
             .outline
             .as_ref()
-            .and_then(|state| state.rows.get(state.selected))
-            .and_then(OutlineRow::target)
-        else {
+            .and_then(|state| state.rows.get(state.selected).cloned());
+        match &selected_row {
+            Some(OutlineRow::Summary { expanded, .. }) => {
+                self.outline_set_expanded(!expanded);
+                return;
+            }
+            Some(OutlineRow::Call {
+                file_idx: None,
+                location,
+                ..
+            }) => {
+                self.set_status(format!("{location} is outside this diff"));
+                return;
+            }
+            _ => {}
+        }
+        let Some(target) = selected_row.as_ref().and_then(OutlineRow::target) else {
             return;
         };
         self.outline = None;
@@ -994,6 +1083,9 @@ impl App {
             sbs_viewport: ViewportState::default(),
             comments: Vec::new(),
             loaded: false,
+            symbols: None,
+            index_in_flight: false,
+            index_pending: None,
             diff_generation: 0,
             pending_gap_expansions: std::collections::HashSet::new(),
         });
@@ -1045,6 +1137,14 @@ impl App {
                     .collect();
 
                 let first_load = !was_loaded;
+                let mut changed_paths: Vec<String> = self.repos[idx]
+                    .files
+                    .iter()
+                    .chain(files.iter())
+                    .map(|file| file.path.clone())
+                    .collect();
+                changed_paths.sort();
+                changed_paths.dedup();
                 let mut new_files = files;
                 for file in &mut new_files {
                     if let Some(&collapsed) = old_collapsed.get(&file.path) {
@@ -1099,6 +1199,7 @@ impl App {
                         .unwrap_or(0);
                     repo.sbs_viewport.clamp_scroll(sbs_total, height);
                 }
+                self.request_index(idx, Some(changed_paths));
                 if idx == self.active_tab {
                     self.focused_file = self.focused_file_from_scroll();
                     let file_count = self.repos[idx].files.len();
@@ -1153,6 +1254,67 @@ impl App {
     /// left dirty across many per-thread arenas.
     pub fn attach_diff_worker(&mut self, results: mpsc::Sender<DiffResult>) {
         self.diff_worker = Some(DiffWorker::spawn(results));
+    }
+
+    pub fn attach_index_worker(&mut self, results: mpsc::Sender<IndexResult>) {
+        self.index_worker = Some(IndexWorker::spawn(results));
+    }
+
+    /// Ask for the symbol index of a repo to be (re)built in the background. `changed`
+    /// limits the work to those paths when an index already exists; `None` rebuilds all.
+    /// Requests that arrive while a job runs are merged and run once it finishes.
+    pub fn request_index(&mut self, idx: usize, changed: Option<Vec<String>>) {
+        let Some(worker) = &self.index_worker else {
+            return; // tests and headless use
+        };
+        let repo = &mut self.repos[idx];
+        let changed = match (&repo.symbols, changed) {
+            (Some(_), Some(paths)) => Some(paths),
+            _ => None,
+        };
+        if repo.index_in_flight {
+            repo.index_pending = match (repo.index_pending.take(), changed) {
+                (Some(mut pending), Some(paths)) if !pending.is_empty() => {
+                    pending.extend(paths);
+                    pending.sort();
+                    pending.dedup();
+                    Some(pending)
+                }
+                (None, Some(paths)) => Some(paths),
+                _ => Some(Vec::new()), // full rebuild wins
+            };
+            return;
+        }
+        let job = IndexJob {
+            repo_id: repo.id,
+            root: repo.info.path.clone(),
+            base: repo.symbols.clone(),
+            changed,
+        };
+        if worker.submit(job) {
+            repo.index_in_flight = true;
+        }
+    }
+
+    /// Store a finished index; returns true when the active tab's outline needs redrawing.
+    pub fn apply_index_result(&mut self, result: IndexResult) -> bool {
+        let Some(idx) = self.find_repo(result.repo_id) else {
+            return false;
+        };
+        {
+            let repo = &mut self.repos[idx];
+            repo.symbols = Some(result.index);
+            repo.index_in_flight = false;
+        }
+        if let Some(pending) = self.repos[idx].index_pending.take() {
+            let changed = (!pending.is_empty()).then_some(pending);
+            self.request_index(idx, changed);
+        }
+        if idx == self.active_tab && self.outline.is_some() {
+            self.rebuild_outline();
+            return true;
+        }
+        false
     }
 
     pub fn refresh_repo_async(&self, idx: usize, diff_tx: &mpsc::UnboundedSender<DiffResult>) {
@@ -1671,6 +1833,63 @@ impl DiffWorker {
 
     /// False if the worker thread has exited, so the caller can fall back.
     fn submit(&self, job: DiffJob) -> bool {
+        self.jobs.send(job).is_ok()
+    }
+}
+
+struct IndexJob {
+    repo_id: u64,
+    root: PathBuf,
+    base: Option<Arc<SymbolIndex>>,
+    /// Paths to re-parse against `base`; `None` means index the whole repository.
+    changed: Option<Vec<String>>,
+}
+
+pub struct IndexResult {
+    pub repo_id: u64,
+    pub index: Arc<SymbolIndex>,
+}
+
+impl IndexJob {
+    fn run(self) -> IndexResult {
+        let index = match (self.base, self.changed) {
+            (Some(base), Some(changed)) => base.with_updated_files(&self.root, &changed),
+            _ => {
+                let paths = git2::Repository::open(&self.root)
+                    .map(|repo| crate::symbols::indexable_paths(&repo))
+                    .unwrap_or_default();
+                SymbolIndex::build(&self.root, &paths)
+            }
+        };
+        IndexResult {
+            repo_id: self.repo_id,
+            index: Arc::new(index),
+        }
+    }
+}
+
+/// One long-lived thread that builds symbol indexes in submission order.
+struct IndexWorker {
+    jobs: std::sync::mpsc::Sender<IndexJob>,
+}
+
+impl IndexWorker {
+    fn spawn(results: mpsc::Sender<IndexResult>) -> Self {
+        let (jobs, inbox) = std::sync::mpsc::channel::<IndexJob>();
+        std::thread::Builder::new()
+            .name("index-worker".to_string())
+            .spawn(move || {
+                for job in inbox {
+                    if results.blocking_send(job.run()).is_err() {
+                        break;
+                    }
+                }
+            })
+            .expect("spawn index worker thread");
+        Self { jobs }
+    }
+
+    fn submit(&self, job: IndexJob) -> bool {
         self.jobs.send(job).is_ok()
     }
 }

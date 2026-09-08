@@ -1,4 +1,4 @@
-use crate::app::{App, BaseBranchResult, DiffResult, GapExpandResult};
+use crate::app::{App, BaseBranchResult, DiffResult, GapExpandResult, IndexResult};
 use crate::git;
 use crate::highlight::Highlighter;
 use crate::ui::{self, LayoutHints};
@@ -31,6 +31,7 @@ enum AppEvent {
     DiffDone(DiffResult),
     BaseBranch(BaseBranchResult),
     GapExpanded(GapExpandResult),
+    Indexed(IndexResult),
     Tick,
 }
 
@@ -43,6 +44,7 @@ struct Channels {
     base_tx: mpsc::Sender<BaseBranchResult>,
     gap_rx: mpsc::Receiver<GapExpandResult>,
     gap_tx: mpsc::Sender<GapExpandResult>,
+    index_rx: mpsc::Receiver<IndexResult>,
 }
 
 fn restore_terminal() {
@@ -92,6 +94,8 @@ pub async fn run(path: PathBuf) -> Result<()> {
     app.attach_diff_worker(diff_tx.clone());
     let (base_tx, base_rx) = mpsc::channel::<BaseBranchResult>(EVENT_CHANNEL_CAPACITY);
     let (gap_tx, gap_rx) = mpsc::channel::<GapExpandResult>(EVENT_CHANNEL_CAPACITY);
+    let (index_tx, index_rx) = mpsc::channel::<IndexResult>(EVENT_CHANNEL_CAPACITY);
+    app.attach_index_worker(index_tx);
 
     // Load every repo in the background so the first frame appears immediately, with the
     // active tab first so it fills in before the others.
@@ -112,6 +116,7 @@ pub async fn run(path: PathBuf) -> Result<()> {
         base_tx,
         gap_rx,
         gap_tx,
+        index_rx,
     };
 
     run_loop(
@@ -175,6 +180,7 @@ async fn run_loop(
             Some(ev) = ch.diff_rx.recv() => AppEvent::DiffDone(ev),
             Some(ev) = ch.base_rx.recv() => AppEvent::BaseBranch(ev),
             Some(ev) = ch.gap_rx.recv() => AppEvent::GapExpanded(ev),
+            Some(ev) = ch.index_rx.recv() => AppEvent::Indexed(ev),
             () = &mut tick_sleep => AppEvent::Tick,
         };
 
@@ -193,6 +199,8 @@ async fn run_loop(
                 AppEvent::BaseBranch(ev)
             } else if let Ok(ev) = ch.watch_rx.try_recv() {
                 AppEvent::FileChange(ev)
+            } else if let Ok(ev) = ch.index_rx.try_recv() {
+                AppEvent::Indexed(ev)
             } else {
                 break;
             };
@@ -316,6 +324,11 @@ fn handle_event(
         AppEvent::GapExpanded(result) => {
             app.apply_gap_expand(result);
             *needs_redraw = true;
+        }
+        AppEvent::Indexed(result) => {
+            if app.apply_index_result(result) {
+                *needs_redraw = true;
+            }
         }
         AppEvent::Tick => {
             let now = Instant::now();

@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::diff::{FileStatus, LineKind};
 use crate::highlight::Highlighter;
-use crate::outline::{self, OutlineRow, SymbolChange, hunk_context};
+use crate::outline::{self, CallDirection, OutlineRow, SymbolChange, hunk_context};
 use crate::viewport::{RowRef, chunk_end, side_by_side_gutter_width, side_by_side_pane_widths};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
@@ -328,9 +328,18 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
     let Some(state) = app.outline.as_ref() else {
         return;
     };
+    let indexing = app
+        .repos
+        .get(app.active_tab)
+        .is_some_and(|repo| repo.symbols.is_none());
+    let title = if indexing {
+        " Outline — ↵ open · y copy as markdown · o full diff · indexing calls… "
+    } else {
+        " Outline — ↵ open · →/← callers & callees · y copy as markdown · o full diff "
+    };
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Outline — ↵ open · j/k move · y copy as markdown · o full diff ")
+        .title(title)
         .title_style(Style::default().fg(FG_MUTED));
     let inner = block.inner(area);
     frame.render_widget(block, area);
@@ -431,6 +440,88 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
                 spans.push(Span::styled(
                     format!("… {count} more"),
                     with_bg(Style::default().fg(FG_MUTED).add_modifier(Modifier::ITALIC)),
+                ));
+                None
+            }
+            OutlineRow::Summary {
+                prefix,
+                callers,
+                callees,
+                warning,
+                expanded,
+                ..
+            } => {
+                spans.push(Span::styled(
+                    prefix.clone(),
+                    with_bg(Style::default().fg(FG_MUTED)),
+                ));
+                let caret = if *expanded { "▾ " } else { "▸ " };
+                spans.push(Span::styled(caret, with_bg(Style::default().fg(FG_MUTED))));
+                match warning {
+                    Some(warning) => {
+                        spans.push(Span::styled(
+                            format!("⚠ {warning}"),
+                            with_bg(
+                                Style::default()
+                                    .fg(FG_STATUS_M)
+                                    .add_modifier(Modifier::BOLD),
+                            ),
+                        ));
+                        spans.push(Span::styled(
+                            format!("  · calls {callees}"),
+                            with_bg(Style::default().fg(FG_MUTED)),
+                        ));
+                    }
+                    None => {
+                        spans.push(Span::styled(
+                            format!("called by {callers} · calls {callees}"),
+                            with_bg(Style::default().fg(FG_MUTED)),
+                        ));
+                    }
+                }
+                None
+            }
+            OutlineRow::Call {
+                prefix,
+                direction,
+                name,
+                location,
+                mark,
+                file_idx,
+                ..
+            } => {
+                spans.push(Span::styled(
+                    prefix.clone(),
+                    with_bg(Style::default().fg(FG_MUTED)),
+                ));
+                let arrow = match direction {
+                    CallDirection::Incoming => "← ",
+                    CallDirection::Outgoing => "→ ",
+                };
+                spans.push(Span::styled(arrow, with_bg(Style::default().fg(FG_HUNK))));
+                if let Some(mark) = mark {
+                    let color = match mark {
+                        SymbolChange::Added => FG_ADD,
+                        SymbolChange::Removed => FG_DEL,
+                        SymbolChange::Modified => FG_STATUS_M,
+                    };
+                    spans.push(Span::styled(
+                        format!("{} ", outline::change_glyph(*mark)),
+                        with_bg(Style::default().fg(color).add_modifier(Modifier::BOLD)),
+                    ));
+                }
+                let name_color = if file_idx.is_some() {
+                    Color::White
+                } else {
+                    FG_PATH_DIR
+                };
+                spans.push(Span::styled(
+                    name.clone(),
+                    with_bg(Style::default().fg(name_color)),
+                ));
+                spans.push(Span::styled(
+                    format!("  {location}"),
+                    with_bg(Style::default().fg(FG_MUTED)),
                 ));
                 None
             }
@@ -1808,7 +1899,7 @@ fn draw_help_overlay(frame: &mut Frame) {
         &[
             ("m/s/b", "Modified / staged / branch"),
             ("v", "Unified ↔ side-by-side"),
-            ("o", "Outline: files + changed symbols"),
+            ("o", "Outline: files, symbols, callers"),
             ("p", "Preview focused .md file"),
         ],
     ));

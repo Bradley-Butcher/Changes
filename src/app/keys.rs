@@ -325,6 +325,8 @@ pub fn handle_outline_key(app: &mut App, key: event::KeyEvent) -> bool {
         KeyCode::Char('g') | KeyCode::Home => app.outline_jump_to_end(false),
         KeyCode::Char('G') | KeyCode::End => app.outline_jump_to_end(true),
         KeyCode::Enter => app.outline_jump(),
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => app.outline_set_expanded(true),
+        KeyCode::Left | KeyCode::Char('h') => app.outline_set_expanded(false),
         KeyCode::Char('y') => match app.outline_markdown() {
             Some(text) => app.copy_to_clipboard(text, "change outline as markdown"),
             None => app.set_status("Nothing to copy"),
