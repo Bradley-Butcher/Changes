@@ -320,10 +320,14 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
         .repos
         .get(app.active_tab)
         .is_some_and(|repo| repo.symbols.is_none());
-    let title = if indexing {
-        " Outline — ↵ open · y copy as markdown · o full diff · indexing calls… "
-    } else {
-        " Outline — ↵ open · →/← expand callers & callees · y copy as markdown · o full diff "
+    let title = match (indexing, state.flow) {
+        (true, _) => " Outline — ↵ open · y copy as markdown · o full diff · indexing calls… ",
+        (false, true) => {
+            " Flow — routes from entry points to changed code · ↵ open · t file tree · y copy · o full diff "
+        }
+        (false, false) => {
+            " Outline — ↵ open · →/← callers & callees · t flow · y copy as markdown · o full diff "
+        }
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -478,10 +482,71 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
                     prefix.clone(),
                     with_bg(Style::default().fg(FG_MUTED)),
                 ));
+                let text = if *count > 0 {
+                    format!("{label} ({count})")
+                } else {
+                    label.to_string()
+                };
                 spans.push(Span::styled(
-                    format!("{label} ({count})"),
+                    text,
                     with_bg(Style::default().fg(FG_HUNK).add_modifier(Modifier::BOLD)),
                 ));
+                None
+            }
+            OutlineRow::Flow {
+                depth,
+                name,
+                location,
+                mark,
+                file_idx,
+                is_target,
+                warning,
+                ..
+            } => {
+                // Mark column first, then indentation by depth: the diff idiom.
+                let (glyph, glyph_color) = match mark {
+                    Some(SymbolChange::Added) => ("+", FG_ADD),
+                    Some(SymbolChange::Removed) => ("-", FG_DEL),
+                    Some(SymbolChange::Modified) => ("~", FG_STATUS_M),
+                    None => (" ", FG_MUTED),
+                };
+                spans.push(Span::styled(
+                    format!("{glyph} "),
+                    with_bg(
+                        Style::default()
+                            .fg(glyph_color)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                ));
+                spans.push(Span::styled("  ".repeat(*depth), with_bg(Style::default())));
+                let name_style = if *is_target {
+                    Style::default()
+                        .fg(if file_idx.is_some() {
+                            Color::White
+                        } else {
+                            FG_PATH_DIR
+                        })
+                        .add_modifier(Modifier::BOLD)
+                } else if mark.is_some() {
+                    Style::default().fg(Color::White)
+                } else {
+                    Style::default().fg(FG_PATH_DIR)
+                };
+                spans.push(Span::styled(name.clone(), with_bg(name_style)));
+                spans.push(Span::styled(
+                    format!("  {location}"),
+                    with_bg(Style::default().fg(FG_MUTED)),
+                ));
+                if let Some(warning) = warning {
+                    spans.push(Span::styled(
+                        format!("   ⚠ {warning}"),
+                        with_bg(
+                            Style::default()
+                                .fg(FG_STATUS_M)
+                                .add_modifier(Modifier::BOLD),
+                        ),
+                    ));
+                }
                 None
             }
             OutlineRow::Call {
@@ -546,8 +611,15 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from(spans));
     }
     if state.rows.is_empty() {
+        let text = if state.flow && indexing {
+            "  Indexing calls… the flow view appears when the index is ready"
+        } else if state.flow {
+            "  No changed functions the index can trace (unsupported language?)"
+        } else {
+            "  No changes to outline"
+        };
         lines.push(Line::from(Span::styled(
-            "  No changes to outline",
+            text,
             Style::default().fg(FG_MUTED),
         )));
     }
@@ -1593,8 +1665,8 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
         let hints_full: [(&str, &str); 8] = if app.outline.is_some() {
             [
                 ("↵", "open"),
-                ("j/k", "move"),
-                ("y", "copy outline"),
+                ("t", "flow/tree"),
+                ("y", "copy"),
                 ("o", "full diff"),
                 ("m/b/B", "compare"),
                 ("f", "find"),
@@ -2094,6 +2166,7 @@ const HELP_LEFT: HelpColumn = &[
             ("B", "Pick what to compare against"),
             ("v", "Unified ↔ side-by-side"),
             ("o", "Outline: files and symbols"),
+            ("t", "Flow view (in the outline)"),
             ("p", "Preview focused .md file"),
         ],
     ),

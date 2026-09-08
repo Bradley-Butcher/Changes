@@ -28,6 +28,9 @@ pub struct Def {
     /// The impl / class / module the definition sits in, when nested.
     pub container: Option<String>,
     pub kind: DefKind,
+    /// A test: `#[test]`, inside `mod tests`, `test_*`, or in a test file. Tests call
+    /// everything, so they are excluded from routes and from "no callers".
+    pub is_test: bool,
     pub path: String,
     /// 1-based line of the declaration.
     pub line: u32,
@@ -47,16 +50,27 @@ pub struct Call {
     /// The receiver type when the call site states it: `Foo` for `Foo::bar()`, the
     /// enclosing container for `self.bar()` / `this.bar()`. None for `x.bar()`.
     pub qualifier: Option<String>,
+    /// Written as a method call on some receiver (`x.bar()`), not a bare `bar()`.
+    pub is_method: bool,
 }
 
 impl Call {
-    /// Whether this call could target `def`, given what the call site says about the
-    /// receiver. A stated qualifier must match the definition's container.
+    /// Whether this call could target `def`, given what the call site says. A stated
+    /// receiver type must match the definition's container. A bare `bar()` never hits a
+    /// method, and in Rust or Go `x.bar()` never hits a free function; Python and
+    /// JavaScript allow `module.bar()`, so there an unknown receiver keeps both open.
     fn may_target(&self, def: &Def) -> bool {
         match (&self.qualifier, &def.container) {
             (Some(qualifier), Some(container)) => qualifier == container,
             (Some(_), None) => false,
-            (None, _) => true,
+            (None, Some(_)) => self.is_method,
+            (None, None) => {
+                !self.is_method
+                    || matches!(
+                        language_for_path(&self.path),
+                        Some(Lang::Python | Lang::JavaScript | Lang::TypeScript | Lang::Tsx)
+                    )
+            }
         }
     }
 }
@@ -77,7 +91,34 @@ pub struct Caller {
     pub from: Option<String>,
     /// Bare name of that function, for matching against the diff's symbols.
     pub from_name: Option<String>,
+    /// The call sits in a test function or test file.
+    pub from_test: bool,
 }
+
+/// One function on a route from an entry point down to a changed function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PathStep {
+    pub display: String,
+    /// Bare identifier; empty for top-level code outside any function.
+    pub name: String,
+    pub path: String,
+    pub line: u32,
+}
+
+/// A route from a root of the call graph (something nothing calls, or top-level code)
+/// down to a function, highest first. `complete` is false when the walk hit the depth
+/// limit before reaching a root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallPath {
+    pub steps: Vec<PathStep>,
+    pub complete: bool,
+}
+
+/// Longest route followed upward before giving up on reaching a root. Product routes
+/// through worker threads and dispatch layers are commonly ten deep.
+pub const MAX_PATH_DEPTH: usize = 12;
+/// Upper bound on call-graph nodes visited per function, so a hub cannot stall a build.
+const MAX_PATH_NODES: usize = 4_000;
 
 #[derive(Debug, Default, Clone)]
 pub struct SymbolIndex {
@@ -189,6 +230,7 @@ impl SymbolIndex {
                     line: call.line,
                     from: enclosing.map(|d| d.display.clone()),
                     from_name: enclosing.map(|d| d.name.clone()),
+                    from_test: enclosing.is_some_and(|d| d.is_test) || is_test_path(path),
                 })
             })
             .collect();
@@ -196,6 +238,124 @@ impl SymbolIndex {
             (a.path != def_path, &a.path, a.line).cmp(&(b.path != def_path, &b.path, b.line))
         });
         callers
+    }
+
+    /// Callers that are not tests.
+    pub fn production_callers(&self, name: &str, def_path: &str, def: Option<&Def>) -> Vec<Caller> {
+        self.callers(name, def_path, def)
+            .into_iter()
+            .filter(|caller| !caller.from_test)
+            .collect()
+    }
+
+    /// Distinct non-test functions containing calls that may target `def`, plus a
+    /// pseudo-step for top-level code. Excludes `def` itself.
+    fn calling_defs(&self, def: &Def) -> Vec<PathStep> {
+        let mut steps: Vec<PathStep> = Vec::new();
+        for caller in self.production_callers(&def.name, &def.path, Some(def)) {
+            let step = match &caller.from {
+                Some(from) => {
+                    let Some(enclosing) = self.files.get(&caller.path).and_then(|file| {
+                        file.defs.iter().find(|d| {
+                            d.display == *from && d.line <= caller.line && caller.line <= d.end_line
+                        })
+                    }) else {
+                        continue;
+                    };
+                    PathStep {
+                        display: enclosing.display.clone(),
+                        name: enclosing.name.clone(),
+                        path: enclosing.path.clone(),
+                        line: enclosing.line,
+                    }
+                }
+                None => PathStep {
+                    display: format!("top level of {}", caller.path),
+                    name: String::new(),
+                    path: caller.path.clone(),
+                    line: caller.line,
+                },
+            };
+            if !steps
+                .iter()
+                .any(|s| s.path == step.path && s.line == step.line)
+            {
+                steps.push(step);
+            }
+        }
+        steps
+    }
+
+    /// Routes from call-graph roots down to `def`, shortest first, at most `max_paths`.
+    /// A breadth-first walk over callers; cycles and hubs are bounded by a visited set
+    /// and `MAX_PATH_NODES`. With no complete route within `MAX_PATH_DEPTH`, the longest
+    /// partial routes are returned flagged incomplete.
+    pub fn paths_to_roots(&self, def: &Def, max_paths: usize) -> Vec<CallPath> {
+        use std::collections::VecDeque;
+        let start = PathStep {
+            display: def.display.clone(),
+            name: def.name.clone(),
+            path: def.path.clone(),
+            line: def.line,
+        };
+        // Chains are stored deepest-first (the changed function at index 0) and reversed
+        // on output so paths read highest → deepest.
+        let mut queue: VecDeque<Vec<PathStep>> = VecDeque::from([vec![start]]);
+        let mut visited: std::collections::HashSet<(String, u32)> =
+            std::collections::HashSet::from([(def.path.clone(), def.line)]);
+        let mut complete = Vec::new();
+        let mut partial = Vec::new();
+        let mut explored = 0usize;
+
+        while let Some(chain) = queue.pop_front() {
+            if complete.len() >= max_paths || explored > MAX_PATH_NODES {
+                break;
+            }
+            explored += 1;
+            let top = chain.last().expect("chains are never empty");
+            let callers = if top.name.is_empty() {
+                Vec::new() // top-level code is a root
+            } else {
+                let as_def = self.defs_named(&top.name, &top.path);
+                as_def
+                    .into_iter()
+                    .find(|d| d.path == top.path && d.line == top.line)
+                    .map(|d| self.calling_defs(d))
+                    .unwrap_or_default()
+            };
+            if callers.is_empty() {
+                let mut steps = chain.clone();
+                steps.reverse();
+                complete.push(CallPath {
+                    steps,
+                    complete: true,
+                });
+                continue;
+            }
+            if chain.len() >= MAX_PATH_DEPTH {
+                let mut steps = chain.clone();
+                steps.reverse();
+                partial.push(CallPath {
+                    steps,
+                    complete: false,
+                });
+                continue;
+            }
+            for caller in callers {
+                if !visited.insert((caller.path.clone(), caller.line)) {
+                    continue;
+                }
+                let mut next = chain.clone();
+                next.push(caller);
+                queue.push_back(next);
+            }
+        }
+        if complete.is_empty() {
+            partial.truncate(max_paths);
+            partial
+        } else {
+            complete
+        }
     }
 
     /// Names called from inside `def` that resolve to a definition in this index, in
@@ -472,14 +632,15 @@ fn parse_source(parsers: &mut Parsers, lang: Lang, path: &str, source: &[u8]) ->
     let capture_names = query.capture_names();
 
     let mut defs: Vec<Def> = Vec::new();
-    // name, line, byte offset, receiver qualifier
-    let mut raw_calls: Vec<(String, u32, usize, Qualifier)> = Vec::new();
+    // name, line, byte offset, receiver qualifier, written as a method call
+    let mut raw_calls: Vec<(String, u32, usize, Qualifier, bool)> = Vec::new();
     let mut cursor = QueryCursor::new();
     let mut matches = cursor.matches(query, tree.root_node(), source);
     while let Some(m) = matches.next() {
         let mut name: Option<&str> = None;
         let mut node: Option<(Node, &str)> = None;
         let mut qualifier = Qualifier::Unknown;
+        let mut is_method = false;
         for capture in m.captures() {
             if Some(capture.index) == name_capture {
                 name = capture.node.utf8_text(source).ok();
@@ -497,6 +658,7 @@ fn parse_source(parsers: &mut Parsers, lang: Lang, path: &str, source: &[u8]) ->
                     };
                 }
             } else if Some(capture.index) == receiver_capture {
+                is_method = true;
                 if let Ok(text) = capture.node.utf8_text(source) {
                     qualifier = match text {
                         "self" | "Self" | "this" | "cls" => Qualifier::SelfType,
@@ -516,7 +678,13 @@ fn parse_source(parsers: &mut Parsers, lang: Lang, path: &str, source: &[u8]) ->
         };
         let line = node.start_position().row as u32 + 1;
         match capture_name {
-            "call" => raw_calls.push((name.to_string(), line, node.start_byte(), qualifier)),
+            "call" => raw_calls.push((
+                name.to_string(),
+                line,
+                node.start_byte(),
+                qualifier,
+                is_method,
+            )),
             "def.function" | "def.type" => {
                 // Rust methods match both a method and a function pattern; keep one.
                 if defs
@@ -535,11 +703,16 @@ fn parse_source(parsers: &mut Parsers, lang: Lang, path: &str, source: &[u8]) ->
                     Some(container) => format!("{container}{}{name}", lang.separator()),
                     None => name.to_string(),
                 };
+                let is_test = is_test_path(path)
+                    || container.as_deref() == Some("tests")
+                    || name.starts_with("test_")
+                    || has_test_attribute(node, source);
                 defs.push(Def {
                     name: name.to_string(),
                     display,
                     container,
                     kind,
+                    is_test,
                     path: path.to_string(),
                     line,
                     end_line: node.end_position().row as u32 + 1,
@@ -556,10 +729,10 @@ fn parse_source(parsers: &mut Parsers, lang: Lang, path: &str, source: &[u8]) ->
         .into_iter()
         // `x.len()` on an unknown receiver is almost always the standard library, and
         // would otherwise link every collection call to any local method named `len`.
-        .filter(|(name, _, _, qualifier)| {
+        .filter(|(name, _, _, qualifier, _)| {
             !(matches!(qualifier, Qualifier::Unknown) && is_ubiquitous_method(name))
         })
-        .map(|(name, line, offset, qualifier)| {
+        .map(|(name, line, offset, qualifier, is_method)| {
             let enclosing = innermost_def(&defs, offset);
             let qualifier = match qualifier {
                 Qualifier::Named(name) => Some(name),
@@ -572,6 +745,7 @@ fn parse_source(parsers: &mut Parsers, lang: Lang, path: &str, source: &[u8]) ->
                 line,
                 enclosing,
                 qualifier,
+                is_method,
             }
         })
         .collect();
@@ -586,7 +760,7 @@ fn parse_source(parsers: &mut Parsers, lang: Lang, path: &str, source: &[u8]) ->
 /// Calls written inside a Rust macro invocation. tree-sitter parses `format!(...)` and
 /// friends as opaque token trees, so `name(`, `Type::name(` and `self.name(` are found by
 /// scanning the tokens in order.
-fn macro_body_calls(body: Node, source: &[u8]) -> Vec<(String, u32, usize, Qualifier)> {
+fn macro_body_calls(body: Node, source: &[u8]) -> Vec<(String, u32, usize, Qualifier, bool)> {
     let mut leaves: Vec<Node> = Vec::new();
     collect_leaves(body, &mut leaves);
     let text = |node: &Node| node.utf8_text(source).unwrap_or("");
@@ -618,14 +792,50 @@ fn macro_body_calls(body: Node, source: &[u8]) -> Vec<(String, u32, usize, Quali
             (Some("."), Some(receiver)) if receiver.kind() == "self" => Qualifier::SelfType,
             _ => Qualifier::Unknown,
         };
+        let is_method = leaves.get(i.wrapping_sub(1)).map(|n| n.kind()) == Some(".");
         calls.push((
             name.to_string(),
             leaf.start_position().row as u32 + 1,
             leaf.start_byte(),
             qualifier,
+            is_method,
         ));
     }
     calls
+}
+
+/// Rust `#[test]` / `#[tokio::test]` (or any `..._test]`) attribute directly above a
+/// function item.
+fn has_test_attribute(node: Node, source: &[u8]) -> bool {
+    let mut previous = node.prev_sibling();
+    while let Some(sibling) = previous {
+        if sibling.kind() != "attribute_item" {
+            break;
+        }
+        let text = sibling.utf8_text(source).unwrap_or("");
+        if text.contains("test]") || text.contains("test(") || text.starts_with("#[cfg(test)") {
+            return true;
+        }
+        previous = sibling.prev_sibling();
+    }
+    false
+}
+
+/// Test files by convention across the supported languages.
+pub fn is_test_path(path: &str) -> bool {
+    let file = path.rsplit('/').next().unwrap_or(path);
+    path.starts_with("tests/")
+        || path.contains("/tests/")
+        || path.contains("/test/")
+        || path.contains("/__tests__/")
+        || file.starts_with("test_")
+        || file.ends_with("_test.py")
+        || file.ends_with("_test.go")
+        || file.ends_with(".test.ts")
+        || file.ends_with(".test.tsx")
+        || file.ends_with(".test.js")
+        || file.ends_with(".spec.ts")
+        || file.ends_with(".spec.js")
 }
 
 fn collect_leaves<'tree>(node: Node<'tree>, out: &mut Vec<Node<'tree>>) {
@@ -844,6 +1054,40 @@ fn main() { println!("{} {}", helper(1), T::size(&T)); assert_eq!(helper(2), "2"
             .find(|c| c.name == "size" && c.line == 3)
             .unwrap();
         assert_eq!(self_size.qualifier.as_deref(), Some("T"));
+    }
+
+    #[test]
+    fn paths_run_from_entry_points_down_to_the_function() {
+        let root = std::env::temp_dir().join(format!("changes-paths-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("app.rs"),
+            "fn main() { run(); }\nfn run() { handle_event(); }\nfn handle_event() { deep(); }\nfn deep() { leaf(); }\nfn leaf() {}\nfn cron() { deep(); }\nfn orphan() { leaf(); }\n",
+        )
+        .unwrap();
+        let index = SymbolIndex::build(&root, &["app.rs".to_string()]);
+        let leaf = index.defs_named("leaf", "app.rs")[0].clone();
+        let paths = index.paths_to_roots(&leaf, 3);
+        let rendered: Vec<String> = paths
+            .iter()
+            .map(|p| {
+                p.steps
+                    .iter()
+                    .map(|s| s.display.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" → ")
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            vec![
+                "orphan → leaf",
+                "cron → deep → leaf",
+                "main → run → handle_event → deep → leaf",
+            ]
+        );
+        assert!(paths.iter().all(|p| p.complete));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

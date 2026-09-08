@@ -16,6 +16,7 @@ It's also agent-agnostic. You shouldn't have to use a specific app or IDE just t
 
 - **Outline view** — press `o` for the shape of the change: a file tree with `+/-` counts and the functions, types and classes each hunk adds, removes or touches. Big diffs open here first
 - **Callers and callees** — every changed function shows who calls it and what it calls, resolved with tree-sitter across the whole repo (Rust, Python, Go, JS/TS). In the diff it's one line under the hunk header; in the outline it expands into a call tree. New functions nobody calls and deleted functions that are still called are flagged
+- **Flow view** — `t` in the outline draws the change as a call-tree diff rooted at entry points: `main → run → handle_event → + your_new_function`. Unchanged steps are context, changed ones carry `+`/`~`/`-`, and code no user route reaches is listed separately
 - **Multi-repo tabs** — watch agent changes across repos simultaneously
 - **Two views that matter** — `m` for everything uncommitted, `b` for the whole branch against its base (uncommitted work included). `B` picks anything else: trunk, upstream, staged only, a typed ref
 - **Annotate hunks** — right-click to add review comments, `Y` to copy all as markdown for your agent
@@ -121,7 +122,7 @@ The `┃` gutter bar marks the hunk that `y` / `n` / `N` act on. Click a hunk or
 | `b` | Branch: everything since the fork point with the stack parent or trunk, uncommitted work included |
 | `B` | Compare picker: trunk, upstream, staged, unstaged, a typed ref, and a "commits only" checkbox |
 | `v` | Toggle unified / side-by-side view |
-| `o` | Outline: file tree + changed symbols (`Enter` opens, `→`/`←` show/hide callers and callees, `y` copies as markdown) |
+| `o` | Outline: file tree + changed symbols (`Enter` opens, `→`/`←` show/hide callers and callees, `t` flow view, `y` copies as markdown) |
 | `j` / `k`, `Ctrl+D` / `Ctrl+U`, `PgDn` / `PgUp` | Scroll by line, half page, page |
 | `g` / `G` | Jump to top / bottom |
 | `]` / `[` | Next / previous hunk |

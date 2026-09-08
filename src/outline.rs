@@ -72,6 +72,19 @@ pub enum OutlineRow {
         warning: Option<String>,
         expanded: bool,
     },
+    /// One step of the flow view: a function on a route from an entry point down to
+    /// changed code, indented by depth. Unchanged steps have no mark.
+    Flow {
+        depth: usize,
+        name: String,
+        location: String,
+        mark: Option<SymbolChange>,
+        file_idx: Option<usize>,
+        hunk_idx: Option<usize>,
+        /// A changed function, as opposed to unchanged context on the route.
+        is_target: bool,
+        warning: Option<String>,
+    },
     /// Heading inside an expanded symbol: "called by (2)" or "calls (33)".
     Section {
         prefix: String,
@@ -119,6 +132,9 @@ impl OutlineRow {
             OutlineRow::More { file_idx, .. } => Some((*file_idx, None)),
             OutlineRow::Summary { .. } | OutlineRow::Section { .. } => None,
             OutlineRow::Call {
+                file_idx, hunk_idx, ..
+            }
+            | OutlineRow::Flow {
                 file_idx, hunk_idx, ..
             } => file_idx.map(|file_idx| (file_idx, *hunk_idx)),
         }
@@ -190,6 +206,247 @@ struct Context<'a> {
     expanded: &'a HashSet<(String, String)>,
 }
 
+/// Routes per changed function gathered before choosing the one to draw. Enough that a
+/// long product route survives alongside shorter routes from examples and tests.
+const MAX_FLOW_ROUTES: usize = 6;
+
+/// The flow view: a call-tree diff rooted at entry points. Every route from a call-graph
+/// root down to a changed function is merged into one tree per root; unchanged steps
+/// are context, changed ones carry their mark. Roots with the most changed code first,
+/// then functions no route reaches, then removed functions.
+pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
+    // Every changed function symbol across the diff, keyed for marking route steps.
+    let mut changed: Vec<(usize, Symbol)> = Vec::new();
+    for (file_idx, file) in files.iter().enumerate() {
+        for symbol in file_symbols(file) {
+            if symbol.ident.is_some() {
+                changed.push((file_idx, symbol));
+            }
+        }
+    }
+    let change_of = |path: &str, ident: &str| -> Option<SymbolChange> {
+        changed
+            .iter()
+            .find(|(file_idx, symbol)| {
+                files[*file_idx].path == path && symbol.ident.as_deref() == Some(ident)
+            })
+            .map(|(_, symbol)| symbol.change)
+    };
+
+    let mut roots: Vec<FlowNode> = Vec::new();
+    let mut unreachable: Vec<(usize, Symbol)> = Vec::new();
+    let mut removed: Vec<(usize, Symbol)> = Vec::new();
+    let mut truncated: Vec<FlowNode> = Vec::new();
+
+    for (file_idx, symbol) in &changed {
+        let file = &files[*file_idx];
+        let ident = symbol.ident.as_deref().expect("filtered above");
+        if symbol.change == SymbolChange::Removed {
+            removed.push((*file_idx, symbol.clone()));
+            continue;
+        }
+        let Some(def) = index
+            .defs_named(ident, &file.path)
+            .into_iter()
+            .find(|def| def.kind == DefKind::Function && def.path == file.path)
+            .cloned()
+        else {
+            continue; // unsupported language, or the index has not caught up yet
+        };
+        if def.is_test {
+            continue; // tests are not user-facing code
+        }
+        let mut paths = index.paths_to_roots(&def, MAX_FLOW_ROUTES);
+        let only_itself = paths.len() == 1 && paths[0].steps.len() == 1;
+        if only_itself && !is_entry_point(ident, &file.path) {
+            unreachable.push((*file_idx, symbol.clone()));
+            continue;
+        }
+        // Draw the route from the most entry-point-like root (main, a handler, product
+        // code over examples), shortest among those; count the rest on the target so the
+        // tree keeps one copy of each subtree.
+        paths.sort_by_key(|route| {
+            let root = &route.steps[0];
+            (
+                is_auxiliary_path(&root.path),
+                entry_point_rank(&root.name, &root.path),
+                route.steps.len(),
+            )
+        });
+        let other_routes = paths.len().saturating_sub(1);
+        if let Some(route) = paths.into_iter().next() {
+            let forest = if route.complete {
+                &mut roots
+            } else {
+                &mut truncated
+            };
+            insert_route(forest, &route.steps, files, &change_of, other_routes);
+        }
+    }
+
+    // Product entry points first, examples and benches last, more changed code first.
+    roots.sort_by_key(|root| {
+        (
+            is_auxiliary_path(&root.path),
+            std::cmp::Reverse(root.targets()),
+        )
+    });
+    let mut rows = Vec::new();
+    for root in &roots {
+        root.emit(0, &mut rows);
+    }
+    if !truncated.is_empty() {
+        rows.push(OutlineRow::Section {
+            prefix: String::new(),
+            label: "routes longer than the search depth (entry point not reached)",
+            count: 0,
+        });
+        for root in &truncated {
+            root.emit(1, &mut rows);
+        }
+    }
+    if !unreachable.is_empty() {
+        rows.push(OutlineRow::Section {
+            prefix: String::new(),
+            label: "no route from any entry point",
+            count: unreachable.len(),
+        });
+        for (file_idx, symbol) in unreachable {
+            let ident = symbol.ident.as_deref().unwrap_or_default();
+            let display = index
+                .defs_named(ident, &files[file_idx].path)
+                .first()
+                .map(|def| def.display.clone())
+                .unwrap_or_else(|| ident.to_string());
+            rows.push(OutlineRow::Flow {
+                depth: 1,
+                name: display,
+                location: files[file_idx].path.clone(),
+                mark: Some(symbol.change),
+                file_idx: Some(file_idx),
+                hunk_idx: Some(symbol.hunk_idx),
+                is_target: true,
+                warning: Some("no callers".to_string()),
+            });
+        }
+    }
+    if !removed.is_empty() {
+        rows.push(OutlineRow::Section {
+            prefix: String::new(),
+            label: "removed",
+            count: removed.len(),
+        });
+        for (file_idx, symbol) in removed {
+            let ident = symbol.ident.as_deref().unwrap_or_default();
+            let survivors = index.callers(ident, &files[file_idx].path, None).len();
+            rows.push(OutlineRow::Flow {
+                depth: 1,
+                name: ident.to_string(),
+                location: files[file_idx].path.clone(),
+                mark: Some(SymbolChange::Removed),
+                file_idx: Some(file_idx),
+                hunk_idx: Some(symbol.hunk_idx),
+                is_target: true,
+                warning: (survivors > 0).then(|| format!("still called by {survivors}")),
+            });
+        }
+    }
+    rows
+}
+
+struct FlowNode {
+    path: String,
+    line: u32,
+    name: String,
+    mark: Option<SymbolChange>,
+    file_idx: Option<usize>,
+    hunk_idx: Option<usize>,
+    is_target: bool,
+    /// Routes to this target beyond the drawn one.
+    other_routes: usize,
+    children: Vec<FlowNode>,
+}
+
+impl FlowNode {
+    /// Changed functions in this subtree, for ordering roots.
+    fn targets(&self) -> usize {
+        usize::from(self.is_target) + self.children.iter().map(FlowNode::targets).sum::<usize>()
+    }
+
+    fn emit(&self, depth: usize, rows: &mut Vec<OutlineRow>) {
+        let location = if self.other_routes > 0 {
+            format!(
+                "{}:{}  ({} other route{})",
+                self.path,
+                self.line,
+                self.other_routes,
+                if self.other_routes == 1 { "" } else { "s" }
+            )
+        } else {
+            format!("{}:{}", self.path, self.line)
+        };
+        rows.push(OutlineRow::Flow {
+            depth,
+            name: self.name.clone(),
+            location,
+            mark: self.mark,
+            file_idx: self.file_idx,
+            hunk_idx: self.hunk_idx,
+            is_target: self.is_target,
+            warning: None,
+        });
+        for child in &self.children {
+            child.emit(depth + 1, rows);
+        }
+    }
+}
+
+/// Merge one root-first route into the forest, sharing prefixes with existing routes.
+fn insert_route(
+    forest: &mut Vec<FlowNode>,
+    steps: &[crate::symbols::PathStep],
+    files: &[FileDiff],
+    change_of: &dyn Fn(&str, &str) -> Option<SymbolChange>,
+    other_routes: usize,
+) {
+    let mut level = forest;
+    let last = steps.len().saturating_sub(1);
+    for (i, step) in steps.iter().enumerate() {
+        let position = match level
+            .iter()
+            .position(|node| node.path == step.path && node.line == step.line)
+        {
+            Some(position) => position,
+            None => {
+                let mark = if step.name.is_empty() {
+                    None
+                } else {
+                    change_of(&step.path, &step.name)
+                };
+                let (file_idx, hunk_idx, _) =
+                    locate_in_diff(files, &step.path, step.line, Some(&step.name));
+                level.push(FlowNode {
+                    path: step.path.clone(),
+                    line: step.line,
+                    name: step.display.clone(),
+                    mark,
+                    file_idx,
+                    hunk_idx,
+                    is_target: false,
+                    other_routes: 0,
+                    children: Vec::new(),
+                });
+                level.len() - 1
+            }
+        };
+        if i == last {
+            level[position].is_target = true;
+            level[position].other_routes = other_routes;
+        }
+        level = &mut level[position].children;
+    }
+}
+
 /// Markdown rendering of the outline, for pasting into an agent prompt or PR body.
 pub fn outline_markdown(rows: &[OutlineRow]) -> String {
     let mut out = String::from("## Change outline\n\n```text\n");
@@ -244,7 +501,29 @@ pub fn outline_markdown(rows: &[OutlineRow]) -> String {
                 label,
                 count,
             } => {
-                out.push_str(&format!("{prefix}{label} ({count})\n"));
+                if *count > 0 {
+                    out.push_str(&format!("{prefix}{label} ({count})\n"));
+                } else {
+                    out.push_str(&format!("{prefix}{label}\n"));
+                }
+            }
+            OutlineRow::Flow {
+                depth,
+                name,
+                location,
+                mark,
+                warning,
+                ..
+            } => {
+                let mark = mark.map(change_glyph).unwrap_or(" ");
+                let warning = warning
+                    .as_ref()
+                    .map(|w| format!("   ⚠ {w}"))
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "{mark} {}{name}  {location}{warning}\n",
+                    "  ".repeat(*depth)
+                ));
             }
             OutlineRow::Call {
                 prefix,
@@ -585,9 +864,20 @@ pub fn call_summary<'a>(
     if def.is_none() && callers.is_empty() {
         return None;
     }
+    let production = callers.iter().filter(|c| !c.from_test).count();
+    if def.as_ref().is_some_and(|d| d.is_test) {
+        return Some(CallSummary {
+            callers,
+            callees,
+            warning: None,
+        });
+    }
     let warning = match change {
         SymbolChange::Added if callers.is_empty() && !is_entry_point(ident, &file.path) => {
             Some("no callers".to_string())
+        }
+        SymbolChange::Added if production == 0 && !is_entry_point(ident, &file.path) => {
+            Some("only called from tests".to_string())
         }
         SymbolChange::Removed if !callers.is_empty() => {
             Some(format!("still called by {}", callers.len()))
@@ -666,6 +956,34 @@ fn fit_width(text: &str, width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// How much a root looks like where a user's action enters: 0 for `main` and top-level
+/// code, 1 for handler-like names, 2 for anything else (an unused public function, say).
+fn entry_point_rank(name: &str, path: &str) -> u8 {
+    if name == "main" || (name.is_empty() && !is_auxiliary_path(path)) {
+        0
+    } else if name.starts_with("handle")
+        || name.starts_with("on_")
+        || name.starts_with("run")
+        || name.starts_with("serve")
+        || name.starts_with("route")
+        || name.starts_with("cli")
+        || name.starts_with("command")
+    {
+        1
+    } else {
+        2
+    }
+}
+
+/// Examples, benchmarks and scripts: real callers, but not the product's entry points.
+fn is_auxiliary_path(path: &str) -> bool {
+    path.starts_with("examples/")
+        || path.starts_with("benches/")
+        || path.starts_with("scripts/")
+        || path.starts_with("tools/")
+        || crate::symbols::is_test_path(path)
 }
 
 /// Functions nobody is expected to call: program entry points and tests.
@@ -1170,6 +1488,67 @@ mod tests {
                 ("fn old_name".into(), SymbolChange::Removed, 1),
                 ("fn new_name".into(), SymbolChange::Added, 1),
                 ("fn resize".into(), SymbolChange::Modified, 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn flow_view_roots_routes_at_entry_points_and_lists_orphans() {
+        use super::build_flow;
+        use crate::symbols::SymbolIndex;
+        let root = std::env::temp_dir().join(format!("changes-flow-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        std::fs::write(
+            root.join("src/main.rs"),
+            "fn main() { run(); }\nfn run() { handle(); }\nfn handle() { leaf(); }\nfn leaf() {}\nfn orphan() {}\n#[cfg(test)]\nmod tests { #[test] fn t() { super::orphan(); } }\n",
+        )
+        .unwrap();
+        let index = SymbolIndex::build(&root, &["src/main.rs".to_string()]);
+        // The diff added `leaf` and `orphan`.
+        let file = file(
+            "src/main.rs",
+            FileStatus::Modified,
+            vec![Hunk {
+                header: "@@ -3,0 +4,2 @@".to_string(),
+                lines: vec![
+                    line(LineKind::Addition, "fn leaf() {}"),
+                    line(LineKind::Addition, "fn orphan() {}"),
+                ],
+            }],
+        );
+        let rows = build_flow(&[file], &index);
+        let rendered: Vec<String> = rows
+            .iter()
+            .map(|row| match row {
+                OutlineRow::Flow {
+                    depth,
+                    name,
+                    mark,
+                    warning,
+                    ..
+                } => format!(
+                    "{}{}{name}{}",
+                    mark.map(super::change_glyph).unwrap_or(" "),
+                    "  ".repeat(*depth + 1),
+                    warning
+                        .as_ref()
+                        .map(|w| format!(" ⚠ {w}"))
+                        .unwrap_or_default()
+                ),
+                OutlineRow::Section { label, count, .. } => format!("[{label} {count}]"),
+                other => panic!("unexpected row {other:?}"),
+            })
+            .collect();
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            rendered,
+            vec![
+                "   main",
+                "     run",
+                "       handle",
+                "+        leaf",
+                "[no route from any entry point 1]",
+                "+    orphan ⚠ no callers",
             ]
         );
     }

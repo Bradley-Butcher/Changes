@@ -155,6 +155,8 @@ pub struct OutlineState {
     pub scroll: usize,
     /// Symbols whose callers and callees are shown, keyed by (file path, identifier).
     pub expanded: std::collections::HashSet<(String, String)>,
+    /// Flow view: the call-tree diff rooted at entry points, instead of the file tree.
+    pub flow: bool,
 }
 
 /// Diffs with at least this many files open in the outline first, so the shape of the
@@ -385,15 +387,19 @@ impl App {
     // -- Outline (change shape) view --
 
     pub fn open_outline(&mut self) {
-        let expanded = self
+        let (expanded, flow) = self
             .outline
             .take()
-            .map(|state| state.expanded)
+            .map(|state| (state.expanded, state.flow))
             .unwrap_or_default();
         let rows = self
             .repos
             .get(self.active_tab)
-            .map(|repo| outline::build_outline(&repo.files, repo.symbols.as_deref(), &expanded))
+            .map(|repo| match (flow, repo.symbols.as_deref()) {
+                (true, Some(index)) => outline::build_flow(&repo.files, index),
+                (true, None) => Vec::new(),
+                (false, index) => outline::build_outline(&repo.files, index, &expanded),
+            })
             .unwrap_or_default();
         let selected = rows.iter().position(OutlineRow::is_selectable).unwrap_or(0);
         self.outline = Some(OutlineState {
@@ -401,7 +407,18 @@ impl App {
             selected,
             scroll: 0,
             expanded,
+            flow,
         });
+    }
+
+    /// Switch the outline between the file tree and the flow view.
+    pub fn toggle_outline_flow(&mut self) {
+        let Some(state) = &mut self.outline else {
+            return;
+        };
+        state.flow = !state.flow;
+        state.scroll = 0;
+        self.open_outline();
     }
 
     /// Show or hide the callers and callees of the symbol the cursor is on.
