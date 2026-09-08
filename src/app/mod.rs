@@ -539,7 +539,10 @@ impl App {
     /// Scroll the outline just enough to keep the selection on screen, with a small
     /// margin so the next row is already visible when moving.
     fn keep_outline_selection_visible(&mut self) {
-        let height = self.viewport_height();
+        let height = self
+            .viewport_height()
+            .saturating_sub(crate::ui::OUTLINE_HEADER_ROWS as usize)
+            .max(1);
         let Some(state) = &mut self.outline else {
             return;
         };

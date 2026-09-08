@@ -3,41 +3,66 @@ use crate::diff::{FileStatus, LineKind};
 use crate::git::{Base, BaseCandidates, DiffMode};
 use crate::highlight::Highlighter;
 use crate::outline::{self, OutlineRow, SymbolChange, hunk_context};
+use crate::theme::theme;
 use crate::viewport::{RowRef, chunk_end, side_by_side_gutter_width, side_by_side_pane_widths};
 use ratatui::Frame;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{
-    Block, Borders, Clear, Paragraph, Scrollbar, ScrollbarOrientation, ScrollbarState,
+    Block, BorderType, Borders, Clear, Padding, Paragraph, Scrollbar, ScrollbarOrientation,
+    ScrollbarState,
 };
 use unicode_width::UnicodeWidthStr;
 
-const BG_ADD: Color = Color::Rgb(30, 60, 30);
-const BG_DEL: Color = Color::Rgb(60, 30, 30);
-const BG_ADD_EMPH: Color = Color::Rgb(40, 90, 40);
-const BG_DEL_EMPH: Color = Color::Rgb(90, 40, 40);
-const FG_ADD: Color = Color::Rgb(100, 220, 100);
-const FG_DEL: Color = Color::Rgb(220, 100, 100);
-const FG_HUNK: Color = Color::Rgb(130, 170, 220);
-const FG_MUTED: Color = Color::Rgb(120, 120, 120);
-const BG_HEADER: Color = Color::Rgb(35, 40, 55);
-const BG_FLASH: Color = Color::Rgb(80, 80, 40);
-const FG_EXPAND: Color = Color::Rgb(80, 130, 180);
-const FG_STATUS_M: Color = Color::Rgb(220, 180, 60);
-const FG_STATUS_A: Color = Color::Rgb(100, 220, 100);
-const FG_STATUS_D: Color = Color::Rgb(220, 100, 100);
-const FG_STATUS_R: Color = Color::Rgb(130, 170, 220);
-const FG_PATH_DIR: Color = Color::Rgb(140, 140, 160);
-const FG_PATH_FILE: Color = Color::Rgb(240, 240, 250);
-const FG_COMMENT: Color = Color::Rgb(220, 180, 60);
-const FG_FOCUS: Color = Color::Rgb(100, 180, 255);
-const BG_TAB_ACTIVE: Color = Color::Rgb(50, 60, 85);
-const BG_STATUS: Color = Color::Rgb(40, 40, 50);
-const BG_POPUP: Color = Color::Rgb(30, 30, 40);
-const BG_NOTE: Color = Color::Rgb(30, 30, 20);
-
 const TAB_BAR_HEIGHT: u16 = 1;
+/// Rows the outline / flow view spends on its heading before the first row.
+pub const OUTLINE_HEADER_ROWS: u16 = 1;
+
+/// The one popup frame: rounded, a muted border, bold title top-left, key hints along the
+/// bottom edge, and a column of padding so text never touches the border.
+fn popup_block<'a>(title: &'a str, hint: &'a str) -> Block<'a> {
+    let t = theme();
+    let mut block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(t.surface_raised))
+        .title(Line::from(Span::styled(format!(" {title} "), t.bold())))
+        .padding(Padding::horizontal(1))
+        .style(t.popup_style());
+    if !hint.is_empty() {
+        block = block.title_bottom(
+            Line::from(Span::styled(format!(" {hint} "), t.muted_style())).right_aligned(),
+        );
+    }
+    block
+}
+
+/// A text-input row in a popup: accent prompt, the query, and a block cursor.
+fn prompt_line(query: &str) -> Line<'static> {
+    let t = theme();
+    Line::from(vec![
+        Span::styled("› ", t.accent_style()),
+        Span::styled(query.to_string(), t.text_style()),
+        Span::styled(" ", Style::default().add_modifier(Modifier::REVERSED)),
+    ])
+}
+
+/// Bold title on the left, muted key hints on the right, on the first row of a view.
+fn draw_view_heading(frame: &mut Frame, area: Rect, title: &str, hint: &str) {
+    let width = area.width as usize;
+    let title_width = UnicodeWidthStr::width(title);
+    let hint_width = UnicodeWidthStr::width(hint);
+    let mut spans = vec![Span::styled(title.to_string(), theme().bold())];
+    if title_width + 2 + hint_width <= width {
+        spans.push(Span::raw(" ".repeat(width - title_width - hint_width)));
+        spans.push(Span::styled(hint.to_string(), theme().muted_style()));
+    }
+    frame.render_widget(
+        Paragraph::new(Line::from(spans)),
+        Rect::new(area.x, area.y, area.width, 1),
+    );
+}
 
 /// Layout positions computed during rendering, needed for mouse hit-testing.
 /// Kept separate from App so `draw()` doesn't require `&mut App`.
@@ -53,20 +78,69 @@ pub struct LayoutHints {
     pub content_width: u16,
 }
 
+/// Screen rows: tab strip, a hairline rule, the content area, the status line.
 fn screen_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(TAB_BAR_HEIGHT), // tab bar
-            Constraint::Min(1),                 // diff area
-            Constraint::Length(1),              // status bar
+            Constraint::Length(TAB_BAR_HEIGHT),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
         ])
         .split(area)
 }
 
+/// The content area minus a one-column left margin and the scrollbar column on the right.
+/// No box border: the file header bars give the diff its structure.
+fn content_inner(area: Rect) -> Rect {
+    Rect::new(
+        area.x + 1,
+        area.y,
+        area.width.saturating_sub(2),
+        area.height,
+    )
+}
+
+/// The column the scrollbar occupies, at the right edge of the content area.
+fn scrollbar_area(area: Rect) -> Rect {
+    Rect::new(
+        area.x + area.width.saturating_sub(1),
+        area.y,
+        1,
+        area.height,
+    )
+}
+
 pub fn diff_inner_area(area: Rect) -> Rect {
     let chunks = screen_chunks(area);
-    Block::default().borders(Borders::ALL).inner(chunks[1])
+    content_inner(chunks[2])
+}
+
+fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, visible: usize, position: usize) {
+    if total <= visible {
+        return;
+    }
+    let mut state = ScrollbarState::new(total.saturating_sub(visible)).position(position);
+    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+        .begin_symbol(None)
+        .end_symbol(None)
+        .track_symbol(Some("│"))
+        .thumb_symbol("┃")
+        .track_style(Style::default().fg(theme().surface_raised))
+        .thumb_style(Style::default().fg(theme().muted));
+    frame.render_stateful_widget(scrollbar, scrollbar_area(area), &mut state);
+}
+
+fn draw_rule(frame: &mut Frame, area: Rect) {
+    let rule = "─".repeat(area.width as usize);
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            rule,
+            Style::default().fg(theme().surface_raised),
+        )),
+        area,
+    );
 }
 
 pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut LayoutHints) {
@@ -79,8 +153,9 @@ pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut
     hints.content_width = diff_inner.width;
 
     draw_tab_bar(frame, app, hints, chunks[0]);
-    draw_diff_area(frame, app, highlighter, chunks[1]);
-    draw_status_bar(frame, app, hints, chunks[2]);
+    draw_rule(frame, chunks[1]);
+    draw_diff_area(frame, app, highlighter, chunks[2]);
+    draw_status_bar(frame, app, hints, chunks[3]);
 
     if app.markdown_preview.is_some() {
         draw_markdown_preview(frame, app);
@@ -100,17 +175,17 @@ pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut
 }
 
 fn tab_label(index: usize, repo: &crate::app::RepoState) -> String {
-    // " 1 name +12 -3 ✎2 "
-    let mut label = format!(" {} {} ", index + 1, repo.info.name);
+    // "1 name  +12 -3  ✎2"
+    let mut label = format!("{} {}", index + 1, repo.info.name);
     if !repo.files.is_empty() {
         let (adds, dels) = repo
             .files
             .iter()
             .fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
-        label.push_str(&format!("+{adds} -{dels} "));
+        label.push_str(&format!("  +{adds} -{dels}"));
     }
     if !repo.comments.is_empty() {
-        label.push_str(&format!("✎{} ", repo.comments.len()));
+        label.push_str(&format!("  ✎{}", repo.comments.len()));
     }
     label
 }
@@ -125,10 +200,10 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rec
         .enumerate()
         .map(|(i, repo)| tab_label(i, repo))
         .collect();
-    // Each tab is followed by one column of spacing.
+    // Each tab is padded by a space on each side and followed by two columns of spacing.
     let widths: Vec<usize> = labels
         .iter()
-        .map(|label| UnicodeWidthStr::width(label.as_str()) + 1)
+        .map(|label| UnicodeWidthStr::width(label.as_str()) + 4)
         .collect();
     let total_width: usize = widths.iter().sum();
     let area_width = area.width as usize;
@@ -151,7 +226,7 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rec
     let mut col = area.x as usize;
     if overflow {
         let marker = if scroll > 0 { "‹" } else { " " };
-        spans.push(Span::styled(marker, Style::default().fg(FG_MUTED)));
+        spans.push(Span::styled(marker, Style::default().fg(theme().muted)));
         col += 1;
     }
 
@@ -176,25 +251,27 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rec
 
         let repo = &app.repos[i];
         let is_active = i == app.active_tab;
+        // The active tab is the accent color, underlined; others are plain or dim when
+        // they have nothing to show. No background blocks.
         let style = if is_active {
             Style::default()
-                .fg(Color::Yellow)
-                .bg(BG_TAB_ACTIVE)
-                .add_modifier(Modifier::BOLD)
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD | Modifier::UNDERLINED)
         } else if repo.files.is_empty() {
-            Style::default().fg(FG_MUTED)
+            Style::default().fg(theme().muted)
         } else {
-            Style::default().fg(Color::White)
+            Style::default().fg(theme().text)
         };
 
         // Clip a tab that starts before the scroll offset (only happens on the left edge).
+        let padded = format!(" {label} ");
         let skip = scroll.saturating_sub(tab_start);
-        let shown: String = label.chars().skip(skip).collect();
+        let shown: String = padded.chars().skip(skip).collect();
         let shown_width = UnicodeWidthStr::width(shown.as_str());
         let start_col = col as u16;
         spans.push(Span::styled(shown, style));
-        spans.push(Span::raw(" "));
-        col += shown_width + 1;
+        spans.push(Span::raw("  "));
+        col += shown_width + 2;
         hints.tab_positions.push((start_col, col as u16));
     }
     if overflow {
@@ -203,7 +280,7 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rec
         let strip = Rect::new(area.x, area.y, area.width.saturating_sub(1), 1);
         frame.render_widget(Paragraph::new(Line::from(spans)), strip);
         frame.render_widget(
-            Paragraph::new(Span::styled(marker, Style::default().fg(FG_MUTED))),
+            Paragraph::new(Span::styled(marker, Style::default().fg(theme().muted))),
             Rect::new(marker_col, area.y, 1, 1),
         );
     } else {
@@ -215,18 +292,8 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rec
 }
 
 fn draw_empty_state(frame: &mut Frame, app: &App, area: Rect) {
-    let block = Block::default().borders(Borders::ALL);
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
-
-    let logo_lines = [
-        r#"██████╗  ██╗  ██╗  █████╗  ███╗   ██╗  ██████╗  ███████╗ ███████╗"#,
-        r#"██╔════╝  ██║  ██║ ██╔══██╗ ████╗  ██║ ██╔════╝  ██╔════╝ ██╔════╝"#,
-        r#"██║       ███████║ ███████║ ██╔██╗ ██║ ██║  ███╗ █████╗   ███████╗"#,
-        r#"██║       ██╔══██║ ██╔══██║ ██║╚██╗██║ ██║   ██║ ██╔══╝   ╚════██║"#,
-        r#"╚██████╗  ██║  ██║ ██║  ██║ ██║ ╚████║ ╚██████╔╝ ███████╗ ███████║"#,
-        r#" ╚═════╝  ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═══╝  ╚═════╝  ╚══════╝ ╚══════╝"#,
-    ];
+    let t = theme();
+    let inner = content_inner(area);
 
     let repo = app.repos.get(app.active_tab);
     let loaded = repo.is_none_or(|r| r.loaded);
@@ -234,51 +301,36 @@ fn draw_empty_state(frame: &mut Frame, app: &App, area: Rect) {
         empty_state_text(app.current_mode(), &app.current_bases())
     } else {
         (
-            "> computing diff ...".to_string(),
+            "computing diff…".to_string(),
             "Reading the repository. Large repos can take a few seconds.",
         )
     };
+    let headline = headline.trim_start_matches("> ").to_string();
     let watching = repo
         .map(|r| format!("watching {}", r.info.path.display()))
         .unwrap_or_default();
 
-    // Logo, blank, prompt, headline, blank, hint, watching
-    let content_height = if inner.height >= 14 { 12u16 } else { 5 };
-    let top_pad = inner.height.saturating_sub(content_height) / 2;
-
-    let mut lines: Vec<Line> = Vec::new();
-    for _ in 0..top_pad {
-        lines.push(Line::from(""));
-    }
-    if inner.height >= 14 {
-        for logo_line in &logo_lines {
-            lines.push(Line::from(Span::styled(
-                *logo_line,
-                Style::default().fg(FG_FOCUS).add_modifier(Modifier::BOLD),
-            )));
-        }
-        lines.push(Line::from(""));
-    }
-    lines.push(Line::from(Span::styled(
-        "> git status",
-        Style::default().fg(FG_MUTED),
-    )));
-    lines.push(Line::from(Span::styled(
-        headline,
-        Style::default().fg(FG_MUTED).add_modifier(Modifier::ITALIC),
-    )));
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        hint,
-        Style::default().fg(Color::White),
-    )));
-    lines.push(Line::from(Span::styled(
-        watching,
-        Style::default().fg(FG_MUTED),
-    )));
-
-    let para = Paragraph::new(lines).alignment(Alignment::Center);
-    frame.render_widget(para, inner);
+    // A small wordmark, the state, and what to do next: nothing that competes with a
+    // diff once one appears.
+    let lines: Vec<Line> = vec![
+        Line::from(Span::styled(
+            "changes",
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(headline, t.text_style())),
+        Line::from(Span::styled(hint, t.muted_style())),
+        Line::from(""),
+        Line::from(Span::styled(watching, t.muted_style())),
+    ];
+    let top_pad = inner.height.saturating_sub(lines.len() as u16) / 2;
+    let area = Rect::new(
+        inner.x,
+        inner.y + top_pad,
+        inner.width,
+        inner.height.saturating_sub(top_pad),
+    );
+    frame.render_widget(Paragraph::new(lines).alignment(Alignment::Center), area);
 }
 
 fn draw_diff_area(frame: &mut Frame, app: &App, highlighter: &Highlighter, area: Rect) {
@@ -320,21 +372,23 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
         .repos
         .get(app.active_tab)
         .is_some_and(|repo| repo.symbols.is_none());
-    let title = match (indexing, state.flow) {
-        (true, _) => " Outline — ↵ open · y copy as markdown · o full diff · indexing calls… ",
-        (false, true) => {
-            " Flow — routes from entry points to changed code · ↵ open · t file tree · y copy · o full diff "
-        }
-        (false, false) => {
-            " Outline — ↵ open · →/← callers & callees · t flow · y copy as markdown · o full diff "
-        }
+    let (title, hint) = match (indexing, state.flow) {
+        (true, false) => ("Outline", "↵ open · y copy · o diff · indexing calls…"),
+        (true, true) => ("Flow", "indexing calls…"),
+        (false, true) => (
+            "Flow",
+            "routes from entry points to changed code · ↵ open · t tree · y copy · o diff",
+        ),
+        (false, false) => ("Outline", "↵ open · → callers · t flow · y copy · o diff"),
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .title_style(Style::default().fg(FG_MUTED));
-    let inner = block.inner(area);
-    frame.render_widget(block, area);
+    let content = content_inner(area);
+    draw_view_heading(frame, content, title, hint);
+    let inner = Rect::new(
+        content.x,
+        content.y + OUTLINE_HEADER_ROWS,
+        content.width,
+        content.height.saturating_sub(OUTLINE_HEADER_ROWS),
+    );
 
     let height = inner.height as usize;
     let scroll = state.scroll.min(state.rows.len().saturating_sub(height));
@@ -343,7 +397,11 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::with_capacity(height);
     for (index, row) in state.rows.iter().enumerate().skip(scroll).take(height) {
         let selected = index == state.selected;
-        let row_bg = if selected { Some(BG_TAB_ACTIVE) } else { None };
+        let row_bg = if selected {
+            Some(theme().surface_raised)
+        } else {
+            None
+        };
         let with_bg = |style: Style| match row_bg {
             Some(bg) => style.bg(bg),
             None => style,
@@ -358,13 +416,13 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
             } => {
                 spans.push(Span::styled(
                     prefix.clone(),
-                    with_bg(Style::default().fg(FG_MUTED)),
+                    with_bg(Style::default().fg(theme().muted)),
                 ));
                 spans.push(Span::styled(
                     format!("{name}/"),
                     with_bg(
                         Style::default()
-                            .fg(FG_PATH_DIR)
+                            .fg(theme().muted)
                             .add_modifier(Modifier::BOLD),
                     ),
                 ));
@@ -380,7 +438,7 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
             } => {
                 spans.push(Span::styled(
                     prefix.clone(),
-                    with_bg(Style::default().fg(FG_MUTED)),
+                    with_bg(Style::default().fg(theme().muted)),
                 ));
                 spans.push(Span::styled(
                     format!("{} ", outline::status_glyph(*status)),
@@ -392,7 +450,7 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
                 ));
                 spans.push(Span::styled(
                     name.clone(),
-                    with_bg(Style::default().fg(FG_PATH_FILE).add_modifier(if selected {
+                    with_bg(Style::default().fg(theme().text).add_modifier(if selected {
                         Modifier::BOLD
                     } else {
                         Modifier::empty()
@@ -403,12 +461,12 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
             OutlineRow::Symbol { prefix, symbol, .. } => {
                 spans.push(Span::styled(
                     prefix.clone(),
-                    with_bg(Style::default().fg(FG_MUTED)),
+                    with_bg(Style::default().fg(theme().muted)),
                 ));
                 let (glyph_color, name_color) = match symbol.change {
-                    SymbolChange::Added => (FG_ADD, Color::White),
-                    SymbolChange::Removed => (FG_DEL, FG_MUTED),
-                    SymbolChange::Modified => (FG_STATUS_M, Color::White),
+                    SymbolChange::Added => (theme().add_fg, theme().text),
+                    SymbolChange::Removed => (theme().del_fg, theme().muted),
+                    SymbolChange::Modified => (theme().warn, theme().text),
                 };
                 spans.push(Span::styled(
                     format!("{} ", outline::change_glyph(symbol.change)),
@@ -427,11 +485,15 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
             OutlineRow::More { prefix, count, .. } => {
                 spans.push(Span::styled(
                     prefix.clone(),
-                    with_bg(Style::default().fg(FG_MUTED)),
+                    with_bg(Style::default().fg(theme().muted)),
                 ));
                 spans.push(Span::styled(
                     format!("… {count} more"),
-                    with_bg(Style::default().fg(FG_MUTED).add_modifier(Modifier::ITALIC)),
+                    with_bg(
+                        Style::default()
+                            .fg(theme().muted)
+                            .add_modifier(Modifier::ITALIC),
+                    ),
                 ));
                 None
             }
@@ -445,29 +507,32 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
             } => {
                 spans.push(Span::styled(
                     prefix.clone(),
-                    with_bg(Style::default().fg(FG_MUTED)),
+                    with_bg(Style::default().fg(theme().muted)),
                 ));
                 let caret = if *expanded { "▾ " } else { "▸ " };
-                spans.push(Span::styled(caret, with_bg(Style::default().fg(FG_MUTED))));
+                spans.push(Span::styled(
+                    caret,
+                    with_bg(Style::default().fg(theme().muted)),
+                ));
                 match warning {
                     Some(warning) => {
                         spans.push(Span::styled(
                             format!("⚠ {warning}"),
                             with_bg(
                                 Style::default()
-                                    .fg(FG_STATUS_M)
+                                    .fg(theme().warn)
                                     .add_modifier(Modifier::BOLD),
                             ),
                         ));
                         spans.push(Span::styled(
                             format!("  · calls {callees}"),
-                            with_bg(Style::default().fg(FG_MUTED)),
+                            with_bg(Style::default().fg(theme().muted)),
                         ));
                     }
                     None => {
                         spans.push(Span::styled(
                             format!("called by {callers} · calls {callees}"),
-                            with_bg(Style::default().fg(FG_MUTED)),
+                            with_bg(Style::default().fg(theme().muted)),
                         ));
                     }
                 }
@@ -480,7 +545,7 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
             } => {
                 spans.push(Span::styled(
                     prefix.clone(),
-                    with_bg(Style::default().fg(FG_MUTED)),
+                    with_bg(Style::default().fg(theme().muted)),
                 ));
                 let text = if *count > 0 {
                     format!("{label} ({count})")
@@ -489,7 +554,11 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
                 };
                 spans.push(Span::styled(
                     text,
-                    with_bg(Style::default().fg(FG_HUNK).add_modifier(Modifier::BOLD)),
+                    with_bg(
+                        Style::default()
+                            .fg(theme().accent)
+                            .add_modifier(Modifier::BOLD),
+                    ),
                 ));
                 None
             }
@@ -505,10 +574,10 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
             } => {
                 // Mark column first, then indentation by depth: the diff idiom.
                 let (glyph, glyph_color) = match mark {
-                    Some(SymbolChange::Added) => ("+", FG_ADD),
-                    Some(SymbolChange::Removed) => ("-", FG_DEL),
-                    Some(SymbolChange::Modified) => ("~", FG_STATUS_M),
-                    None => (" ", FG_MUTED),
+                    Some(SymbolChange::Added) => ("+", theme().add_fg),
+                    Some(SymbolChange::Removed) => ("-", theme().del_fg),
+                    Some(SymbolChange::Modified) => ("~", theme().warn),
+                    None => (" ", theme().muted),
                 };
                 spans.push(Span::styled(
                     format!("{glyph} "),
@@ -522,27 +591,27 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
                 let name_style = if *is_target {
                     Style::default()
                         .fg(if file_idx.is_some() {
-                            Color::White
+                            theme().text
                         } else {
-                            FG_PATH_DIR
+                            theme().muted
                         })
                         .add_modifier(Modifier::BOLD)
                 } else if mark.is_some() {
-                    Style::default().fg(Color::White)
+                    Style::default().fg(theme().text)
                 } else {
-                    Style::default().fg(FG_PATH_DIR)
+                    Style::default().fg(theme().muted)
                 };
                 spans.push(Span::styled(name.clone(), with_bg(name_style)));
                 spans.push(Span::styled(
                     format!("  {location}"),
-                    with_bg(Style::default().fg(FG_MUTED)),
+                    with_bg(Style::default().fg(theme().muted)),
                 ));
                 if let Some(warning) = warning {
                     spans.push(Span::styled(
                         format!("   ⚠ {warning}"),
                         with_bg(
                             Style::default()
-                                .fg(FG_STATUS_M)
+                                .fg(theme().warn)
                                 .add_modifier(Modifier::BOLD),
                         ),
                     ));
@@ -559,13 +628,13 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
             } => {
                 spans.push(Span::styled(
                     prefix.clone(),
-                    with_bg(Style::default().fg(FG_MUTED)),
+                    with_bg(Style::default().fg(theme().muted)),
                 ));
                 if let Some(mark) = mark {
                     let color = match mark {
-                        SymbolChange::Added => FG_ADD,
-                        SymbolChange::Removed => FG_DEL,
-                        SymbolChange::Modified => FG_STATUS_M,
+                        SymbolChange::Added => theme().add_fg,
+                        SymbolChange::Removed => theme().del_fg,
+                        SymbolChange::Modified => theme().warn,
                     };
                     spans.push(Span::styled(
                         format!("{} ", outline::change_glyph(*mark)),
@@ -573,9 +642,9 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
                     ));
                 }
                 let name_color = if file_idx.is_some() {
-                    Color::White
+                    theme().text
                 } else {
-                    FG_PATH_DIR
+                    theme().muted
                 };
                 spans.push(Span::styled(
                     name.clone(),
@@ -583,7 +652,7 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
                 ));
                 spans.push(Span::styled(
                     format!("  {location}"),
-                    with_bg(Style::default().fg(FG_MUTED)),
+                    with_bg(Style::default().fg(theme().muted)),
                 ));
                 None
             }
@@ -598,9 +667,15 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
             let tail = adds.len() + 1 + dels.len() + 1;
             let pad = width.saturating_sub(used + tail);
             spans.push(Span::styled(" ".repeat(pad), with_bg(Style::default())));
-            spans.push(Span::styled(adds, with_bg(Style::default().fg(FG_ADD))));
+            spans.push(Span::styled(
+                adds,
+                with_bg(Style::default().fg(theme().add_fg)),
+            ));
             spans.push(Span::styled(" ", with_bg(Style::default())));
-            spans.push(Span::styled(dels, with_bg(Style::default().fg(FG_DEL))));
+            spans.push(Span::styled(
+                dels,
+                with_bg(Style::default().fg(theme().del_fg)),
+            ));
             spans.push(Span::styled(" ", with_bg(Style::default())));
         } else if selected {
             spans.push(Span::styled(
@@ -620,29 +695,20 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
         };
         lines.push(Line::from(Span::styled(
             text,
-            Style::default().fg(FG_MUTED),
+            Style::default().fg(theme().muted),
         )));
     }
     frame.render_widget(Paragraph::new(lines), inner);
 
-    if state.rows.len() > height {
-        let mut scrollbar_state =
-            ScrollbarState::new(state.rows.len().saturating_sub(height)).position(scroll);
-        frame.render_stateful_widget(
-            Scrollbar::new(ScrollbarOrientation::VerticalRight),
-            area,
-            &mut scrollbar_state,
-        );
-    }
+    draw_scrollbar(frame, inner, state.rows.len(), height, scroll);
 }
 
 fn status_color(status: FileStatus) -> Color {
     match status {
-        FileStatus::Modified => FG_STATUS_M,
-        FileStatus::Added => FG_STATUS_A,
-        FileStatus::Deleted => FG_STATUS_D,
-        FileStatus::Renamed => FG_STATUS_R,
-        FileStatus::Untracked => FG_MUTED,
+        FileStatus::Modified => theme().muted,
+        FileStatus::Added | FileStatus::Untracked => theme().add_fg,
+        FileStatus::Deleted => theme().del_fg,
+        FileStatus::Renamed => theme().accent,
     }
 }
 
@@ -652,10 +718,12 @@ fn gutter_separator<'a>(focused: bool) -> Span<'a> {
     if focused {
         Span::styled(
             " ┃",
-            Style::default().fg(FG_FOCUS).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme().accent)
+                .add_modifier(Modifier::BOLD),
         )
     } else {
-        Span::styled(" │", Style::default().fg(FG_MUTED))
+        Span::styled(" │", Style::default().fg(theme().surface_raised))
     }
 }
 
@@ -664,30 +732,30 @@ fn call_context_spans(text: &str) -> Vec<Span<'static>> {
     let mut spans = vec![Span::raw(" ")];
     for (i, part) in text.split(" · ").enumerate() {
         if i > 0 {
-            spans.push(Span::styled(" · ", Style::default().fg(FG_MUTED)));
+            spans.push(Span::styled(" · ", Style::default().fg(theme().muted)));
         }
         if let Some(rest) = part.strip_prefix('⚠') {
             spans.push(Span::styled(
                 format!("⚠{rest}"),
                 Style::default()
-                    .fg(FG_STATUS_M)
+                    .fg(theme().warn)
                     .add_modifier(Modifier::BOLD),
             ));
         } else if let Some(rest) = part.strip_prefix('↑').or_else(|| part.strip_prefix('↓')) {
             let arrow = &part[..part.len() - rest.len()];
             spans.push(Span::styled(
                 arrow.to_string(),
-                Style::default().fg(FG_HUNK),
+                Style::default().fg(theme().accent),
             ));
             spans.push(Span::styled(
                 rest.to_string(),
-                Style::default().fg(FG_MUTED),
+                Style::default().fg(theme().muted),
             ));
         } else {
             spans.push(Span::styled(
                 part.to_string(),
                 Style::default()
-                    .fg(FG_PATH_DIR)
+                    .fg(theme().muted)
                     .add_modifier(Modifier::ITALIC),
             ));
         }
@@ -708,13 +776,13 @@ fn hunk_header_line<'a>(
     if gap_before > 0 {
         spans.push(Span::styled(
             format_expand_indicator(gap_before, numbers_width),
-            Style::default().fg(FG_EXPAND),
+            Style::default().fg(theme().accent),
         ));
         spans.push(gutter_separator(focused));
         if let Some(ctx) = hunk.and_then(|hunk| hunk_context(&hunk.header)) {
             spans.push(Span::styled(
                 format!(" {}", ctx),
-                Style::default().fg(FG_HUNK),
+                Style::default().fg(theme().accent),
             ));
         }
     } else if hunk_idx > 0 || focused {
@@ -722,7 +790,7 @@ fn hunk_header_line<'a>(
         spans.push(gutter_separator(focused));
     }
     if has_comment {
-        spans.push(Span::styled(" [!]", Style::default().fg(FG_COMMENT)));
+        spans.push(Span::styled(" [!]", Style::default().fg(theme().note)));
     }
     Line::from(spans)
 }
@@ -735,9 +803,7 @@ fn draw_unified(
     layout: &crate::viewport::DiffLayout,
     area: Rect,
 ) {
-    let inner_area = Block::default().borders(Borders::ALL).inner(area);
-    let block = Block::default().borders(Borders::ALL);
-    frame.render_widget(block, area);
+    let inner_area = content_inner(area);
 
     let visible_height = inner_area.height as usize;
     let total_lines = layout.total_lines();
@@ -795,8 +861,8 @@ fn draw_unified(
                     let lno_w = layout.lineno_width(file_idx);
                     let gutter = " ".repeat(lno_w * 2 + 1) + " ┃";
                     lines.push(Line::from(vec![
-                        Span::styled(gutter, Style::default().fg(FG_COMMENT)),
-                        Span::styled(format!(" {}", text), Style::default().fg(FG_COMMENT)),
+                        Span::styled(gutter, Style::default().fg(theme().note)),
+                        Span::styled(format!(" {}", text), Style::default().fg(theme().note)),
                     ]));
                 }
             }
@@ -845,6 +911,7 @@ fn draw_unified(
                     chunk_idx,
                     chunk_start,
                     file.is_whole_file_change(),
+                    layout.emphasis(file_idx, hunk_idx, line_idx),
                 ));
             }
             RowRef::GapTail { gap_after, .. } if gap_after > 0 => {
@@ -854,7 +921,7 @@ fn draw_unified(
                 lines.push(Line::from(vec![
                     Span::styled(
                         format_expand_indicator(gap_after, layout.lineno_width(file_idx) * 2 + 1),
-                        Style::default().fg(FG_EXPAND),
+                        Style::default().fg(theme().accent),
                     ),
                     gutter_separator(false),
                 ]));
@@ -866,13 +933,13 @@ fn draw_unified(
 
     let paragraph = Paragraph::new(lines);
     frame.render_widget(paragraph, inner_area);
-
-    if total_lines > visible_height {
-        let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_height))
-            .position(app.current_scroll_offset());
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
-    }
+    draw_scrollbar(
+        frame,
+        area,
+        total_lines,
+        visible_height,
+        app.current_scroll_offset(),
+    );
 }
 
 fn draw_side_by_side(
@@ -883,9 +950,7 @@ fn draw_side_by_side(
     layout: &crate::viewport::DiffLayout,
     area: Rect,
 ) {
-    let block = Block::default().borders(Borders::ALL);
-    let inner_area = block.inner(area);
-    frame.render_widget(block, area);
+    let inner_area = content_inner(area);
 
     let (left_width, right_width) = side_by_side_pane_widths(inner_area.width as usize);
     let left_rect = Rect::new(
@@ -915,12 +980,12 @@ fn draw_side_by_side(
     let mut right_lines: Vec<Line> = Vec::with_capacity(visible_height);
     let mut divider_lines: Vec<Line> = Vec::with_capacity(visible_height);
     let focused_hunk = app.focused_hunk();
-    let divider = Line::from(Span::styled("│", Style::default().fg(FG_MUTED)));
-    let header_divider = Line::from(Span::styled(" ", Style::default().bg(BG_HEADER)));
+    let divider = Line::from(Span::styled("│", Style::default().fg(theme().muted)));
+    let header_divider = Line::from(Span::styled(" ", Style::default().bg(theme().surface)));
     let header_fill = |width: u16| {
         Line::from(Span::styled(
             " ".repeat(width as usize),
-            Style::default().bg(BG_HEADER),
+            Style::default().bg(theme().surface),
         ))
     };
 
@@ -1039,7 +1104,7 @@ fn draw_side_by_side(
                 let expand_line = Line::from(vec![
                     Span::styled(
                         format_expand_indicator(gap_after, lno_w),
-                        Style::default().fg(FG_EXPAND),
+                        Style::default().fg(theme().accent),
                     ),
                     gutter_separator(false),
                 ]);
@@ -1058,8 +1123,8 @@ fn draw_side_by_side(
                 if let Some(text) = layout.comment_line_text(file_idx, hunk_idx, wrap_idx) {
                     let lno_w = layout.lineno_width(file_idx);
                     let comment_line = Line::from(vec![
-                        Span::styled(" ".repeat(lno_w) + " ┃", Style::default().fg(FG_COMMENT)),
-                        Span::styled(format!(" {}", text), Style::default().fg(FG_COMMENT)),
+                        Span::styled(" ".repeat(lno_w) + " ┃", Style::default().fg(theme().note)),
+                        Span::styled(format!(" {}", text), Style::default().fg(theme().note)),
                     ]);
                     left_lines.push(comment_line);
                     right_lines.push(Line::from(""));
@@ -1098,13 +1163,13 @@ fn draw_side_by_side(
         frame.render_widget(Paragraph::new(divider_lines), divider_rect);
     }
     frame.render_widget(Paragraph::new(right_lines), right_rect);
-
-    if total_lines > visible_height {
-        let mut scrollbar_state = ScrollbarState::new(total_lines.saturating_sub(visible_height))
-            .position(app.current_scroll_offset());
-        let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight);
-        frame.render_stateful_widget(scrollbar, area, &mut scrollbar_state);
-    }
+    draw_scrollbar(
+        frame,
+        area,
+        total_lines,
+        visible_height,
+        app.current_scroll_offset(),
+    );
 }
 
 #[derive(Clone, Copy)]
@@ -1143,6 +1208,7 @@ fn build_unified_line<'a>(
     chunk_idx: usize,
     chunk_start: usize,
     plain: bool,
+    emphasis: Option<&[(usize, usize)]>,
 ) -> Line<'a> {
     // In a file that is entirely new or entirely deleted every line is on one side, so
     // per-line markers carry no information; show it as source with a header badge.
@@ -1154,22 +1220,26 @@ fn build_unified_line<'a>(
     };
 
     let bg = if is_flashing {
-        Some(BG_FLASH)
+        Some(theme().flash)
     } else if plain {
         None
     } else {
         match line.kind {
-            LineKind::Addition => Some(BG_ADD),
-            LineKind::Deletion => Some(BG_DEL),
+            LineKind::Addition => Some(theme().add_bg),
+            LineKind::Deletion => Some(theme().del_bg),
             _ => None,
         }
     };
 
     let prefix_style = match line.kind {
-        _ if plain => Style::default().fg(FG_MUTED),
-        LineKind::Addition => Style::default().fg(FG_ADD).bg(bg.unwrap_or_default()),
-        LineKind::Deletion => Style::default().fg(FG_DEL).bg(bg.unwrap_or_default()),
-        _ => Style::default().fg(FG_MUTED),
+        _ if plain => Style::default().fg(theme().muted),
+        LineKind::Addition => Style::default()
+            .fg(theme().add_fg)
+            .bg(bg.unwrap_or_default()),
+        LineKind::Deletion => Style::default()
+            .fg(theme().del_fg)
+            .bg(bg.unwrap_or_default()),
+        _ => Style::default().fg(theme().muted),
     };
 
     // Gutter width: line numbers + separator + prefix
@@ -1181,7 +1251,7 @@ fn build_unified_line<'a>(
         vec![
             Span::styled(
                 format_lineno(line, lno_width),
-                Style::default().fg(FG_MUTED),
+                Style::default().fg(theme().muted),
             ),
             gutter_separator(is_focused),
             Span::styled(prefix.to_string(), prefix_style),
@@ -1193,7 +1263,17 @@ fn build_unified_line<'a>(
             Span::raw("  "),
         ]
     };
-    let mut highlighted = highlighter.highlight_line_content(&line.content[range], file_path, bg);
+    let mut highlighted =
+        highlighter.highlight_line_content(&line.content[range.clone()], file_path, bg);
+    if !is_flashing && let Some(ranges) = emphasis {
+        let local = ranges_for_chunk(ranges, range.start, range.end);
+        let emph = match line.kind {
+            LineKind::Addition => theme().add_emph,
+            LineKind::Deletion => theme().del_emph,
+            LineKind::Context => theme().flash,
+        };
+        apply_inline_emphasis(&mut highlighted.spans, &local, emph);
+    }
     spans.append(&mut highlighted.spans);
     Line::from(spans)
 }
@@ -1217,15 +1297,15 @@ fn build_sbs_line<'a>(
             Line::from(vec![
                 Span::raw(" ".repeat(lno_width)),
                 gutter_separator(is_focused),
-                Span::styled(" ~", Style::default().fg(FG_MUTED)),
+                Span::styled(" ~", Style::default().fg(theme().muted)),
             ])
         });
     };
 
     let bg = match line.kind {
         _ if plain => None,
-        LineKind::Addition => Some(BG_ADD),
-        LineKind::Deletion => Some(BG_DEL),
+        LineKind::Addition => Some(theme().add_bg),
+        LineKind::Deletion => Some(theme().del_bg),
         _ => None,
     };
 
@@ -1237,10 +1317,10 @@ fn build_sbs_line<'a>(
     };
 
     let prefix_style = match line.kind {
-        _ if plain => Style::default().fg(FG_MUTED),
-        LineKind::Addition => Style::default().fg(FG_ADD),
-        LineKind::Deletion => Style::default().fg(FG_DEL),
-        _ => Style::default().fg(FG_MUTED),
+        _ if plain => Style::default().fg(theme().muted),
+        LineKind::Addition => Style::default().fg(theme().add_fg),
+        LineKind::Deletion => Style::default().fg(theme().del_fg),
+        _ => Style::default().fg(theme().muted),
     };
 
     let gutter_width = side_by_side_gutter_width(lno_width);
@@ -1257,7 +1337,7 @@ fn build_sbs_line<'a>(
             None => " ".repeat(lno_width),
         };
         vec![
-            Span::styled(lineno, Style::default().fg(FG_MUTED)),
+            Span::styled(lineno, Style::default().fg(theme().muted)),
             gutter_separator(is_focused),
             Span::styled(prefix.to_string(), prefix_style),
         ]
@@ -1289,8 +1369,8 @@ fn apply_chunk_emphasis(
     chunk_end: usize,
 ) {
     let Some(emphasis) = (match kind {
-        LineKind::Addition => Some(BG_ADD_EMPH),
-        LineKind::Deletion => Some(BG_DEL_EMPH),
+        LineKind::Addition => Some(theme().add_emph),
+        LineKind::Deletion => Some(theme().del_emph),
         LineKind::Context => None,
     }) else {
         return;
@@ -1319,14 +1399,15 @@ fn ranges_for_chunk(
 
 /// Build a full-width centered file header banner.
 fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: u16) -> Line<'a> {
-    let collapse = if file.collapsed { "▶" } else { "▼" };
+    let collapse = if file.collapsed { "▸" } else { "▾" };
 
+    // Yellow is for warnings; a modified file is the ordinary case and stays quiet.
     let (status_char, status_fg) = match file.status {
-        FileStatus::Modified => ("M", FG_STATUS_M),
-        FileStatus::Added => ("A", FG_STATUS_A),
-        FileStatus::Deleted => ("D", FG_STATUS_D),
-        FileStatus::Renamed => ("R", FG_STATUS_R),
-        FileStatus::Untracked => ("?", FG_MUTED),
+        FileStatus::Modified => ("M", theme().muted),
+        FileStatus::Added => ("A", theme().add_fg),
+        FileStatus::Deleted => ("D", theme().del_fg),
+        FileStatus::Renamed => ("R", theme().accent),
+        FileStatus::Untracked => ("?", theme().add_fg),
     };
 
     // Split path into directory + filename
@@ -1347,7 +1428,7 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
     let adds = format!("+{}", file.additions);
     let dels = format!("-{}", file.deletions);
 
-    let bg = BG_HEADER;
+    let bg = theme().surface;
     let total_width = width as usize;
     let underline = if is_focused {
         Modifier::UNDERLINED
@@ -1360,7 +1441,7 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
         Span::styled(" ", Style::default().bg(bg)),
         Span::styled(
             format!("{} ", collapse),
-            Style::default().fg(FG_MUTED).bg(bg),
+            Style::default().fg(theme().muted).bg(bg),
         ),
         Span::styled(
             status_char.to_string(),
@@ -1379,19 +1460,19 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
         spans.push(Span::styled(
             old_path_str.to_string(),
             Style::default()
-                .fg(FG_PATH_DIR)
+                .fg(theme().muted)
                 .bg(bg)
                 .add_modifier(underline),
         ));
         spans.push(Span::styled(
             arrow.to_string(),
-            Style::default().fg(FG_MUTED).bg(bg),
+            Style::default().fg(theme().muted).bg(bg),
         ));
         if !dir.is_empty() {
             spans.push(Span::styled(
                 dir.to_string(),
                 Style::default()
-                    .fg(FG_PATH_DIR)
+                    .fg(theme().muted)
                     .bg(bg)
                     .add_modifier(underline),
             ));
@@ -1399,7 +1480,7 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
         spans.push(Span::styled(
             filename.to_string(),
             Style::default()
-                .fg(FG_PATH_FILE)
+                .fg(theme().text)
                 .bg(bg)
                 .add_modifier(Modifier::BOLD | underline),
         ));
@@ -1412,7 +1493,7 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
             spans.push(Span::styled(
                 dir.to_string(),
                 Style::default()
-                    .fg(FG_PATH_DIR)
+                    .fg(theme().muted)
                     .bg(bg)
                     .add_modifier(underline),
             ));
@@ -1420,7 +1501,7 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
         spans.push(Span::styled(
             filename.to_string(),
             Style::default()
-                .fg(FG_PATH_FILE)
+                .fg(theme().text)
                 .bg(bg)
                 .add_modifier(Modifier::BOLD | underline),
         ));
@@ -1436,7 +1517,7 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
         spans.push(Span::styled(
             badge,
             Style::default()
-                .fg(FG_MUTED)
+                .fg(theme().muted)
                 .bg(bg)
                 .add_modifier(Modifier::ITALIC),
         ));
@@ -1452,9 +1533,15 @@ fn build_file_header<'a>(file: &crate::diff::FileDiff, is_focused: bool, width: 
         + adds.len()
         + 2
         + dels.len();
-    spans.push(Span::styled(adds, Style::default().fg(FG_ADD).bg(bg)));
+    spans.push(Span::styled(
+        adds,
+        Style::default().fg(theme().add_fg).bg(bg),
+    ));
     spans.push(Span::styled("  ", Style::default().bg(bg)));
-    spans.push(Span::styled(dels, Style::default().fg(FG_DEL).bg(bg)));
+    spans.push(Span::styled(
+        dels,
+        Style::default().fg(theme().del_fg).bg(bg),
+    ));
     let right_pad = total_width.saturating_sub(used);
     spans.push(Span::styled(" ".repeat(right_pad), Style::default().bg(bg)));
 
@@ -1551,11 +1638,16 @@ fn format_expand_indicator(gap: usize, numbers_width: usize) -> String {
 }
 
 fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rect) {
+    let t = theme();
     let repo = app.repos.get(app.active_tab);
     let bases = app.current_bases();
     let mode = app.current_mode().label(&bases);
     let view = if app.outline.is_some() {
-        "outline"
+        if app.outline.as_ref().is_some_and(|o| o.flow) {
+            "flow"
+        } else {
+            "outline"
+        }
     } else if app.side_by_side {
         "side-by-side"
     } else {
@@ -1573,79 +1665,66 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
         })
         .unwrap_or((0, 0));
 
-    let mut spans: Vec<Span> = vec![Span::styled(
-        format!(
-            "  {} │ {} file{}",
-            branch_name,
-            file_count,
-            if file_count != 1 { "s" } else { "" },
-        ),
-        Style::default().fg(Color::White),
-    )];
+    // One accent pill for the comparison; everything else is quiet text.
+    let mut spans: Vec<Span> = Vec::new();
+    let mode_text = format!(" {} ", mode.to_uppercase());
+    let mode_width = UnicodeWidthStr::width(mode_text.as_str()) as u16;
+    spans.push(Span::styled(mode_text, t.pill()));
+    hints.mode_badge_pos = (area.x, area.x + mode_width);
+
     spans.push(Span::styled(
-        format!(" +{}", total_add),
-        Style::default().fg(FG_ADD),
+        format!("  {branch_name}"),
+        Style::default().fg(t.text),
     ));
     spans.push(Span::styled(
-        format!(" -{}", total_del),
-        Style::default().fg(FG_DEL),
+        format!(
+            "  ·  {} file{}  ",
+            file_count,
+            if file_count != 1 { "s" } else { "" }
+        ),
+        t.muted_style(),
+    ));
+    spans.push(Span::styled(
+        format!("+{total_add}"),
+        Style::default().fg(t.add_fg),
+    ));
+    spans.push(Span::styled(
+        format!(" -{total_del}"),
+        Style::default().fg(t.del_fg),
     ));
     if note_count > 0 {
         spans.push(Span::styled(
             format!(
-                " │ ✎ {} note{}",
+                "  ·  ✎ {} note{}",
                 note_count,
                 if note_count != 1 { "s" } else { "" }
             ),
-            Style::default().fg(FG_COMMENT),
+            Style::default().fg(t.note),
         ));
     }
-
-    // Mode and view as highlighted badges — track positions for click handling
-    spans.push(Span::raw("  "));
-    let col_before_mode: u16 = area.x
-        + spans
-            .iter()
-            .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
-            .sum::<u16>();
-    let mode_text = format!(" {} ", mode);
-    let mode_width = UnicodeWidthStr::width(mode_text.as_str()) as u16;
-    spans.push(Span::styled(
-        mode_text,
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    ));
-    hints.mode_badge_pos = (col_before_mode, col_before_mode + mode_width);
-
-    spans.push(Span::raw(" "));
+    spans.push(Span::styled("  ·  ", t.muted_style()));
     let col_before_view: u16 = area.x
         + spans
             .iter()
             .map(|span| UnicodeWidthStr::width(span.content.as_ref()) as u16)
             .sum::<u16>();
-    let view_text = format!(" {} ", view);
-    let view_width = UnicodeWidthStr::width(view_text.as_str()) as u16;
+    let view_width = UnicodeWidthStr::width(view) as u16;
     spans.push(Span::styled(
-        view_text,
-        Style::default()
-            .fg(Color::Black)
-            .bg(Color::Magenta)
-            .add_modifier(Modifier::BOLD),
+        view.to_string(),
+        t.muted_style().add_modifier(Modifier::UNDERLINED),
     ));
     hints.view_badge_pos = (col_before_view, col_before_view + view_width);
     hints.status_bar_row = area.y;
 
     // Transient message, error, or warning takes precedence over the key hints.
     let message: Option<(String, Style)> = if let Some((ref msg, _)) = app.status_message {
-        Some((msg.clone(), Style::default().fg(FG_COMMENT)))
+        Some((msg.clone(), Style::default().fg(t.text)))
     } else if let Some(ref err) = app.last_error {
-        Some((err.clone(), Style::default().fg(Color::Red)))
+        Some((err.clone(), Style::default().fg(t.del_fg)))
     } else if !app.branch_base_resolved() {
         Some((
             "nothing to compare against — press B to pick a base or m for local".to_string(),
-            Style::default().fg(Color::Yellow),
+            t.warn_style(),
         ))
     } else {
         None
@@ -1658,49 +1737,37 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
     let remaining = (area.width as usize).saturating_sub(used_width);
 
     if let Some((msg, style)) = message {
-        spans.push(Span::raw("  "));
+        spans.push(Span::raw("   "));
         spans.push(Span::styled(msg, style));
     } else {
-        // Key hints, from the most useful down, dropped from the right when space is tight.
-        let hints_full: [(&str, &str); 8] = if app.outline.is_some() {
-            [
+        // A few key hints for the current view, dropped from the right when space is tight.
+        let hints_full: &[(&str, &str)] = if app.outline.is_some() {
+            &[
                 ("↵", "open"),
-                ("t", "flow/tree"),
+                ("t", "flow"),
                 ("y", "copy"),
-                ("o", "full diff"),
-                ("m/b/B", "compare"),
-                ("f", "find"),
+                ("o", "diff"),
                 ("?", "help"),
-                ("q", "quit"),
             ]
         } else {
-            [
-                ("y", "copy hunk"),
+            &[
+                ("y", "copy"),
                 ("n", "note"),
-                ("Y", "copy notes"),
-                ("]/[", "hunk"),
                 ("o", "outline"),
-                ("J/K", "file"),
+                ("]", "next hunk"),
                 ("?", "help"),
-                ("q", "quit"),
             ]
         };
         let mut hint_spans: Vec<Span> = Vec::new();
         let mut hint_width = 0usize;
         let budget = remaining.saturating_sub(3);
         for (key, label) in hints_full {
-            let piece_width = UnicodeWidthStr::width(key) + 1 + UnicodeWidthStr::width(label) + 2;
+            let piece_width = UnicodeWidthStr::width(*key) + 1 + UnicodeWidthStr::width(*label) + 3;
             if hint_width + piece_width > budget {
                 break;
             }
-            hint_spans.push(Span::styled(
-                key.to_string(),
-                Style::default().fg(Color::White),
-            ));
-            hint_spans.push(Span::styled(
-                format!(" {label}  "),
-                Style::default().fg(FG_MUTED),
-            ));
+            hint_spans.push(Span::styled(key.to_string(), Style::default().fg(t.text)));
+            hint_spans.push(Span::styled(format!(" {label}   "), t.muted_style()));
             hint_width += piece_width;
         }
         let padding = remaining.saturating_sub(hint_width);
@@ -1708,7 +1775,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
         spans.extend(hint_spans);
     }
 
-    let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(BG_STATUS));
+    let status = Paragraph::new(Line::from(spans)).style(Style::default().bg(t.surface));
 
     frame.render_widget(status, area);
 }
@@ -1778,10 +1845,7 @@ fn draw_compare_picker(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, popup_area);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Compare against  — ↑↓ move · ↵ select · Esc close ")
-        .style(Style::default().bg(BG_POPUP));
+    let block = popup_block("Compare against", "↑↓ move · ↵ select · esc");
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
@@ -1819,16 +1883,13 @@ fn draw_compare_picker(frame: &mut Frame, app: &App) {
             name_width = name_width
         );
         let style = if is_selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(100, 180, 255))
-                .add_modifier(Modifier::BOLD)
+            theme().selection().fg(theme().text)
         } else {
-            Style::default().fg(Color::White).bg(BG_POPUP)
+            Style::default().fg(theme().text).bg(theme().popup_bg)
         };
         lines.push(Line::from(Span::styled(padded, style)));
     }
-    let list = Paragraph::new(lines).style(Style::default().bg(BG_POPUP));
+    let list = Paragraph::new(lines).style(Style::default().bg(theme().popup_bg));
     frame.render_widget(list, inner);
 }
 
@@ -1852,15 +1913,8 @@ fn draw_file_picker(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, popup_area);
 
-    let title = format!(
-        " Find file  {}/{}  — ↑↓ move · ↵ jump · Esc close ",
-        filtered.len(),
-        total
-    );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .style(Style::default().bg(BG_POPUP));
+    let title = format!("Find file  {}/{}", filtered.len(), total);
+    let block = popup_block(&title, "↑↓ move · ↵ open · esc");
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
@@ -1869,12 +1923,8 @@ fn draw_file_picker(frame: &mut Frame, app: &App) {
     }
 
     // Input line with cursor
-    let input_text = format!(" > {}_", picker.query);
-    let input_line = Paragraph::new(Line::from(Span::styled(
-        input_text,
-        Style::default().fg(Color::Yellow),
-    )))
-    .style(Style::default().bg(BG_POPUP));
+    let input_line =
+        Paragraph::new(prompt_line(&picker.query)).style(Style::default().bg(theme().popup_bg));
     let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(input_line, input_area);
 
@@ -1923,12 +1973,9 @@ fn draw_file_picker(frame: &mut Frame, app: &App) {
         );
 
         let style = if is_selected {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(100, 180, 255))
-                .add_modifier(Modifier::BOLD)
+            theme().selection().fg(theme().text)
         } else {
-            Style::default().fg(Color::White).bg(BG_POPUP)
+            Style::default().fg(theme().text).bg(theme().popup_bg)
         };
 
         lines.push(Line::from(Span::styled(text, style)));
@@ -1937,7 +1984,7 @@ fn draw_file_picker(frame: &mut Frame, app: &App) {
     if filtered.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No matching files",
-            Style::default().fg(FG_MUTED).bg(BG_POPUP),
+            Style::default().fg(theme().muted).bg(theme().popup_bg),
         )));
     }
 
@@ -1962,10 +2009,7 @@ fn draw_repo_adder(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, popup_area);
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Add repo — type a path · space check · ↵ add · Esc close ")
-        .style(Style::default().bg(BG_POPUP));
+    let block = popup_block("Add repo", "type a path · space check · ↵ add · esc");
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
@@ -1974,12 +2018,8 @@ fn draw_repo_adder(frame: &mut Frame, app: &App) {
     }
 
     // Input line
-    let input_text = format!(" > {}_", adder.query);
-    let input_line = Paragraph::new(Line::from(Span::styled(
-        input_text,
-        Style::default().fg(Color::Yellow),
-    )))
-    .style(Style::default().bg(BG_POPUP));
+    let input_line =
+        Paragraph::new(prompt_line(&adder.query)).style(Style::default().bg(theme().popup_bg));
     let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(input_line, input_area);
 
@@ -1994,9 +2034,9 @@ fn draw_repo_adder(frame: &mut Frame, app: &App) {
     if let Some(ref err) = adder.error {
         let err_line = Paragraph::new(Line::from(Span::styled(
             format!(" {}", err),
-            Style::default().fg(Color::Red),
+            Style::default().fg(theme().del_fg),
         )))
-        .style(Style::default().bg(BG_POPUP));
+        .style(Style::default().bg(theme().popup_bg));
         frame.render_widget(err_line, list_area);
         return;
     }
@@ -2022,14 +2062,11 @@ fn draw_repo_adder(frame: &mut Frame, app: &App) {
         let text = format!(" {} {}", check, name);
 
         let style = if is_cursor {
-            Style::default()
-                .fg(Color::Black)
-                .bg(Color::Rgb(100, 180, 255))
-                .add_modifier(Modifier::BOLD)
+            theme().selection().fg(theme().text)
         } else if is_checked {
-            Style::default().fg(Color::Green).bg(BG_POPUP)
+            Style::default().fg(theme().add_fg).bg(theme().popup_bg)
         } else {
-            Style::default().fg(Color::White).bg(BG_POPUP)
+            Style::default().fg(theme().text).bg(theme().popup_bg)
         };
 
         lines.push(Line::from(Span::styled(text, style)));
@@ -2038,7 +2075,7 @@ fn draw_repo_adder(frame: &mut Frame, app: &App) {
     if adder.results.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No git repos here — type a path like ../other-project or /abs/path/",
-            Style::default().fg(FG_MUTED).bg(BG_POPUP),
+            Style::default().fg(theme().muted).bg(theme().popup_bg),
         )));
     }
 
@@ -2061,11 +2098,7 @@ fn draw_markdown_preview(frame: &mut Frame, app: &App) {
 
     frame.render_widget(Clear, popup_area);
 
-    let title = format!(" {} — j/k scroll, q/esc/p close ", preview.path);
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .style(Style::default().bg(Color::Rgb(25, 25, 35)));
+    let block = popup_block(&preview.path, "j/k scroll · esc");
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
@@ -2102,7 +2135,7 @@ fn draw_markdown_preview(frame: &mut Frame, app: &App) {
         .cloned()
         .collect();
 
-    let para = Paragraph::new(visible_lines).style(Style::default().bg(Color::Rgb(25, 25, 35)));
+    let para = Paragraph::new(visible_lines).style(theme().popup_style());
 
     frame.render_widget(para, inner);
 
@@ -2119,16 +2152,16 @@ fn help_section<'a>(title: &'a str, rows: &[(&'a str, &'a str)]) -> Vec<Line<'a>
     let mut lines = vec![Line::from(Span::styled(
         title,
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme().accent)
             .add_modifier(Modifier::BOLD),
     ))];
     for (key, action) in rows {
         lines.push(Line::from(vec![
             Span::styled(
                 format!("  {key:<width$}", width = HELP_KEY_WIDTH - 2),
-                Style::default().fg(Color::Yellow),
+                theme().accent_style(),
             ),
-            Span::styled(*action, Style::default().fg(Color::White)),
+            Span::styled(*action, theme().text_style()),
         ]));
     }
     lines.push(Line::from(""));
@@ -2228,7 +2261,7 @@ fn draw_help_overlay(frame: &mut Frame) {
     let mut right = help_column_lines(HELP_RIGHT);
     right.push(Line::from(Span::styled(
         "The ┃ gutter bar marks the hunk y / n act on.",
-        Style::default().fg(FG_MUTED),
+        Style::default().fg(theme().muted),
     )));
 
     let column_width = HELP_COLUMN_WIDTH;
@@ -2265,13 +2298,8 @@ fn draw_help_overlay(frame: &mut Frame) {
     frame.render_widget(Clear, popup_area);
 
     let help = Paragraph::new(body)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .title(" Help — ? or Esc to close ")
-                .style(Style::default().bg(BG_POPUP)),
-        )
-        .style(Style::default().fg(Color::White).bg(BG_POPUP));
+        .block(popup_block("Help", "? or esc to close"))
+        .style(theme().popup_style());
 
     frame.render_widget(help, popup_area);
 }
@@ -2330,14 +2358,12 @@ fn draw_comment_input(frame: &mut Frame, app: &App) {
 
     let editing = app.find_comment(input.file_idx, input.hunk_idx).is_some();
     let title = format!(
-        " {} note · {} — ↵ newline · Ctrl+D save · Esc cancel ",
+        "{} note · {}",
         if editing { "Edit" } else { "New" },
         file_label
     );
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .style(Style::default().bg(BG_NOTE).fg(FG_COMMENT));
+    let block = popup_block(&title, "↵ newline · ctrl-d save · esc cancel")
+        .border_style(Style::default().fg(theme().note));
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
@@ -2362,24 +2388,21 @@ fn draw_comment_input(frame: &mut Frame, app: &App) {
             display_lines.push(Line::from(vec![
                 Span::styled(
                     format!(" {}", before),
-                    Style::default().fg(Color::White).bg(BG_NOTE),
+                    Style::default().fg(theme().text).bg(theme().popup_bg),
                 ),
                 Span::styled(
                     cursor_char.to_string(),
-                    Style::default()
-                        .fg(Color::Black)
-                        .bg(FG_COMMENT)
-                        .add_modifier(Modifier::BOLD),
+                    Style::default().add_modifier(Modifier::REVERSED),
                 ),
                 Span::styled(
                     after_cursor.to_string(),
-                    Style::default().fg(Color::White).bg(BG_NOTE),
+                    Style::default().fg(theme().text).bg(theme().popup_bg),
                 ),
             ]));
         } else {
             display_lines.push(Line::from(Span::styled(
                 format!(" {}", text_line),
-                Style::default().fg(Color::White).bg(BG_NOTE),
+                Style::default().fg(theme().text).bg(theme().popup_bg),
             )));
         }
 
@@ -2387,7 +2410,7 @@ fn draw_comment_input(frame: &mut Frame, app: &App) {
         byte_count = line_end + if i < text_lines.len() - 1 { 1 } else { 0 };
     }
 
-    let para = Paragraph::new(display_lines).style(Style::default().bg(BG_NOTE));
+    let para = Paragraph::new(display_lines).style(Style::default().bg(theme().popup_bg));
     frame.render_widget(para, inner);
 }
 
@@ -2414,18 +2437,15 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
 
     let filtered_count = app.filtered_comment_indices().len();
     let title = if browser.query.is_empty() {
-        format!(" Notes ({}) — type to filter ", comments.len())
+        format!("Notes  {}", comments.len())
     } else {
-        format!(
-            " Notes {}/{} — type to filter ",
-            filtered_count,
-            comments.len()
-        )
+        format!("Notes  {}/{}", filtered_count, comments.len())
     };
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .style(Style::default().bg(BG_NOTE).fg(FG_COMMENT));
+    let block = popup_block(
+        &title,
+        "type to filter · ↵ jump · y copy · space check · d delete",
+    )
+    .border_style(Style::default().fg(theme().note));
     let inner = block.inner(popup_area);
     frame.render_widget(block, popup_area);
 
@@ -2434,12 +2454,8 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
     }
 
     // Input line
-    let input_text = format!(" > {}_", browser.query);
-    let input_line = Paragraph::new(Line::from(Span::styled(
-        input_text,
-        Style::default().fg(FG_COMMENT),
-    )))
-    .style(Style::default().bg(BG_NOTE));
+    let input_line =
+        Paragraph::new(prompt_line(&browser.query)).style(Style::default().bg(theme().popup_bg));
     let input_area = Rect::new(inner.x, inner.y, inner.width, 1);
     frame.render_widget(input_line, input_area);
 
@@ -2447,9 +2463,9 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
     let hint_area = Rect::new(inner.x, inner.y + inner.height - 1, inner.width, 1);
     let hint = Paragraph::new(Line::from(Span::styled(
         " ↵ jump to hunk   y copy checked   space check/uncheck   d delete   Esc close",
-        Style::default().fg(FG_MUTED),
+        Style::default().fg(theme().muted),
     )))
-    .style(Style::default().bg(BG_NOTE));
+    .style(Style::default().bg(theme().popup_bg));
     frame.render_widget(hint, hint_area);
 
     // Comment list
@@ -2470,7 +2486,7 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
     if comments.is_empty() {
         lines.push(Line::from(Span::styled(
             "  No review notes yet — right-click a hunk to add one",
-            Style::default().fg(FG_MUTED).bg(BG_NOTE),
+            Style::default().fg(theme().muted).bg(theme().popup_bg),
         )));
     } else {
         let filtered = app.filtered_comment_indices();
@@ -2492,12 +2508,9 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
                 .unwrap_or(0);
 
             let header_style = if is_selected {
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(FG_COMMENT)
-                    .add_modifier(Modifier::BOLD)
+                theme().selection().fg(theme().note)
             } else {
-                Style::default().fg(FG_COMMENT).bg(BG_NOTE)
+                Style::default().fg(theme().note).bg(theme().popup_bg)
             };
 
             lines.push(Line::from(Span::styled(
@@ -2507,9 +2520,9 @@ fn draw_comment_browser(frame: &mut Frame, app: &App) {
 
             // Show comment text
             let text_style = if is_selected {
-                Style::default().fg(Color::White).bg(Color::Rgb(40, 40, 30))
+                Style::default().fg(theme().text).bg(Color::Rgb(40, 40, 30))
             } else {
-                Style::default().fg(Color::White).bg(BG_NOTE)
+                Style::default().fg(theme().text).bg(theme().popup_bg)
             };
 
             for text_line in c.text.lines() {
@@ -2621,14 +2634,15 @@ mod tests {
             total_new_lines: 12,
             sbs_cache: None,
         }];
-        // A 19x8 terminal gives the diff an inner area of 17x4; the 13-column gutter
-        // leaves four content columns, so the line wraps into three chunks.
+        // A 19x7 terminal (tab strip, rule, four content rows, status) gives the diff an
+        // inner area of 17x4; the 13-column gutter leaves four content columns, so the
+        // line wraps into three chunks.
         app.layout.content_width = 17;
         app.layout.content_height = 4;
         app.prepare_active_layout();
         app.jump_active_viewport_bottom();
 
-        let backend = TestBackend::new(19, 8);
+        let backend = TestBackend::new(19, 7);
         let mut terminal = Terminal::new(backend).unwrap();
         let highlighter = Highlighter::new();
         let mut hints = LayoutHints::default();
@@ -2694,7 +2708,7 @@ mod tests {
         app.prepare_active_layout();
         app.jump_active_viewport_bottom();
 
-        let backend = TestBackend::new(28, 8);
+        let backend = TestBackend::new(28, 7);
         let mut terminal = Terminal::new(backend).unwrap();
         let highlighter = Highlighter::new();
         let mut hints = LayoutHints::default();

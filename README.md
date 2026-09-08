@@ -73,6 +73,8 @@ changes /path/to/projects
 
 If you point it at a directory with multiple git repos, it opens them all in tabs. You can also add repos on the fly with `a`.
 
+Text uses your terminal's own colors, so it matches your shell and editor. Diff tints and surfaces come in dark and light variants: `changes --theme light` or `CHANGES_THEME=light`.
+
 ## What to compare
 
 Two keys cover most of a review:

@@ -131,7 +131,7 @@ impl Highlighter {
         let cached = if let Some(cached) = self.highlight_cache.borrow_mut().get(&cache_key) {
             cached
         } else {
-            let theme = &self.theme_set.themes["base16-ocean.dark"];
+            let theme = &self.theme_set.themes[crate::theme::theme().syntax];
             let mut h = HighlightLines::new(syntax, theme);
             let regions = match h.highlight_line(text, &self.syntax_set) {
                 Ok(regions) => regions,

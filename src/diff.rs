@@ -247,6 +247,38 @@ fn align_hunk_lines(hunk: &Hunk) -> Vec<SideBySideLine> {
 /// diff is quadratic in the worst case and the result is unreadable anyway.
 const MAX_INLINE_DIFF_BYTES: usize = 4096;
 
+/// Word-level changed ranges for a hunk's lines in unified order: each run of deletions
+/// is paired positionally with the run of additions that follows it, exactly as the
+/// side-by-side view aligns them. Only lines that have ranges are returned.
+pub fn unified_emphasis(hunk: &Hunk) -> Vec<(usize, ChangedRanges)> {
+    let mut out = Vec::new();
+    let mut dels: Vec<usize> = Vec::new();
+    let mut adds: Vec<usize> = Vec::new();
+    let flush = |dels: &mut Vec<usize>, adds: &mut Vec<usize>, out: &mut Vec<_>| {
+        for (d, a) in dels.iter().zip(adds.iter()) {
+            let (left, right) =
+                compute_inline_diff(&hunk.lines[*d].content, &hunk.lines[*a].content);
+            if let Some(left) = left {
+                out.push((*d, left));
+            }
+            if let Some(right) = right {
+                out.push((*a, right));
+            }
+        }
+        dels.clear();
+        adds.clear();
+    };
+    for (idx, line) in hunk.lines.iter().enumerate() {
+        match line.kind {
+            LineKind::Deletion => dels.push(idx),
+            LineKind::Addition => adds.push(idx),
+            LineKind::Context => flush(&mut dels, &mut adds, &mut out),
+        }
+    }
+    flush(&mut dels, &mut adds, &mut out);
+    out
+}
+
 /// Compute word-level diff between two lines.
 /// Returns byte ranges of changed words in each line.
 fn compute_inline_diff(old: &str, new: &str) -> (Option<ChangedRanges>, Option<ChangedRanges>) {

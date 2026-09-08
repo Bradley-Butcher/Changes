@@ -78,7 +78,11 @@ fn handle_mouse_with_sender(app: &mut App, mouse: event::MouseEvent, gap_tx: Gap
                 return true;
             }
             MouseEventKind::Down(MouseButton::Left) if mouse.row >= app.layout.content_y => {
-                let row = (mouse.row as usize).saturating_sub(app.layout.content_y as usize)
+                let first_row = app.layout.content_y + crate::ui::OUTLINE_HEADER_ROWS;
+                if mouse.row < first_row {
+                    return false; // the heading
+                }
+                let row = (mouse.row as usize).saturating_sub(first_row as usize)
                     + app.outline.as_ref().map_or(0, |state| state.scroll);
                 if app.outline_select_row(row) {
                     app.outline_jump();

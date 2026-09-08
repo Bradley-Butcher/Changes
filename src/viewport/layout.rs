@@ -17,6 +17,8 @@ pub struct DiffLayout {
     comment_lines: HashMap<(usize, usize), Vec<String>>,
     /// Inline caller / callee lines per hunk, keyed by (file_idx, hunk_idx).
     call_context: HashMap<(usize, usize), Vec<String>>,
+    /// Word-level changed byte ranges for unified lines, keyed by (file, hunk, line).
+    emphasis: HashMap<(usize, usize, usize), crate::diff::ChangedRanges>,
     /// Every hunk in display order with the rows it occupies (header through last line).
     hunk_rows: Vec<HunkRows>,
     /// Gutter digit count per file, computed once here instead of per rendered row.
@@ -82,6 +84,11 @@ impl DiffLayout {
         }
 
         let mut call_context: HashMap<(usize, usize), Vec<String>> = HashMap::new();
+        let emphasis = if view_kind == ViewKind::Unified {
+            unified_emphasis_for(files)
+        } else {
+            HashMap::new()
+        };
 
         for (file_idx, file) in files.iter().enumerate() {
             let lno_w = lineno_widths[file_idx];
@@ -254,10 +261,23 @@ impl DiffLayout {
             file_header_rows,
             comment_lines,
             call_context,
+            emphasis,
             hunk_rows,
             lineno_widths,
             chunk_starts,
         }
+    }
+
+    /// Word-level changed ranges for a unified line, if any part of it changed in place.
+    pub fn emphasis(
+        &self,
+        file_idx: usize,
+        hunk_idx: usize,
+        line_idx: usize,
+    ) -> Option<&[(usize, usize)]> {
+        self.emphasis
+            .get(&(file_idx, hunk_idx, line_idx))
+            .map(Vec::as_slice)
     }
 
     /// Text of a `CallContext` row.
@@ -456,6 +476,52 @@ impl DiffLayout {
     pub fn hunk_has_comment(&self, file_idx: usize, hunk_idx: usize) -> bool {
         self.comment_lines.contains_key(&(file_idx, hunk_idx))
     }
+}
+
+/// Word-level emphasis for every unified line in the diff, spread across threads for
+/// large diffs. Whole-file additions and deletions have nothing to pair.
+fn unified_emphasis_for(
+    files: &[FileDiff],
+) -> HashMap<(usize, usize, usize), crate::diff::ChangedRanges> {
+    let jobs: Vec<(usize, usize, &crate::diff::Hunk)> = files
+        .iter()
+        .enumerate()
+        .filter(|(_, file)| !file.is_whole_file_change() && !file.collapsed)
+        .flat_map(|(file_idx, file)| {
+            file.hunks
+                .iter()
+                .enumerate()
+                .map(move |(hunk_idx, hunk)| (file_idx, hunk_idx, hunk))
+        })
+        .collect();
+    let total_lines: usize = jobs.iter().map(|(_, _, hunk)| hunk.lines.len()).sum();
+    let threads = std::thread::available_parallelism().map_or(1, |n| n.get());
+    let run = |chunk: &[(usize, usize, &crate::diff::Hunk)]| {
+        let mut out = Vec::new();
+        for (file_idx, hunk_idx, hunk) in chunk {
+            for (line_idx, ranges) in crate::diff::unified_emphasis(hunk) {
+                out.push(((*file_idx, *hunk_idx, line_idx), ranges));
+            }
+        }
+        out
+    };
+    let entries: Vec<((usize, usize, usize), crate::diff::ChangedRanges)> =
+        if total_lines < 8_000 || threads < 2 || jobs.len() < 2 {
+            run(&jobs)
+        } else {
+            let chunk_size = jobs.len().div_ceil(threads);
+            std::thread::scope(|scope| {
+                let handles: Vec<_> = jobs
+                    .chunks(chunk_size)
+                    .map(|chunk| scope.spawn(move || run(chunk)))
+                    .collect();
+                handles
+                    .into_iter()
+                    .flat_map(|handle| handle.join().expect("emphasis worker panicked"))
+                    .collect()
+            })
+        };
+    entries.into_iter().collect()
 }
 
 /// Call-context lines per hunk: one per changed function the index knows, at most three.
