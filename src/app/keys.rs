@@ -104,9 +104,8 @@ fn handle_key_with_set_mode(
         KeyCode::Char('v') => {
             app.toggle_view();
         }
-        KeyCode::Char('o') => {
-            app.toggle_outline();
-        }
+        KeyCode::Char('o') => app.show_overview(false),
+        KeyCode::Char('t') => app.show_overview(true),
 
         // Scrolling
         KeyCode::Char('j') | KeyCode::Down => {
@@ -316,7 +315,8 @@ pub fn handle_outline_key(app: &mut App, key: event::KeyEvent) -> bool {
     }
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
     match key.code {
-        KeyCode::Esc | KeyCode::Char('o') => app.close_outline(),
+        KeyCode::Esc => app.close_outline(),
+        KeyCode::Char('o') => app.show_overview(false),
         KeyCode::Char('j') | KeyCode::Down => app.outline_move(1),
         KeyCode::Char('k') | KeyCode::Up => app.outline_move(-1),
         KeyCode::Char('d') if ctrl => app.outline_move(app.half_page_size() as isize),
@@ -326,7 +326,7 @@ pub fn handle_outline_key(app: &mut App, key: event::KeyEvent) -> bool {
         KeyCode::Char('g') | KeyCode::Home => app.outline_jump_to_end(false),
         KeyCode::Char('G') | KeyCode::End => app.outline_jump_to_end(true),
         KeyCode::Enter => app.outline_jump(),
-        KeyCode::Char('t') => app.toggle_outline_flow(),
+        KeyCode::Char('t') => app.show_overview(true),
         KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => app.outline_set_expanded(true),
         KeyCode::Left | KeyCode::Char('h') => app.outline_set_expanded(false),
         KeyCode::Char('y') => match app.outline_markdown() {

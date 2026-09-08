@@ -412,13 +412,24 @@ impl App {
     }
 
     /// Switch the outline between the file tree and the flow view.
-    pub fn toggle_outline_flow(&mut self) {
-        let Some(state) = &mut self.outline else {
-            return;
-        };
-        state.flow = !state.flow;
-        state.scroll = 0;
-        self.open_outline();
+    /// Show one of the two overview views. `o` and `t` each open their view from the
+    /// diff, switch to it from the other view, and return to the diff when pressed again.
+    pub fn show_overview(&mut self, flow: bool) {
+        match &mut self.outline {
+            Some(state) if state.flow == flow => self.close_outline(),
+            Some(state) => {
+                state.flow = flow;
+                state.scroll = 0;
+                self.open_outline();
+            }
+            None => {
+                self.open_outline();
+                if flow && let Some(state) = &mut self.outline {
+                    state.flow = true;
+                    self.open_outline();
+                }
+            }
+        }
     }
 
     /// Show or hide the callers and callees of the symbol the cursor is on.
@@ -463,11 +474,7 @@ impl App {
     }
 
     pub fn toggle_outline(&mut self) {
-        if self.outline.is_some() {
-            self.close_outline();
-        } else {
-            self.open_outline();
-        }
+        self.show_overview(false);
     }
 
     /// Recompute rows after the diff changed, keeping the cursor on the same file.

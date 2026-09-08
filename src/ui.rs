@@ -395,7 +395,7 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
         (true, true) => ("Flow", "indexing calls…"),
         (false, true) => (
             "Flow",
-            "routes from entry points to changed code · ↵ open · t tree · y copy · o diff",
+            "routes from entry points to changed code · ↵ open · o outline · y copy · t diff",
         ),
         (false, false) => ("Outline", "↵ open · → callers · t flow · y copy · o diff"),
     };
@@ -1759,7 +1759,16 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
         spans.push(Span::styled(msg, style));
     } else {
         // A few key hints for the current view, dropped from the right when space is tight.
-        let hints_full: &[(&str, &str)] = if app.outline.is_some() {
+        let in_flow = app.outline.as_ref().is_some_and(|o| o.flow);
+        let hints_full: &[(&str, &str)] = if in_flow {
+            &[
+                ("↵", "open"),
+                ("o", "outline"),
+                ("y", "copy"),
+                ("t", "diff"),
+                ("?", "help"),
+            ]
+        } else if app.outline.is_some() {
             &[
                 ("↵", "open"),
                 ("t", "flow"),
@@ -1772,7 +1781,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
                 ("y", "copy"),
                 ("n", "note"),
                 ("o", "outline"),
-                ("]", "next hunk"),
+                ("t", "flow"),
                 ("?", "help"),
             ]
         };
@@ -2217,7 +2226,7 @@ const HELP_LEFT: HelpColumn = &[
             ("B", "Pick what to compare against"),
             ("v", "Unified ↔ side-by-side"),
             ("o", "Outline: files and symbols"),
-            ("t", "Flow view (in the outline)"),
+            ("t", "Flow: routes into the change"),
             ("p", "Preview focused .md file"),
         ],
     ),
