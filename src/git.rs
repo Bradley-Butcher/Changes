@@ -36,7 +36,13 @@ pub enum Base {
     Upstream,
     /// A ref the user typed.
     Ref(String),
+    /// The empty tree: everything the repository has ever contained. The reference point
+    /// for a fresh repo with no remote and no other branch, and for "show me all of it".
+    Root,
 }
+
+/// The name `Base::Root` resolves to, shown in labels and the picker.
+pub const ROOT_BASE_NAME: &str = "repository start";
 
 /// The branches a repo could be compared against, detected once per refresh.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -55,13 +61,24 @@ impl BaseCandidates {
     /// on main with base main) falls through to its upstream, which shows unpushed work.
     pub fn resolve(&self, base: &Base) -> Option<String> {
         let name = match base {
-            Base::Parent => self.parent.clone().or_else(|| self.trunk.clone())?,
+            Base::Parent => match self.parent.clone().or_else(|| self.trunk.clone()) {
+                Some(name) => name,
+                // Nothing to diverge from at all: a fresh repository. Everything since
+                // the first commit is the only sensible branch view.
+                None => return Some(ROOT_BASE_NAME.to_string()),
+            },
             Base::Trunk => self.trunk.clone()?,
             Base::Upstream => return self.upstream.clone(),
             Base::Ref(name) => name.clone(),
+            Base::Root => return Some(ROOT_BASE_NAME.to_string()),
         };
         if self.branch.as_deref() == Some(name.as_str()) {
-            return self.upstream.clone();
+            // On trunk itself: unpushed work if there is an upstream, otherwise the whole
+            // history, which is what a repo that has never been pushed can show.
+            return self
+                .upstream
+                .clone()
+                .or_else(|| (*base == Base::Parent).then(|| ROOT_BASE_NAME.to_string()));
         }
         Some(name)
     }
@@ -82,6 +99,10 @@ impl DiffMode {
             DiffMode::Staged => Cow::Borrowed("Staged"),
             DiffMode::Unstaged => Cow::Borrowed("Unstaged"),
             DiffMode::Branch { base, commits_only } => match bases.resolve(base) {
+                Some(name) if name == ROOT_BASE_NAME && *commits_only => {
+                    Cow::Borrowed("All commits")
+                }
+                Some(name) if name == ROOT_BASE_NAME => Cow::Borrowed("Everything"),
                 Some(name) if *commits_only => Cow::Owned(format!("vs {name}, commits only")),
                 Some(name) => Cow::Owned(format!("vs {name}")),
                 None => Cow::Borrowed("Branch"),
@@ -851,6 +872,17 @@ fn branch_exists(repo: &Repository, branch: &str) -> bool {
 /// Fork point of `base_ref` and HEAD → HEAD, or → the working tree unless `commits_only`.
 fn branch_diff_spec(repo: &Repository, base_ref: &str, commits_only: bool) -> Result<DiffSpec> {
     let head = repo.head()?.peel_to_commit()?;
+    if base_ref == ROOT_BASE_NAME {
+        // The empty tree: every file the repository holds is an addition.
+        return Ok(if commits_only {
+            DiffSpec::TreeToTree {
+                old_tree: repo.treebuilder(None)?.write()?,
+                new_tree: head.tree()?.id(),
+            }
+        } else {
+            DiffSpec::TreeToWorkdir { old_tree: None }
+        });
+    }
     let base_commit = base_commit(repo, base_ref)?;
     let merge_base = repo.merge_base(base_commit.id(), head.id())?;
     let merge_base_tree = repo.find_commit(merge_base)?.tree()?.id();
@@ -888,8 +920,9 @@ fn base_commit<'repo>(repo: &'repo Repository, base_ref: &str) -> Result<git2::C
 mod tests {
     use super::{
         Base, BaseCandidates, DiffMode, DiffSpec, MAX_UNTRACKED_FILE_BYTES, MAX_UNTRACKED_LINES,
-        PARALLEL_MIN_DELTAS, build_diff, collect_files_parallel, collect_files_serial,
-        collect_files_via_print, compute_diff, count_lines, delta_path, read_untracked_lines,
+        PARALLEL_MIN_DELTAS, ROOT_BASE_NAME, build_diff, collect_files_parallel,
+        collect_files_serial, collect_files_via_print, compute_diff, count_lines, delta_path,
+        read_untracked_lines,
     };
     use crate::diff::{FileDiff, FileStatus, LineKind};
     use git2::Delta;
@@ -1102,19 +1135,34 @@ mod tests {
             Some("origin/main")
         );
 
+        // On trunk with no upstream (a repo that has never been pushed), the branch view
+        // falls back to the whole history rather than having nothing to show.
         let unpushed_main = BaseCandidates {
             trunk: Some("main".to_string()),
             branch: Some("main".to_string()),
             ..BaseCandidates::default()
         };
-        assert_eq!(unpushed_main.resolve(&Base::Parent), None);
+        assert_eq!(
+            unpushed_main.resolve(&Base::Parent).as_deref(),
+            Some(ROOT_BASE_NAME)
+        );
+        assert_eq!(unpushed_main.resolve(&Base::Trunk), None);
         assert_eq!(
             DiffMode::Branch {
                 base: Base::Parent,
                 commits_only: false
             }
             .label(&unpushed_main),
-            "Branch"
+            "Everything"
+        );
+        // A brand-new repository has no trunk detected at all: same fallback.
+        let fresh = BaseCandidates {
+            branch: Some("main".to_string()),
+            ..BaseCandidates::default()
+        };
+        assert_eq!(
+            fresh.resolve(&Base::Parent).as_deref(),
+            Some(ROOT_BASE_NAME)
         );
         assert_eq!(
             DiffMode::Branch {
@@ -1124,6 +1172,48 @@ mod tests {
             .label(&stacked),
             "vs main, commits only"
         );
+    }
+
+    #[test]
+    fn a_fresh_repository_shows_its_whole_history_in_branch_mode() {
+        let root = temp_path("fresh-repo");
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        commit_all(&repo, "first");
+        std::fs::write(root.join("b.txt"), "two\n").unwrap();
+        commit_all(&repo, "second");
+        std::fs::write(root.join("c.txt"), "three\n").unwrap();
+        drop(repo);
+
+        let branch = DiffMode::Branch {
+            base: Base::Parent,
+            commits_only: false,
+        };
+        let mut paths: Vec<String> = compute_diff(&root, &branch, None)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            ["a.txt", "b.txt", "c.txt"],
+            "both commits plus the working tree"
+        );
+
+        let commits_only = DiffMode::Branch {
+            base: Base::Root,
+            commits_only: true,
+        };
+        let mut paths: Vec<String> = compute_diff(&root, &commits_only, None)
+            .unwrap()
+            .into_iter()
+            .map(|f| f.path)
+            .collect();
+        paths.sort();
+        assert_eq!(paths, ["a.txt", "b.txt"]);
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     fn describe(files: &[FileDiff]) -> Vec<String> {

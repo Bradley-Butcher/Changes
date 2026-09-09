@@ -310,6 +310,7 @@ impl App {
             push_base(Base::Trunk, "trunk");
         }
         push_base(Base::Upstream, "upstream, unpushed");
+        push_base(Base::Root, "everything since the first commit");
         rows.push(CompareRow::Staged);
         rows.push(CompareRow::Unstaged);
         rows.push(CompareRow::CommitsOnly);

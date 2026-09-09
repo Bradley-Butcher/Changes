@@ -135,8 +135,8 @@ The `┃` gutter bar marks the hunk that `y` / `n` / `N` act on. Click a hunk or
 | Key | Action |
 |-----|--------|
 | `m` | Local: uncommitted work vs HEAD (staged, unstaged, untracked) |
-| `b` | Branch: everything since the fork point with the stack parent or trunk, uncommitted work included |
-| `B` | Compare picker: trunk, upstream, staged, unstaged, a typed ref, and a "commits only" checkbox |
+| `b` | Branch: everything since the fork point with the stack parent or trunk, uncommitted work included. On a repo that has never been pushed, or is still on its first commits, this is everything since the first commit |
+| `B` | Compare picker: trunk, upstream, repository start, staged, unstaged, a typed ref, and a "commits only" checkbox |
 | `v` | Toggle unified / side-by-side view |
 | `o` | Outline: file tree + changed symbols (`Enter` opens, `→`/`←` show/hide callers and callees, `y` copies as markdown) |
 | `t` | Flow: routes from entry points to the changed code (`o` and `t` switch between the two views; pressing the current view's key returns to the diff) |

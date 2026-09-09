@@ -1107,7 +1107,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(names, ["pr2", "main", "origin/pr3"]);
+        assert_eq!(names, ["pr2", "main", "origin/pr3", "repository start"]);
 
         // On main, trunk and upstream both mean origin/main: one row, not two.
         app.repos[0].bases = Some(BaseCandidates {
@@ -1124,6 +1124,11 @@ mod tests {
                     base: Base::Trunk,
                     name: "origin/main".to_string(),
                     detail: "trunk",
+                },
+                CompareRow::Base {
+                    base: Base::Root,
+                    name: "repository start".to_string(),
+                    detail: "everything since the first commit",
                 },
                 CompareRow::Staged,
                 CompareRow::Unstaged,

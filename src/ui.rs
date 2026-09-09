@@ -1843,6 +1843,10 @@ fn empty_state_text(mode: &DiffMode, bases: &BaseCandidates) -> (String, &'stati
                     format!("> {name} not found"),
                     "Press B to pick another base.",
                 ),
+                Base::Root => (
+                    "> the repository is empty".to_string(),
+                    "Nothing has been committed or written here yet.",
+                ),
                 Base::Parent | Base::Trunk => (
                     "> base branch not detected".to_string(),
                     "No main/master branch or gt parent found. Press B to type a ref, or m for local changes.",
