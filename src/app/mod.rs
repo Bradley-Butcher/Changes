@@ -2706,6 +2706,8 @@ mod tests {
             since: false,
             base_label: "main".to_string(),
             previous_mode: DiffMode::Local,
+            anchor: None,
+            anchor_missed: false,
         };
         assert_eq!(
             state.mode(),
