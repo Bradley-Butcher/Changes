@@ -154,7 +154,7 @@ async fn run_loop(
 
     loop {
         if needs_redraw {
-            let content_area = ui::diff_inner_area(terminal.size()?.into());
+            let content_area = ui::diff_inner_area(terminal.size()?.into(), app.timeline_rows());
             app.layout.content_y = content_area.y;
             app.layout.content_height = content_area.height;
             app.layout.content_width = content_area.width;
@@ -300,6 +300,9 @@ fn handle_event(
         AppEvent::Terminal(Event::Mouse(m)) => {
             if mouse::handle_mouse_bounded(app, m, &ch.gap_tx) {
                 *needs_redraw = true;
+            }
+            if let Some(mode) = app.pending_mode.take() {
+                app.set_mode_bounded(mode, &ch.diff_tx);
             }
         }
         AppEvent::Terminal(Event::Resize(_, _)) => {

@@ -2,7 +2,9 @@ pub mod keys;
 pub mod mouse;
 
 use crate::diff::{DiffLine, FileDiff, LineKind};
-use crate::git::{self, Base, BaseCandidates, DiffMode, RepoInfo};
+use crate::git::{
+    self, Base, BaseCandidates, DiffMode, RangeEnd, RangeKind, RepoInfo, TimelineStep,
+};
 use crate::outline::{self, OutlineRow};
 use crate::symbols::SymbolIndex;
 use crate::ui::LayoutHints;
@@ -79,6 +81,8 @@ pub struct RepoState {
     pub files: Vec<FileDiff>,
     /// Branches this repo can be compared against; None until detection has run once.
     pub bases: Option<BaseCandidates>,
+    /// The timeline strip, when open: commits from the base to HEAD plus the working tree.
+    pub timeline: Option<TimelineState>,
     /// Whether branch comparisons leave uncommitted work out. Remembered across mode
     /// switches so `b` comes back to the same view the picker last set up.
     pub commits_only: bool,
@@ -159,6 +163,53 @@ pub struct OutlineState {
     pub flow: bool,
 }
 
+/// Scrubbing through the commits between the base and the working tree.
+pub struct TimelineState {
+    pub steps: Vec<TimelineStep>,
+    /// Index into `steps`.
+    pub cursor: usize,
+    /// Show everything from the base up to the cursor, rather than the cursor's own step.
+    pub since: bool,
+    /// What the base was called when the timeline opened, for the strip's first node.
+    pub base_label: String,
+    /// The mode to return to when the timeline closes.
+    pub previous_mode: DiffMode,
+    /// The function the user was on before the last move, kept while steps that do not
+    /// contain it go by so scrubbing snaps back to it when it reappears.
+    pub anchor: Option<(String, Option<String>)>,
+    /// Whether the last move failed to find the anchor.
+    pub anchor_missed: bool,
+}
+
+impl TimelineState {
+    /// The diff to show for the step under the cursor.
+    pub fn mode(&self) -> DiffMode {
+        let step = &self.steps[self.cursor];
+        let to = match &step.id {
+            Some(id) => RangeEnd::Commit(id.clone()),
+            None => RangeEnd::Workdir,
+        };
+        let from = if self.since {
+            self.steps.first().and_then(|first| first.parent.clone())
+        } else {
+            step.parent.clone()
+        };
+        DiffMode::Range {
+            from,
+            to,
+            kind: if self.since {
+                RangeKind::Since
+            } else {
+                RangeKind::Step
+            },
+        }
+    }
+
+    pub fn current(&self) -> &TimelineStep {
+        &self.steps[self.cursor]
+    }
+}
+
 /// Diffs with at least this many files open in the outline first, so the shape of the
 /// change is visible before any single hunk.
 pub const OUTLINE_AUTO_OPEN_FILES: usize = 15;
@@ -194,6 +245,12 @@ pub struct App {
     pub last_click: Option<(u16, u16, Instant)>,
     diff_worker: Option<DiffWorker>,
     index_worker: Option<IndexWorker>,
+    /// Where to land after the next diff arrives: (file path, function identifier).
+    /// Set when the timeline moves, so scrubbing keeps the same function in view.
+    pending_anchor: Option<(String, Option<String>)>,
+    /// A mode change requested from somewhere without a diff channel (mouse clicks);
+    /// the run loop applies it after the event.
+    pub pending_mode: Option<DiffMode>,
 }
 
 impl App {
@@ -207,6 +264,7 @@ impl App {
                 mode: DiffMode::Local,
                 files: Vec::new(),
                 bases: None,
+                timeline: None,
                 commits_only: false,
                 unified_layout: None,
                 sbs_layout: None,
@@ -255,6 +313,8 @@ impl App {
             last_click: None,
             diff_worker: None,
             index_worker: None,
+            pending_anchor: None,
+            pending_mode: None,
         }
     }
 
@@ -382,6 +442,164 @@ impl App {
         self.focused_file = self.focused_file_from_scroll();
         if self.outline.is_some() {
             self.rebuild_outline();
+        }
+    }
+
+    // -- Timeline --
+
+    /// Rows the timeline strip occupies above the content, 0 when closed.
+    pub fn timeline_rows(&self) -> u16 {
+        if self.repos[self.active_tab].timeline.is_some() {
+            crate::ui::TIMELINE_ROWS
+        } else {
+            0
+        }
+    }
+
+    pub fn timeline(&self) -> Option<&TimelineState> {
+        self.repos[self.active_tab].timeline.as_ref()
+    }
+
+    /// Open the timeline on the working tree, or close it. Returns the diff mode to
+    /// switch to, or None when the repository has no commits to walk.
+    pub fn timeline_toggle(&mut self) -> Option<DiffMode> {
+        if let Some(state) = self.repos[self.active_tab].timeline.take() {
+            return Some(state.previous_mode);
+        }
+        // Base detection is lazy; the timeline needs it now to know where to start.
+        if self.repos[self.active_tab].bases.is_none() {
+            let path = self.repos[self.active_tab].info.path.clone();
+            self.repos[self.active_tab].bases = Some(git::detect_bases(&path));
+        }
+        let repo = &self.repos[self.active_tab];
+        let bases = self.current_bases();
+        let base = bases.resolve(&crate::git::Base::Parent);
+        let mut base_label = base.clone().unwrap_or_else(|| "start".to_string());
+        let mut steps =
+            match git::timeline_steps(&repo.info.path, base.as_deref(), git::MAX_TIMELINE_STEPS) {
+                Ok(steps) => steps,
+                Err(error) => {
+                    self.set_status(format!("Timeline unavailable: {error}"));
+                    return None;
+                }
+            };
+        // Nothing unmerged (a pushed trunk, say): scrub recent history instead.
+        if steps.len() < 2 {
+            steps = match git::timeline_steps(&repo.info.path, None, git::HISTORY_TIMELINE_STEPS) {
+                Ok(steps) => steps,
+                Err(error) => {
+                    self.set_status(format!("Timeline unavailable: {error}"));
+                    return None;
+                }
+            };
+            base_label = format!("{} earlier", git::HISTORY_TIMELINE_STEPS);
+            if steps.len() - 1 < git::HISTORY_TIMELINE_STEPS {
+                base_label = "repository start".to_string();
+            }
+        }
+        if steps.len() < 2 {
+            self.set_status("No commits to scrub through yet");
+            return None;
+        }
+        // Start on the working tree when there is uncommitted work, else on HEAD.
+        let clean = repo.mode == DiffMode::Local && repo.files.is_empty();
+        let state = TimelineState {
+            cursor: steps.len() - 1 - usize::from(clean),
+            steps,
+            since: false,
+            base_label,
+            previous_mode: repo.mode.clone(),
+            anchor: None,
+            anchor_missed: false,
+        };
+        let mode = state.mode();
+        self.repos[self.active_tab].timeline = Some(state);
+        Some(mode)
+    }
+
+    /// The anchor to carry across a move: the focused function, unless the last move
+    /// missed, in which case the earlier anchor stays so it can be found again.
+    fn carry_anchor(&mut self) -> Option<(String, Option<String>)> {
+        let focused = self.focus_anchor();
+        let state = self.repos[self.active_tab].timeline.as_mut()?;
+        if !state.anchor_missed || state.anchor.is_none() {
+            state.anchor = focused;
+        }
+        state.anchor.clone()
+    }
+
+    /// Move the cursor by `delta` steps; None when already at the end.
+    pub fn timeline_move(&mut self, delta: isize) -> Option<DiffMode> {
+        let anchor = self.carry_anchor();
+        let state = self.repos[self.active_tab].timeline.as_mut()?;
+        let next = state
+            .cursor
+            .saturating_add_signed(delta)
+            .min(state.steps.len() - 1);
+        if next == state.cursor {
+            return None;
+        }
+        state.cursor = next;
+        let mode = state.mode();
+        self.pending_anchor = anchor;
+        Some(mode)
+    }
+
+    pub fn timeline_jump(&mut self, index: usize) -> Option<DiffMode> {
+        let anchor = self.carry_anchor();
+        let state = self.repos[self.active_tab].timeline.as_mut()?;
+        if index >= state.steps.len() || index == state.cursor {
+            return None;
+        }
+        state.cursor = index;
+        let mode = state.mode();
+        self.pending_anchor = anchor;
+        Some(mode)
+    }
+
+    pub fn timeline_toggle_since(&mut self) -> Option<DiffMode> {
+        let anchor = self.carry_anchor();
+        let state = self.repos[self.active_tab].timeline.as_mut()?;
+        state.since = !state.since;
+        let mode = state.mode();
+        self.pending_anchor = anchor;
+        Some(mode)
+    }
+
+    /// The file and function the focused hunk is in, for re-anchoring after a refresh.
+    fn focus_anchor(&self) -> Option<(String, Option<String>)> {
+        let (file_idx, hunk_idx) = self.focused_hunk()?;
+        let repo = self.repos.get(self.active_tab)?;
+        let file = repo.files.get(file_idx)?;
+        let ident = outline::file_symbols_with(file, repo.symbols.as_deref())
+            .into_iter()
+            .find(|symbol| symbol.hunk_idx == hunk_idx)
+            .and_then(|symbol| symbol.ident);
+        Some((file.path.clone(), ident))
+    }
+
+    /// After a timeline move, land on the same function (or file) in the new diff.
+    fn apply_pending_anchor(&mut self) {
+        let Some((path, ident)) = self.pending_anchor.take() else {
+            return;
+        };
+        let repo = &self.repos[self.active_tab];
+        let file_idx = repo.files.iter().position(|file| file.path == path);
+        let hunk = file_idx.and_then(|file_idx| {
+            let ident = ident.as_deref()?;
+            outline::file_symbols_with(&repo.files[file_idx], repo.symbols.as_deref())
+                .into_iter()
+                .find(|symbol| symbol.ident.as_deref() == Some(ident))
+                .map(|symbol| symbol.hunk_idx)
+        });
+        let hit = hunk.is_some() || (ident.is_none() && file_idx.is_some());
+        if let Some(state) = self.repos[self.active_tab].timeline.as_mut() {
+            state.anchor_missed = !hit;
+        }
+        match (file_idx, hunk) {
+            (Some(file_idx), Some(hunk_idx)) => self.select_hunk(file_idx, hunk_idx),
+            (Some(file_idx), None) => self.jump_to_file(file_idx),
+            (None, _) => self.jump_active_viewport_top(),
         }
     }
 
@@ -663,16 +881,27 @@ impl App {
 
     pub fn set_mode(&mut self, mode: DiffMode, diff_tx: &mpsc::UnboundedSender<DiffResult>) {
         self.remember_mode(&mode);
+        if !matches!(mode, DiffMode::Range { .. }) {
+            self.repos[self.active_tab].timeline = None;
+        }
         self.repos[self.active_tab].mode = mode;
         self.refresh_repo_async(self.active_tab, diff_tx);
-        self.jump_active_viewport_top();
+        if self.pending_anchor.is_none() {
+            self.jump_active_viewport_top();
+        }
     }
 
     pub(crate) fn set_mode_bounded(&mut self, mode: DiffMode, diff_tx: &mpsc::Sender<DiffResult>) {
         self.remember_mode(&mode);
+        // Leaving the timeline by any other route drops it; its moves keep the anchor.
+        if !matches!(mode, DiffMode::Range { .. }) {
+            self.repos[self.active_tab].timeline = None;
+        }
         self.repos[self.active_tab].mode = mode;
         self.refresh_repo_async_bounded(self.active_tab, diff_tx);
-        self.jump_active_viewport_top();
+        if self.pending_anchor.is_none() {
+            self.jump_active_viewport_top();
+        }
     }
 
     fn remember_mode(&mut self, mode: &DiffMode) {
@@ -1224,6 +1453,7 @@ impl App {
             mode: DiffMode::Local,
             files: Vec::new(),
             bases: None,
+            timeline: None,
             commits_only: false,
             unified_layout: None,
             sbs_layout: None,
@@ -1350,6 +1580,7 @@ impl App {
                 self.request_index(idx, Some(changed_paths));
                 if idx == self.active_tab {
                     self.focused_file = self.focused_file_from_scroll();
+                    self.apply_pending_anchor();
                     let file_count = self.repos[idx].files.len();
                     if self.outline.is_some() {
                         self.rebuild_outline();
@@ -2453,6 +2684,82 @@ mod tests {
             !app.repos[0].files[0].collapsed,
             "explicit expand survives a refresh"
         );
+    }
+
+    #[test]
+    fn timeline_state_maps_cursor_and_mode_to_a_range() {
+        use crate::git::{RangeEnd, RangeKind, TimelineStep};
+        let step = |id: Option<&str>, parent: Option<&str>| TimelineStep {
+            id: id.map(str::to_string),
+            short: id.unwrap_or("now").chars().take(7).collect(),
+            subject: String::new(),
+            when: String::new(),
+            parent: parent.map(str::to_string),
+        };
+        let mut state = super::TimelineState {
+            steps: vec![
+                step(Some("aaaa"), Some("base")),
+                step(Some("bbbb"), Some("aaaa")),
+                step(None, Some("bbbb")),
+            ],
+            cursor: 1,
+            since: false,
+            base_label: "main".to_string(),
+            previous_mode: DiffMode::Local,
+        };
+        assert_eq!(
+            state.mode(),
+            DiffMode::Range {
+                from: Some("aaaa".to_string()),
+                to: RangeEnd::Commit("bbbb".to_string()),
+                kind: RangeKind::Step,
+            }
+        );
+        state.since = true;
+        state.cursor = 2;
+        assert_eq!(
+            state.mode(),
+            DiffMode::Range {
+                from: Some("base".to_string()),
+                to: RangeEnd::Workdir,
+                kind: RangeKind::Since,
+            }
+        );
+    }
+
+    #[test]
+    fn scrubbing_keeps_the_same_function_in_view() {
+        let mut app = app_with_two_files_of_three_hunks();
+        // Give each hunk a declaration so it has a symbol to anchor on.
+        for file in &mut app.repos[0].files {
+            for (i, hunk) in file.hunks.iter_mut().enumerate() {
+                hunk.lines[0].content = format!("fn {}_{i}() {{}}", file.path.replace(".rs", ""));
+            }
+        }
+        let files = app.repos[0].files.clone();
+        app.apply_diff_result(0, Ok(files));
+        // Focus the second hunk of b.rs and remember it as the anchor.
+        app.select_hunk(1, 1);
+        let symbol = crate::outline::file_symbols(&app.repos[0].files[1])
+            .into_iter()
+            .find(|s| s.hunk_idx == 1)
+            .unwrap();
+        app.pending_anchor = Some(("b.rs".to_string(), symbol.ident.clone()));
+
+        // The next diff lists the files the other way round and drops a.rs's first hunk;
+        // the anchor still lands on the same function of b.rs.
+        let b = app.repos[0].files[1].clone();
+        let mut a = app.repos[0].files[0].clone();
+        a.hunks.remove(0);
+        app.apply_diff_result(0, Ok(vec![b, a]));
+        let (file_idx, hunk_idx) = app.focused_hunk().unwrap();
+        assert_eq!(app.repos[0].files[file_idx].path, "b.rs");
+        let landed = crate::outline::file_symbols(&app.repos[0].files[file_idx])
+            .into_iter()
+            .find(|s| s.hunk_idx == hunk_idx)
+            .unwrap();
+        assert_eq!(landed.ident, symbol.ident);
+        assert!(app.pending_anchor.is_none());
     }
 
     #[test]

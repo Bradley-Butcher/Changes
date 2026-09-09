@@ -56,7 +56,50 @@ fn handle_key_with_set_mode(
         KeyCode::Char('c') if ctrl => return true,
         // Esc only ever closes something; quitting is `q` so a stray Esc can't end a review.
         KeyCode::Esc => {
-            app.show_help = false;
+            if app.show_help {
+                app.show_help = false;
+            } else if app.timeline().is_some()
+                && let Some(mode) = app.timeline_toggle()
+            {
+                set_mode(app, mode);
+            }
+        }
+
+        // Timeline: scrub through the commits between the base and the working tree.
+        KeyCode::Char('l') => {
+            if let Some(mode) = app.timeline_toggle() {
+                set_mode(app, mode);
+            }
+        }
+        KeyCode::Char('>') | KeyCode::Char('.') if app.timeline().is_some() => {
+            if let Some(mode) = app.timeline_move(1) {
+                set_mode(app, mode);
+            } else {
+                app.set_status("At the working tree — the newest point on the timeline");
+            }
+        }
+        KeyCode::Char('<') | KeyCode::Char(',') if app.timeline().is_some() => {
+            if let Some(mode) = app.timeline_move(-1) {
+                set_mode(app, mode);
+            } else {
+                app.set_status("At the first commit on the timeline");
+            }
+        }
+        KeyCode::Char('}') if app.timeline().is_some() => {
+            let last = app.timeline().map(|t| t.steps.len() - 1).unwrap_or(0);
+            if let Some(mode) = app.timeline_jump(last) {
+                set_mode(app, mode);
+            }
+        }
+        KeyCode::Char('{') if app.timeline().is_some() => {
+            if let Some(mode) = app.timeline_jump(0) {
+                set_mode(app, mode);
+            }
+        }
+        KeyCode::Char('s') if app.timeline().is_some() => {
+            if let Some(mode) = app.timeline_toggle_since() {
+                set_mode(app, mode);
+            }
         }
         KeyCode::Char('?') => {
             app.show_help = !app.show_help;

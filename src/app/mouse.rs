@@ -142,6 +142,22 @@ fn handle_mouse_with_sender(app: &mut App, mouse: event::MouseEvent, gap_tx: Gap
                 return false;
             }
 
+            // Timeline strip: click a node to jump to that step.
+            if app.timeline().is_some() && click_row == app.layout.timeline_row {
+                let hit = app
+                    .layout
+                    .timeline_positions
+                    .iter()
+                    .find(|(_, start, end)| click_col >= *start && click_col < *end)
+                    .map(|(index, _, _)| *index);
+                if let Some(index) = hit
+                    && let Some(mode) = app.timeline_jump(index)
+                {
+                    app.pending_mode = Some(mode);
+                }
+                return true;
+            }
+
             // Tab bar
             if click_row == app.layout.tab_bar_row {
                 for (i, &(start, end)) in app.layout.tab_positions.iter().enumerate() {

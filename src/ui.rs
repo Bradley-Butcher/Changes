@@ -1,6 +1,6 @@
 use crate::app::{App, CompareRow};
 use crate::diff::{FileStatus, LineKind};
-use crate::git::{Base, BaseCandidates, DiffMode};
+use crate::git::{Base, BaseCandidates, DiffMode, RangeKind};
 use crate::highlight::Highlighter;
 use crate::outline::{self, OutlineRow, SymbolChange, hunk_context};
 use crate::theme::theme;
@@ -48,6 +48,25 @@ fn prompt_line(query: &str) -> Line<'static> {
     ])
 }
 
+/// Truncate to `width` columns with an ellipsis.
+fn fit_to_width(text: &str, width: usize) -> String {
+    if UnicodeWidthStr::width(text) <= width {
+        return text.to_string();
+    }
+    let mut out = String::new();
+    let mut used = 0;
+    for c in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w + 1 > width {
+            break;
+        }
+        out.push(c);
+        used += w;
+    }
+    out.push('…');
+    out
+}
+
 /// Bold title on the left, muted key hints on the right, on the first row of a view.
 fn draw_view_heading(frame: &mut Frame, area: Rect, title: &str, hint: &str) {
     let width = area.width as usize;
@@ -70,6 +89,9 @@ fn draw_view_heading(frame: &mut Frame, area: Rect, title: &str, hint: &str) {
 pub struct LayoutHints {
     pub tab_bar_row: u16,
     pub tab_positions: Vec<(u16, u16)>,
+    /// Screen row of the timeline strip and the column span of each visible step.
+    pub timeline_row: u16,
+    pub timeline_positions: Vec<(usize, u16, u16)>,
     pub mode_badge_pos: (u16, u16),
     pub view_badge_pos: (u16, u16),
     pub status_bar_row: u16,
@@ -78,13 +100,18 @@ pub struct LayoutHints {
     pub content_width: u16,
 }
 
-/// Screen rows: tab strip, a hairline rule, the content area, the status line.
-fn screen_chunks(area: Rect) -> std::rc::Rc<[Rect]> {
+/// Rows the timeline strip takes above the content when it is open.
+pub const TIMELINE_ROWS: u16 = 2;
+
+/// Screen rows: tab strip, a hairline rule, the timeline (when open), the content area,
+/// the status line.
+fn screen_chunks(area: Rect, timeline_rows: u16) -> std::rc::Rc<[Rect]> {
     Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(TAB_BAR_HEIGHT),
             Constraint::Length(1),
+            Constraint::Length(timeline_rows),
             Constraint::Min(1),
             Constraint::Length(1),
         ])
@@ -112,9 +139,9 @@ fn scrollbar_area(area: Rect) -> Rect {
     )
 }
 
-pub fn diff_inner_area(area: Rect) -> Rect {
-    let chunks = screen_chunks(area);
-    content_inner(chunks[2])
+pub fn diff_inner_area(area: Rect, timeline_rows: u16) -> Rect {
+    let chunks = screen_chunks(area, timeline_rows);
+    content_inner(chunks[3])
 }
 
 fn draw_scrollbar(frame: &mut Frame, area: Rect, total: usize, visible: usize, position: usize) {
@@ -144,18 +171,22 @@ fn draw_rule(frame: &mut Frame, area: Rect) {
 }
 
 pub fn draw(frame: &mut Frame, app: &App, highlighter: &Highlighter, hints: &mut LayoutHints) {
-    let chunks = screen_chunks(frame.area());
+    let timeline_rows = app.timeline_rows();
+    let chunks = screen_chunks(frame.area(), timeline_rows);
 
     // Compute content area top for mouse hit-testing
-    let diff_inner = diff_inner_area(frame.area());
+    let diff_inner = diff_inner_area(frame.area(), timeline_rows);
     hints.content_y = diff_inner.y;
     hints.content_height = diff_inner.height;
     hints.content_width = diff_inner.width;
 
     draw_tab_bar(frame, app, hints, chunks[0]);
     draw_rule(frame, chunks[1]);
-    draw_diff_area(frame, app, highlighter, chunks[2]);
-    draw_status_bar(frame, app, hints, chunks[3]);
+    if timeline_rows > 0 {
+        draw_timeline(frame, app, hints, chunks[2]);
+    }
+    draw_diff_area(frame, app, highlighter, chunks[3]);
+    draw_status_bar(frame, app, hints, chunks[4]);
 
     if app.markdown_preview.is_some() {
         draw_markdown_preview(frame, app);
@@ -289,6 +320,167 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rec
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
+}
+
+/// The timeline: a strip of nodes from the base to the working tree with the cursor
+/// highlighted, then a detail line for the step under the cursor. The strip windows
+/// around the cursor when the commits do not fit, like the tab strip.
+fn draw_timeline(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rect) {
+    let t = theme();
+    let Some(state) = app.timeline() else {
+        return;
+    };
+    hints.timeline_row = area.y;
+    hints.timeline_positions.clear();
+    let strip = Rect::new(area.x + 1, area.y, area.width.saturating_sub(2), 1);
+    let detail = Rect::new(area.x + 1, area.y + 1, area.width.saturating_sub(2), 1);
+
+    // One glyph per step so a whole branch fits on the strip; the detail line names the
+    // step under the cursor. Base on the left, working tree on the right.
+    let base_token = format!("○ {} ", state.base_label);
+    let base_width = UnicodeWidthStr::width(base_token.as_str());
+    let node_width = 2usize; // glyph plus a hairline
+    let available = strip.width as usize;
+    let count = state.steps.len();
+
+    // Window around the cursor when the commits do not fit, with counts for the hidden.
+    let marker_width = 10;
+    let fits = available.saturating_sub(base_width) / node_width;
+    let (first, last) = if count <= fits {
+        (0, count - 1)
+    } else {
+        let visible = available.saturating_sub(marker_width * 2) / node_width;
+        let half = visible / 2;
+        let first = state.cursor.saturating_sub(half).min(count - visible);
+        (first, (first + visible - 1).min(count - 1))
+    };
+
+    let mut spans: Vec<Span> = Vec::new();
+    let mut col = strip.x as usize;
+    let push = |spans: &mut Vec<Span>, col: &mut usize, text: String, style: Style| {
+        *col += UnicodeWidthStr::width(text.as_str());
+        spans.push(Span::styled(text, style));
+    };
+    if first == 0 {
+        push(&mut spans, &mut col, base_token, t.muted_style());
+    } else {
+        push(
+            &mut spans,
+            &mut col,
+            format!("‹ {first} more "),
+            t.muted_style(),
+        );
+    }
+    let rail = Style::default().fg(t.surface_raised);
+    for index in first..=last {
+        let step = &state.steps[index];
+        let is_cursor = index == state.cursor;
+        let included = state.since && index < state.cursor;
+        let (glyph, style) = match (step.id.is_none(), is_cursor, included) {
+            (_, true, _) => (
+                "◉",
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            ),
+            (true, false, _) => ("◌", t.muted_style()),
+            (false, false, true) => ("●", t.text_style()),
+            (false, false, false) => ("●", t.muted_style()),
+        };
+        let start = col as u16;
+        push(&mut spans, &mut col, "─".to_string(), rail);
+        push(&mut spans, &mut col, glyph.to_string(), style);
+        hints.timeline_positions.push((index, start, col as u16));
+    }
+    if last + 1 < count {
+        push(
+            &mut spans,
+            &mut col,
+            format!("─ {} more ›", count - last - 1),
+            t.muted_style(),
+        );
+    }
+    frame.render_widget(Paragraph::new(Line::from(spans)), strip);
+
+    // Detail line: mode and position, the step, then counts and hints. The subject is
+    // the only part allowed to give way when the line is too long.
+    let step = state.current();
+    let position = format!("{}/{}", state.cursor + 1, state.steps.len());
+    let mode_word = if state.since { "SINCE " } else { "STEP " };
+    let (adds, dels, file_count) = app
+        .current_files()
+        .map(|files| {
+            let (a, d) = files
+                .iter()
+                .fold((0, 0), |(a, d), f| (a + f.additions, d + f.deletions));
+            (a, d, files.len())
+        })
+        .unwrap_or((0, 0, 0));
+    let counts = format!(
+        "  ·  {} file{}  ",
+        file_count,
+        if file_count == 1 { "" } else { "s" }
+    );
+    let hint = "< > scrub · s since/step · l close";
+    let (sha, subject, when) = match &step.id {
+        Some(_) => (
+            step.short.clone(),
+            step.subject.clone(),
+            format!("  ·  {}", step.when),
+        ),
+        None => (
+            String::new(),
+            "working tree".to_string(),
+            "  ·  uncommitted".to_string(),
+        ),
+    };
+    let fixed_width = UnicodeWidthStr::width(mode_word)
+        + UnicodeWidthStr::width(position.as_str())
+        + 3
+        + UnicodeWidthStr::width(sha.as_str())
+        + 2
+        + UnicodeWidthStr::width(when.as_str())
+        + UnicodeWidthStr::width(counts.as_str())
+        + format!("+{adds} -{dels}").len();
+    let hint_room = UnicodeWidthStr::width(hint) + 3;
+    let total = detail.width as usize;
+    let subject_room = total
+        .saturating_sub(fixed_width + hint_room)
+        .max(total.saturating_sub(fixed_width) / 2);
+    let subject = fit_to_width(&subject, subject_room);
+
+    let mut detail_spans: Vec<Span> = vec![
+        Span::styled(
+            mode_word,
+            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(position, t.text_style()),
+        Span::styled("   ", t.muted_style()),
+    ];
+    if !sha.is_empty() {
+        detail_spans.push(Span::styled(sha, t.accent_style()));
+        detail_spans.push(Span::raw("  "));
+    }
+    detail_spans.push(Span::styled(subject, t.text_style()));
+    detail_spans.push(Span::styled(when, t.muted_style()));
+    detail_spans.push(Span::styled(counts, t.muted_style()));
+    detail_spans.push(Span::styled(
+        format!("+{adds}"),
+        Style::default().fg(t.add_fg),
+    ));
+    detail_spans.push(Span::styled(
+        format!(" -{dels}"),
+        Style::default().fg(t.del_fg),
+    ));
+    let used: usize = detail_spans
+        .iter()
+        .map(|s| UnicodeWidthStr::width(s.content.as_ref()))
+        .sum();
+    if used + hint_room <= total {
+        detail_spans.push(Span::raw(
+            " ".repeat(total - used - UnicodeWidthStr::width(hint)),
+        ));
+        detail_spans.push(Span::styled(hint, t.muted_style()));
+    }
+    frame.render_widget(Paragraph::new(Line::from(detail_spans)), detail);
 }
 
 fn draw_empty_state(frame: &mut Frame, app: &App, area: Rect) {
@@ -1760,7 +1952,15 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
     } else {
         // A few key hints for the current view, dropped from the right when space is tight.
         let in_flow = app.outline.as_ref().is_some_and(|o| o.flow);
-        let hints_full: &[(&str, &str)] = if in_flow {
+        let hints_full: &[(&str, &str)] = if app.timeline().is_some() && app.outline.is_none() {
+            &[
+                ("< >", "scrub"),
+                ("s", "since/step"),
+                ("y", "copy"),
+                ("o", "outline"),
+                ("l", "close timeline"),
+            ]
+        } else if in_flow {
             &[
                 ("↵", "open"),
                 ("o", "outline"),
@@ -1782,6 +1982,7 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
                 ("n", "note"),
                 ("o", "outline"),
                 ("t", "flow"),
+                ("l", "timeline"),
                 ("?", "help"),
             ]
         };
@@ -1810,6 +2011,16 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
 /// Headline and hint for a loaded diff with no files in it.
 fn empty_state_text(mode: &DiffMode, bases: &BaseCandidates) -> (String, &'static str) {
     match mode {
+        DiffMode::Range { kind, .. } => match kind {
+            RangeKind::Step => (
+                "> this step changed nothing".to_string(),
+                "Press > or < to move along the timeline, or l to leave it.",
+            ),
+            RangeKind::Since => (
+                "> nothing has changed up to this point".to_string(),
+                "Press > to move forward along the timeline, or l to leave it.",
+            ),
+        },
         DiffMode::Local => (
             "> I see no changes ... working tree clean".to_string(),
             "Watching for edits. Press b for the branch diff or B to pick what to compare.",
@@ -2231,6 +2442,8 @@ const HELP_LEFT: HelpColumn = &[
             ("v", "Unified ↔ side-by-side"),
             ("o", "Outline: files and symbols"),
             ("t", "Flow: routes into the change"),
+            ("l", "Timeline: scrub the commits"),
+            ("< >  s", "Timeline step / since mode"),
             ("p", "Preview focused .md file"),
         ],
     ),

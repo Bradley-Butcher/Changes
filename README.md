@@ -16,6 +16,7 @@ It's also agent-agnostic. You shouldn't have to use a specific app or IDE just t
 
 - **Outline view** — press `o` for the shape of the change: a file tree with `+/-` counts and the functions, types and classes each hunk adds, removes or touches. Big diffs open here first
 - **Callers and callees** — every changed function shows who calls it and what it calls, resolved with tree-sitter across the whole repo (Rust, Python, Go, JS/TS). In the diff it's one line under the hunk header; in the outline it expands into a call tree. New functions nobody calls and deleted functions that are still called are flagged
+- **Timeline** — `l` opens a strip of the commits from your base to the working tree. `<` and `>` scrub through them one step at a time, keeping the same function in view as it evolves; `s` switches between "what this commit changed" and "everything up to here"
 - **Flow view** — `t` draws the change as a call-tree diff rooted at entry points: `main → run → handle_event → + your_new_function`. Unchanged steps are context, changed ones carry `+`/`~`/`-`, and code no user route reaches is listed separately
 - **Multi-repo tabs** — watch agent changes across repos simultaneously
 - **Two views that matter** — `m` for everything uncommitted, `b` for the whole branch against its base (uncommitted work included). `B` picks anything else: trunk, upstream, staged only, a typed ref
@@ -140,6 +141,7 @@ The `┃` gutter bar marks the hunk that `y` / `n` / `N` act on. Click a hunk or
 | `v` | Toggle unified / side-by-side view |
 | `o` | Outline: file tree + changed symbols (`Enter` opens, `→`/`←` show/hide callers and callees, `y` copies as markdown) |
 | `t` | Flow: routes from entry points to the changed code (`o` and `t` switch between the two views; pressing the current view's key returns to the diff) |
+| `l` | Timeline: scrub the commits with `<` / `>` (`{` / `}` first / last, click a node), `s` toggles step / since, `l` or `Esc` closes |
 | `j` / `k`, `Ctrl+D` / `Ctrl+U`, `PgDn` / `PgUp` | Scroll by line, half page, page |
 | `g` / `G` | Jump to top / bottom |
 | `]` / `[` | Next / previous hunk |

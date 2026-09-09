@@ -23,6 +23,28 @@ pub enum DiffMode {
     Unstaged,
     /// Fork point with `base` → working tree, or → HEAD when `commits_only`.
     Branch { base: Base, commits_only: bool },
+    /// One step of the timeline: the tree of commit `from` (the empty tree when None) to
+    /// `to`. `kind` only affects the label: a single commit, or everything since the base.
+    Range {
+        from: Option<String>,
+        to: RangeEnd,
+        kind: RangeKind,
+    },
+}
+
+/// The new side of a `DiffMode::Range`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RangeEnd {
+    Commit(String),
+    Workdir,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RangeKind {
+    /// What one step of the timeline changed.
+    Step,
+    /// Everything from the base up to the cursor.
+    Since,
 }
 
 /// Which branch a `DiffMode::Branch` compares against, before it is resolved to a name.
@@ -85,11 +107,13 @@ impl BaseCandidates {
 }
 
 /// Where the "new" side of a diff lives; decides how file contents are read back.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NewSide {
     Workdir,
     Index,
     Head,
+    /// A specific commit's tree, for timeline steps.
+    Commit(String),
 }
 
 impl DiffMode {
@@ -107,6 +131,10 @@ impl DiffMode {
                 Some(name) => Cow::Owned(format!("vs {name}")),
                 None => Cow::Borrowed("Branch"),
             },
+            DiffMode::Range { kind, .. } => match kind {
+                RangeKind::Step => Cow::Borrowed("Step"),
+                RangeKind::Since => Cow::Borrowed("Since"),
+            },
         }
     }
 
@@ -121,6 +149,10 @@ impl DiffMode {
                     NewSide::Workdir
                 }
             }
+            DiffMode::Range { to, .. } => match to {
+                RangeEnd::Commit(id) => NewSide::Commit(id.clone()),
+                RangeEnd::Workdir => NewSide::Workdir,
+            },
         }
     }
 
@@ -267,6 +299,22 @@ pub fn compute_diff(
             };
             branch_diff_spec(&repo, &base_ref, *commits_only)?
         }
+        DiffMode::Range { from, to, .. } => {
+            let old_tree = match from {
+                Some(id) => Some(commit_tree(&repo, id)?),
+                None => None,
+            };
+            match to {
+                RangeEnd::Workdir => DiffSpec::TreeToWorkdir { old_tree },
+                RangeEnd::Commit(id) => DiffSpec::TreeToTree {
+                    old_tree: match old_tree {
+                        Some(tree) => tree,
+                        None => repo.treebuilder(None)?.write()?,
+                    },
+                    new_tree: commit_tree(&repo, id)?,
+                },
+            }
+        }
     };
     let diff = build_diff(&repo, spec)?;
     let new_side = mode.new_side();
@@ -339,7 +387,7 @@ pub fn compute_diff(
         if matches!(file.status, FileStatus::Deleted | FileStatus::Untracked) {
             continue;
         }
-        match new_side {
+        match &new_side {
             NewSide::Workdir => {
                 let path = repo_path.join(&file.path);
                 // Some platforms allow directories to be opened as files. Skip all
@@ -351,8 +399,8 @@ pub fn compute_diff(
                     file.total_new_lines = line_count;
                 }
             }
-            NewSide::Index | NewSide::Head => {
-                if let Ok(blob) = new_side_blob(&repo, Path::new(&file.path), new_side) {
+            NewSide::Index | NewSide::Head | NewSide::Commit(_) => {
+                if let Ok(blob) = new_side_blob(&repo, Path::new(&file.path), new_side.clone()) {
                     file.total_new_lines = count_blob_lines(&blob);
                 }
             }
@@ -681,8 +729,110 @@ pub fn new_side_blob(repo: &Repository, rel_path: &Path, side: NewSide) -> Resul
             .get_path(rel_path)
             .with_context(|| format!("{} is not in HEAD", rel_path.display()))?
             .id(),
+        NewSide::Commit(id) => repo
+            .find_tree(commit_tree(repo, &id)?)?
+            .get_path(rel_path)
+            .with_context(|| format!("{} is not in {id}", rel_path.display()))?
+            .id(),
     };
     Ok(repo.find_blob(oid)?.content().to_vec())
+}
+
+/// The tree of the commit `id` names.
+fn commit_tree(repo: &Repository, id: &str) -> Result<Oid> {
+    Ok(repo
+        .revparse_single(id)
+        .with_context(|| format!("'{id}' is not a commit"))?
+        .peel_to_commit()?
+        .tree_id())
+}
+
+/// One node of the timeline: a commit between the base and HEAD, or the working tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TimelineStep {
+    /// Full commit id; None for the working tree.
+    pub id: Option<String>,
+    pub short: String,
+    pub subject: String,
+    /// "2h ago", "3d ago".
+    pub when: String,
+    /// The commit before this one, or None when it is the first commit ever.
+    pub parent: Option<String>,
+}
+
+/// Commits are listed newest-first by git; the timeline keeps at most this many of the
+/// most recent, oldest on the left.
+pub const MAX_TIMELINE_STEPS: usize = 500;
+/// How far back plain history goes when the branch has nothing unmerged to walk.
+pub const HISTORY_TIMELINE_STEPS: usize = 100;
+
+/// The commits from the fork point with `base` (exclusive) to HEAD, oldest first, followed
+/// by the working tree. `base` is a branch, tag, commit, or `ROOT_BASE_NAME` for the whole
+/// history; None means HEAD's own history as far back as it goes.
+pub fn timeline_steps(
+    repo_path: &Path,
+    base: Option<&str>,
+    limit: usize,
+) -> Result<Vec<TimelineStep>> {
+    let repo = Repository::open(repo_path)
+        .with_context(|| format!("Failed to open repo: {}", repo_path.display()))?;
+    let head = repo.head()?.peel_to_commit()?;
+    let stop = match base {
+        Some(name) if name != ROOT_BASE_NAME => {
+            let base_commit = base_commit(&repo, name)?;
+            Some(repo.merge_base(base_commit.id(), head.id())?)
+        }
+        _ => None,
+    };
+
+    let mut walk = repo.revwalk()?;
+    walk.simplify_first_parent()?;
+    walk.push(head.id())?;
+    if let Some(stop) = stop {
+        walk.hide(stop)?;
+    }
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let mut steps: Vec<TimelineStep> = Vec::new();
+    for oid in walk.take(limit.min(MAX_TIMELINE_STEPS)) {
+        let commit = repo.find_commit(oid?)?;
+        let id = commit.id().to_string();
+        steps.push(TimelineStep {
+            short: id[..7.min(id.len())].to_string(),
+            id: Some(id),
+            subject: commit.summary().unwrap_or("").to_string(),
+            when: relative_time(now - commit.time().seconds()),
+            parent: commit.parent_id(0).ok().map(|p| p.to_string()),
+        });
+    }
+    steps.reverse();
+    steps.push(TimelineStep {
+        id: None,
+        short: "now".to_string(),
+        subject: "working tree".to_string(),
+        when: String::new(),
+        parent: Some(head.id().to_string()),
+    });
+    Ok(steps)
+}
+
+fn relative_time(seconds: i64) -> String {
+    let seconds = seconds.max(0);
+    if seconds < 60 {
+        "just now".to_string()
+    } else if seconds < 3600 {
+        format!("{}m ago", seconds / 60)
+    } else if seconds < 86_400 {
+        format!("{}h ago", seconds / 3600)
+    } else if seconds < 86_400 * 30 {
+        format!("{}d ago", seconds / 86_400)
+    } else if seconds < 86_400 * 365 {
+        format!("{}mo ago", seconds / (86_400 * 30))
+    } else {
+        format!("{}y ago", seconds / (86_400 * 365))
+    }
 }
 
 /// Lines `start..=end` (1-based) of `rel_path` on the new side of a diff in `mode`.
@@ -706,7 +856,7 @@ pub fn read_new_side_lines(
                 .map(|line| line.unwrap_or_default())
                 .collect())
         }
-        side @ (NewSide::Index | NewSide::Head) => {
+        side @ (NewSide::Index | NewSide::Head | NewSide::Commit(_)) => {
             let repo = Repository::open(repo_path)?;
             let blob = new_side_blob(&repo, rel_path, side)?;
             Ok(String::from_utf8_lossy(&blob)
@@ -1213,6 +1363,52 @@ mod tests {
             .collect();
         paths.sort();
         assert_eq!(paths, ["a.txt", "b.txt"]);
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn timeline_lists_commits_oldest_first_then_the_working_tree() {
+        let root = temp_path("timeline");
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        let first = commit_all(&repo, "first");
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        let second = commit_all(&repo, "second");
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        drop(repo);
+
+        let steps = super::timeline_steps(&root, Some(ROOT_BASE_NAME), 50).unwrap();
+        let subjects: Vec<&str> = steps.iter().map(|s| s.subject.as_str()).collect();
+        assert_eq!(subjects, ["first", "second", "working tree"]);
+        assert_eq!(steps[0].parent, None, "the first commit has no parent");
+        assert_eq!(steps[1].parent.as_deref(), Some(first.to_string().as_str()));
+        assert_eq!(steps[2].id, None);
+        assert_eq!(
+            steps[2].parent.as_deref(),
+            Some(second.to_string().as_str())
+        );
+
+        // A step is what that commit changed; since is everything up to it.
+        let step = DiffMode::Range {
+            from: steps[1].parent.clone(),
+            to: super::RangeEnd::Commit(second.to_string()),
+            kind: super::RangeKind::Step,
+        };
+        let files = compute_diff(&root, &step, None).unwrap();
+        assert_eq!(files[0].additions, 1);
+        let since = DiffMode::Range {
+            from: None,
+            to: super::RangeEnd::Workdir,
+            kind: super::RangeKind::Since,
+        };
+        let files = compute_diff(&root, &since, None).unwrap();
+        assert_eq!(files[0].additions, 3);
+
+        // Limited history stops early and reports the parent it stopped at.
+        let recent = super::timeline_steps(&root, None, 1).unwrap();
+        assert_eq!(recent.len(), 2);
+        assert_eq!(recent[0].subject, "second");
         std::fs::remove_dir_all(&root).unwrap();
     }
 
