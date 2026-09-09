@@ -17,6 +17,11 @@ pub const MAX_SNAPSHOTS_PER_BRANCH: usize = 400;
 
 const REF_ROOT: &str = "refs/changes/snapshots";
 
+/// A path's new content (blob id and file mode), or None when the path is gone.
+type Entry = Option<(Oid, i32)>;
+/// A path split into components, with its new entry.
+type Update<'a> = (Vec<&'a str>, Entry);
+
 /// One recorded working-tree state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Snapshot {
@@ -134,7 +139,7 @@ pub fn working_tree(repo: &Repository, head_tree: &git2::Tree<'_>) -> Result<Oid
     let statuses = repo.statuses(Some(&mut options))?;
     let workdir = repo.workdir().context("bare repository")?;
 
-    let mut updates: BTreeMap<String, Option<(Oid, i32)>> = BTreeMap::new();
+    let mut updates: BTreeMap<String, Entry> = BTreeMap::new();
     for entry in statuses.iter() {
         let Some(path) = entry.path() else {
             continue;
@@ -165,7 +170,7 @@ pub fn working_tree(repo: &Repository, head_tree: &git2::Tree<'_>) -> Result<Oid
     if updates.is_empty() {
         return Ok(head_tree.id());
     }
-    let updates: Vec<(Vec<&str>, Option<(Oid, i32)>)> = updates
+    let updates: Vec<Update<'_>> = updates
         .iter()
         .map(|(path, value)| (path.split('/').collect(), *value))
         .collect();
@@ -188,11 +193,11 @@ fn is_executable(_meta: &std::fs::Metadata) -> bool {
 fn update_tree(
     repo: &Repository,
     base: Option<&git2::Tree<'_>>,
-    updates: &[(Vec<&str>, Option<(Oid, i32)>)],
+    updates: &[Update<'_>],
 ) -> Result<Oid> {
     let mut builder: TreeBuilder = repo.treebuilder(base)?;
     // Group updates by their first path component.
-    let mut groups: BTreeMap<&str, Vec<(Vec<&str>, Option<(Oid, i32)>)>> = BTreeMap::new();
+    let mut groups: BTreeMap<&str, Vec<Update<'_>>> = BTreeMap::new();
     for (parts, value) in updates {
         let Some((first, rest)) = parts.split_first() else {
             continue;
