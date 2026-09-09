@@ -32,8 +32,19 @@ enum AppEvent {
     BaseBranch(BaseBranchResult),
     GapExpanded(GapExpandResult),
     Indexed(IndexResult),
+    Snapshot(SnapshotResult),
     Tick,
 }
+
+/// A working-tree state has settled long enough to be worth remembering.
+struct SnapshotResult {
+    repo_id: u64,
+    recorded: bool,
+}
+
+/// How long the diff must stay unchanged before its state is recorded. Long enough to
+/// skip half-written files, short enough to catch every real step.
+const SNAPSHOT_SETTLE: Duration = Duration::from_millis(1000);
 
 /// Bundles the event channels used by the run loop.
 struct Channels {
@@ -45,6 +56,10 @@ struct Channels {
     gap_rx: mpsc::Receiver<GapExpandResult>,
     gap_tx: mpsc::Sender<GapExpandResult>,
     index_rx: mpsc::Receiver<IndexResult>,
+    snapshot_rx: mpsc::Receiver<SnapshotResult>,
+    snapshot_tx: mpsc::Sender<SnapshotResult>,
+    /// Repos whose diff changed recently, and when their state counts as settled.
+    settle: std::collections::HashMap<u64, Instant>,
 }
 
 fn restore_terminal() {
@@ -95,6 +110,7 @@ pub async fn run(path: PathBuf) -> Result<()> {
     let (base_tx, base_rx) = mpsc::channel::<BaseBranchResult>(EVENT_CHANNEL_CAPACITY);
     let (gap_tx, gap_rx) = mpsc::channel::<GapExpandResult>(EVENT_CHANNEL_CAPACITY);
     let (index_tx, index_rx) = mpsc::channel::<IndexResult>(EVENT_CHANNEL_CAPACITY);
+    let (snapshot_tx, snapshot_rx) = mpsc::channel::<SnapshotResult>(EVENT_CHANNEL_CAPACITY);
     app.attach_index_worker(index_tx);
 
     // Load every repo in the background so the first frame appears immediately, with the
@@ -117,6 +133,9 @@ pub async fn run(path: PathBuf) -> Result<()> {
         gap_rx,
         gap_tx,
         index_rx,
+        snapshot_rx,
+        snapshot_tx,
+        settle: std::collections::HashMap::new(),
     };
 
     run_loop(
@@ -166,11 +185,16 @@ async fn run_loop(
             needs_redraw = false;
         }
 
-        let tick_dur = if !app.flash.is_empty() || app.status_message.is_some() {
+        let mut tick_dur = if !app.flash.is_empty() || app.status_message.is_some() {
             FLASH_TICK
         } else {
             IDLE_TICK
         };
+        // Wake for the earliest settle deadline so snapshots are taken on time.
+        let now = Instant::now();
+        if let Some(deadline) = ch.settle.values().min() {
+            tick_dur = tick_dur.min(deadline.saturating_duration_since(now));
+        }
         let tick_sleep = tokio::time::sleep(tick_dur);
         tokio::pin!(tick_sleep);
 
@@ -181,6 +205,7 @@ async fn run_loop(
             Some(ev) = ch.base_rx.recv() => AppEvent::BaseBranch(ev),
             Some(ev) = ch.gap_rx.recv() => AppEvent::GapExpanded(ev),
             Some(ev) = ch.index_rx.recv() => AppEvent::Indexed(ev),
+            Some(ev) = ch.snapshot_rx.recv() => AppEvent::Snapshot(ev),
             () = &mut tick_sleep => AppEvent::Tick,
         };
 
@@ -201,6 +226,8 @@ async fn run_loop(
                 AppEvent::FileChange(ev)
             } else if let Ok(ev) = ch.index_rx.try_recv() {
                 AppEvent::Indexed(ev)
+            } else if let Ok(ev) = ch.snapshot_rx.try_recv() {
+                AppEvent::Snapshot(ev)
             } else {
                 break;
             };
@@ -322,7 +349,15 @@ fn handle_event(
             }
         }
         AppEvent::DiffDone(result) => {
+            let repo_id = result.repo_id;
             if app.apply_diff_refresh_result(result, &ch.diff_tx) {
+                *needs_redraw = true;
+                // The tree changed; record it once it stops changing.
+                ch.settle.insert(repo_id, Instant::now() + SNAPSHOT_SETTLE);
+            }
+        }
+        AppEvent::Snapshot(result) => {
+            if result.recorded && app.timeline_refresh(result.repo_id) {
                 *needs_redraw = true;
             }
         }
@@ -342,6 +377,25 @@ fn handle_event(
         }
         AppEvent::Tick => {
             let now = Instant::now();
+            let due: Vec<u64> = ch
+                .settle
+                .iter()
+                .filter(|(_, deadline)| **deadline <= now)
+                .map(|(id, _)| *id)
+                .collect();
+            for repo_id in due {
+                ch.settle.remove(&repo_id);
+                if let Some((path, branch)) = app.snapshot_target(repo_id) {
+                    let tx = ch.snapshot_tx.clone();
+                    std::thread::spawn(move || {
+                        let recorded = crate::snapshots::record(&path, &branch)
+                            .ok()
+                            .flatten()
+                            .is_some();
+                        let _ = tx.blocking_send(SnapshotResult { repo_id, recorded });
+                    });
+                }
+            }
             let before = app.flash.len();
             app.flash.retain(|f| now < f.until);
             if app.flash.len() != before {

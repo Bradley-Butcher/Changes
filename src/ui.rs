@@ -1,6 +1,6 @@
 use crate::app::{App, CompareRow};
 use crate::diff::{FileStatus, LineKind};
-use crate::git::{Base, BaseCandidates, DiffMode, RangeKind};
+use crate::git::{Base, BaseCandidates, DiffMode, RangeKind, StepKind};
 use crate::highlight::Highlighter;
 use crate::outline::{self, OutlineRow, SymbolChange, hunk_context};
 use crate::theme::theme;
@@ -376,14 +376,21 @@ fn draw_timeline(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Re
         let step = &state.steps[index];
         let is_cursor = index == state.cursor;
         let included = state.since && index < state.cursor;
-        let (glyph, style) = match (step.id.is_none(), is_cursor, included) {
+        // Commits are dots, recorded edits are ticks, the working tree is hollow.
+        let (glyph, style) = match (step.kind, is_cursor, included) {
+            (StepKind::Snapshot, true, _) => (
+                "╽",
+                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+            ),
             (_, true, _) => (
                 "◉",
                 Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
             ),
-            (true, false, _) => ("◌", t.muted_style()),
-            (false, false, true) => ("●", t.text_style()),
-            (false, false, false) => ("●", t.muted_style()),
+            (StepKind::Workdir, false, _) => ("◌", t.muted_style()),
+            (StepKind::Snapshot, false, true) => ("╵", t.text_style()),
+            (StepKind::Snapshot, false, false) => ("╵", t.muted_style()),
+            (StepKind::Commit, false, true) => ("●", t.text_style()),
+            (StepKind::Commit, false, false) => ("●", t.muted_style()),
         };
         let start = col as u16;
         push(&mut spans, &mut col, "─".to_string(), rail);

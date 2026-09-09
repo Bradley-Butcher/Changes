@@ -174,6 +174,9 @@ pub struct TimelineState {
     pub base_label: String,
     /// The mode to return to when the timeline closes.
     pub previous_mode: DiffMode,
+    /// Listing recent history rather than a branch range (a pushed trunk), so refreshes
+    /// re-list the same way.
+    pub history_only: bool,
     /// The function the user was on before the last move, kept while steps that do not
     /// contain it go by so scrubbing snaps back to it when it reappears.
     pub anchor: Option<(String, Option<String>)>,
@@ -475,17 +478,28 @@ impl App {
         let bases = self.current_bases();
         let base = bases.resolve(&crate::git::Base::Parent);
         let mut base_label = base.clone().unwrap_or_else(|| "start".to_string());
-        let mut steps =
-            match git::timeline_steps(&repo.info.path, base.as_deref(), git::MAX_TIMELINE_STEPS) {
-                Ok(steps) => steps,
-                Err(error) => {
-                    self.set_status(format!("Timeline unavailable: {error}"));
-                    return None;
-                }
-            };
+        let branch = bases.branch.clone();
+        let mut steps = match git::timeline_steps(
+            &repo.info.path,
+            base.as_deref(),
+            git::MAX_TIMELINE_STEPS,
+            branch.as_deref(),
+        ) {
+            Ok(steps) => steps,
+            Err(error) => {
+                self.set_status(format!("Timeline unavailable: {error}"));
+                return None;
+            }
+        };
         // Nothing unmerged (a pushed trunk, say): scrub recent history instead.
-        if steps.len() < 2 {
-            steps = match git::timeline_steps(&repo.info.path, None, git::HISTORY_TIMELINE_STEPS) {
+        let history_only = steps.len() < 2;
+        if history_only {
+            steps = match git::timeline_steps(
+                &repo.info.path,
+                None,
+                git::HISTORY_TIMELINE_STEPS,
+                branch.as_deref(),
+            ) {
                 Ok(steps) => steps,
                 Err(error) => {
                     self.set_status(format!("Timeline unavailable: {error}"));
@@ -509,6 +523,7 @@ impl App {
             since: false,
             base_label,
             previous_mode: repo.mode.clone(),
+            history_only,
             anchor: None,
             anchor_missed: false,
         };
@@ -601,6 +616,62 @@ impl App {
             (Some(file_idx), None) => self.jump_to_file(file_idx),
             (None, _) => self.jump_active_viewport_top(),
         }
+    }
+
+    /// Path and branch to record a snapshot for, if the repo is known and on a branch.
+    pub fn snapshot_target(&self, repo_id: u64) -> Option<(PathBuf, String)> {
+        let repo = self.repos.iter().find(|r| r.id == repo_id)?;
+        let branch = repo
+            .bases
+            .as_ref()
+            .and_then(|b| b.branch.clone())
+            .or_else(|| git::detect_bases(&repo.info.path).branch)?;
+        Some((repo.info.path.clone(), branch))
+    }
+
+    /// Re-list the timeline after a snapshot was recorded, keeping the cursor on the same
+    /// step. Returns true when the active tab's strip changed.
+    pub fn timeline_refresh(&mut self, repo_id: u64) -> bool {
+        let Some(idx) = self.find_repo(repo_id) else {
+            return false;
+        };
+        let Some(state) = self.repos[idx].timeline.as_ref() else {
+            return false;
+        };
+        let bases = self.repos[idx].bases.clone().unwrap_or_default();
+        let base = bases.resolve(&crate::git::Base::Parent);
+        let steps = if state.history_only {
+            git::timeline_steps(
+                &self.repos[idx].info.path,
+                None,
+                git::HISTORY_TIMELINE_STEPS,
+                bases.branch.as_deref(),
+            )
+        } else {
+            git::timeline_steps(
+                &self.repos[idx].info.path,
+                base.as_deref(),
+                git::MAX_TIMELINE_STEPS,
+                bases.branch.as_deref(),
+            )
+        };
+        let Ok(steps) = steps else {
+            return false;
+        };
+        let state = self.repos[idx].timeline.as_mut().expect("checked above");
+        let current_id = state.steps[state.cursor].id.clone();
+        let at_end = state.cursor + 1 == state.steps.len();
+        state.steps = steps;
+        state.cursor = if at_end {
+            state.steps.len() - 1
+        } else {
+            state
+                .steps
+                .iter()
+                .position(|s| s.id == current_id)
+                .unwrap_or(state.steps.len() - 1)
+        };
+        idx == self.active_tab
     }
 
     // -- Outline (change shape) view --
@@ -2690,6 +2761,11 @@ mod tests {
     fn timeline_state_maps_cursor_and_mode_to_a_range() {
         use crate::git::{RangeEnd, RangeKind, TimelineStep};
         let step = |id: Option<&str>, parent: Option<&str>| TimelineStep {
+            kind: if id.is_some() {
+                crate::git::StepKind::Commit
+            } else {
+                crate::git::StepKind::Workdir
+            },
             id: id.map(str::to_string),
             short: id.unwrap_or("now").chars().take(7).collect(),
             subject: String::new(),
@@ -2706,6 +2782,7 @@ mod tests {
             since: false,
             base_label: "main".to_string(),
             previous_mode: DiffMode::Local,
+            history_only: false,
             anchor: None,
             anchor_missed: false,
         };

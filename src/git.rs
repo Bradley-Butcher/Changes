@@ -747,16 +747,27 @@ fn commit_tree(repo: &Repository, id: &str) -> Result<Oid> {
         .tree_id())
 }
 
-/// One node of the timeline: a commit between the base and HEAD, or the working tree.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepKind {
+    Commit,
+    /// A recorded working-tree state between two commits.
+    Snapshot,
+    Workdir,
+}
+
+/// One node of the timeline: a commit between the base and HEAD, a snapshot recorded
+/// while `changes` was running, or the working tree.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TimelineStep {
-    /// Full commit id; None for the working tree.
+    pub kind: StepKind,
+    /// Full commit id (snapshots are commit objects too); None for the working tree.
     pub id: Option<String>,
     pub short: String,
     pub subject: String,
     /// "2h ago", "3d ago".
     pub when: String,
-    /// The commit before this one, or None when it is the first commit ever.
+    /// The step before this one: the previous commit or snapshot, or None when it is
+    /// the first commit ever.
     pub parent: Option<String>,
 }
 
@@ -773,6 +784,7 @@ pub fn timeline_steps(
     repo_path: &Path,
     base: Option<&str>,
     limit: usize,
+    branch: Option<&str>,
 ) -> Result<Vec<TimelineStep>> {
     let repo = Repository::open(repo_path)
         .with_context(|| format!("Failed to open repo: {}", repo_path.display()))?;
@@ -795,25 +807,71 @@ pub fn timeline_steps(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0);
-    let mut steps: Vec<TimelineStep> = Vec::new();
+    let mut commits: Vec<(git2::Commit<'_>, Oid)> = Vec::new(); // commit, tree
     for oid in walk.take(limit.min(MAX_TIMELINE_STEPS)) {
         let commit = repo.find_commit(oid?)?;
+        let tree = commit.tree_id();
+        commits.push((commit, tree));
+    }
+    commits.reverse();
+
+    // Snapshots recorded while `changes` ran, grouped by the commit they were taken on.
+    let snapshots = branch
+        .map(|branch| crate::snapshots::list(&repo, branch))
+        .transpose()?
+        .unwrap_or_default();
+    let workdir_tree = crate::snapshots::working_tree(&repo, &head.tree()?).ok();
+
+    let mut steps: Vec<TimelineStep> = Vec::new();
+    // Steps chain: each diffs from the step before it, so a commit made after recorded
+    // edits shows only what changed since the last edit, not the whole commit again.
+    let mut chain_prev: Option<String> = None;
+    for (index, (commit, tree)) in commits.iter().enumerate() {
         let id = commit.id().to_string();
         steps.push(TimelineStep {
+            kind: StepKind::Commit,
             short: id[..7.min(id.len())].to_string(),
-            id: Some(id),
+            id: Some(id.clone()),
             subject: commit.summary().unwrap_or("").to_string(),
             when: relative_time(now - commit.time().seconds()),
-            parent: commit.parent_id(0).ok().map(|p| p.to_string()),
+            parent: chain_prev
+                .clone()
+                .or_else(|| commit.parent_id(0).ok().map(|p| p.to_string())),
         });
+        // The state after the next commit (or the working tree) is already a node; a
+        // snapshot identical to either, or to its predecessor, adds nothing.
+        let next_tree = commits
+            .get(index + 1)
+            .map(|(_, tree)| *tree)
+            .or(workdir_tree);
+        let mut previous_tree = *tree;
+        let mut previous_id = id;
+        for snapshot in snapshots.iter().filter(|s| s.head == commit.id()) {
+            if snapshot.tree == previous_tree || Some(snapshot.tree) == next_tree {
+                continue;
+            }
+            let snapshot_id = snapshot.id.to_string();
+            steps.push(TimelineStep {
+                kind: StepKind::Snapshot,
+                short: String::new(),
+                id: Some(snapshot_id.clone()),
+                subject: "recorded edit".to_string(),
+                when: relative_time(now - snapshot.time),
+                parent: Some(previous_id),
+            });
+            previous_tree = snapshot.tree;
+            previous_id = snapshot_id;
+        }
+        chain_prev = Some(previous_id);
     }
-    steps.reverse();
+    let last_id = steps.last().and_then(|s| s.id.clone());
     steps.push(TimelineStep {
+        kind: StepKind::Workdir,
         id: None,
         short: "now".to_string(),
         subject: "working tree".to_string(),
         when: String::new(),
-        parent: Some(head.id().to_string()),
+        parent: last_id.or_else(|| Some(head.id().to_string())),
     });
     Ok(steps)
 }
@@ -1378,7 +1436,7 @@ mod tests {
         std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
         drop(repo);
 
-        let steps = super::timeline_steps(&root, Some(ROOT_BASE_NAME), 50).unwrap();
+        let steps = super::timeline_steps(&root, Some(ROOT_BASE_NAME), 50, None).unwrap();
         let subjects: Vec<&str> = steps.iter().map(|s| s.subject.as_str()).collect();
         assert_eq!(subjects, ["first", "second", "working tree"]);
         assert_eq!(steps[0].parent, None, "the first commit has no parent");
@@ -1406,9 +1464,62 @@ mod tests {
         assert_eq!(files[0].additions, 3);
 
         // Limited history stops early and reports the parent it stopped at.
-        let recent = super::timeline_steps(&root, None, 1).unwrap();
+        let recent = super::timeline_steps(&root, None, 1, None).unwrap();
         assert_eq!(recent.len(), 2);
         assert_eq!(recent[0].subject, "second");
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn snapshots_become_ticks_between_the_commits_they_were_taken_on() {
+        use super::StepKind;
+        let root = temp_path("timeline-snapshots");
+        std::fs::create_dir_all(&root).unwrap();
+        let repo = git2::Repository::init(&root).unwrap();
+        std::fs::write(root.join("a.txt"), "one\n").unwrap();
+        commit_all(&repo, "first");
+        // Two recorded edits on top of the first commit, then a commit of the second.
+        std::fs::write(root.join("a.txt"), "one\ntwo\n").unwrap();
+        crate::snapshots::record(&root, "main").unwrap().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\n").unwrap();
+        crate::snapshots::record(&root, "main").unwrap().unwrap();
+        commit_all(&repo, "second");
+        // A further uncommitted edit, recorded too.
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\nfour\n").unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        crate::snapshots::record(&root, "main").unwrap().unwrap();
+        drop(repo);
+
+        let steps = super::timeline_steps(&root, Some(ROOT_BASE_NAME), 50, Some("main")).unwrap();
+        let kinds: Vec<StepKind> = steps.iter().map(|s| s.kind).collect();
+        // first, edit (one snapshot equals the second commit's tree and is dropped),
+        // second, (snapshot equal to the working tree is dropped), working tree
+        assert_eq!(
+            kinds,
+            [
+                StepKind::Commit,
+                StepKind::Snapshot,
+                StepKind::Commit,
+                StepKind::Workdir
+            ]
+        );
+        // Each step's parent is the step before it, so step diffs are one edit each:
+        // the second commit diffs from the recorded edit, not from the first commit.
+        assert_eq!(steps[1].parent, steps[0].id);
+        assert_eq!(steps[2].parent, steps[1].id);
+        assert_eq!(steps[3].parent, steps[2].id);
+        let edit = DiffMode::Range {
+            from: steps[1].parent.clone(),
+            to: super::RangeEnd::Commit(steps[1].id.clone().unwrap()),
+            kind: super::RangeKind::Step,
+        };
+        let files = compute_diff(&root, &edit, None).unwrap();
+        assert_eq!(files[0].additions, 1);
+
+        // Without a branch name there are no ticks: plain commit behaviour.
+        let plain = super::timeline_steps(&root, Some(ROOT_BASE_NAME), 50, None).unwrap();
+        assert_eq!(plain.len(), 3);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
