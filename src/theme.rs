@@ -4,6 +4,8 @@
 //! the user already picked for their shell and editor. Only the diff tints and the few
 //! surfaces (header bars, popups, the status line) are fixed RGB, because no ANSI slot
 //! is subtle enough for a background wash; those come in a dark and a light variant.
+//! Secondary text is a fixed mid grey from the 256-colour cube rather than the palette's
+//! "bright black", which ranges from readable to invisible across terminal themes.
 
 use ratatui::style::{Color, Modifier, Style};
 use std::sync::OnceLock;
@@ -58,7 +60,7 @@ const DARK: Theme = Theme {
     kind: ThemeKind::Dark,
     accent: Color::Blue,
     text: Color::Reset,
-    muted: Color::DarkGray,
+    muted: Color::Indexed(245),
     warn: Color::Yellow,
     note: Color::Magenta,
     add_fg: Color::Green,
@@ -77,7 +79,7 @@ const LIGHT: Theme = Theme {
     kind: ThemeKind::Light,
     accent: Color::Blue,
     text: Color::Reset,
-    muted: Color::DarkGray,
+    muted: Color::Indexed(243),
     warn: Color::Yellow,
     note: Color::Magenta,
     add_fg: Color::Green,

@@ -235,7 +235,7 @@ fn ansi_theme() -> Theme {
     const BLUE: u8 = 4;
     const MAGENTA: u8 = 5;
     const CYAN: u8 = 6;
-    const MUTED: u8 = 8;
+    const MUTED: u8 = 245;
     let item = |scope: &str, fg: Option<u8>, font: FontStyle| ThemeItem {
         scope: scope
             .parse::<ScopeSelectors>()

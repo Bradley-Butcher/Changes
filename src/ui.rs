@@ -893,19 +893,16 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
                     ),
                 ));
                 spans.push(Span::styled("  ".repeat(*depth), with_bg(Style::default())));
+                // Changed code is bold; the calls around it read in ordinary text so
+                // the tree stays legible, with only the paths receding.
                 let name_style = if *is_target {
                     Style::default()
-                        .fg(if file_idx.is_some() {
-                            theme().text
-                        } else {
-                            theme().muted
-                        })
+                        .fg(theme().text)
                         .add_modifier(Modifier::BOLD)
-                } else if mark.is_some() {
-                    Style::default().fg(theme().text)
                 } else {
-                    Style::default().fg(theme().muted)
+                    Style::default().fg(theme().text)
                 };
+                let _ = file_idx;
                 spans.push(Span::styled(name.clone(), with_bg(name_style)));
                 spans.push(Span::styled(
                     format!("  {location}"),
