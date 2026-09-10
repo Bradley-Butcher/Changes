@@ -81,8 +81,19 @@ pub struct RepoState {
     pub files: Vec<FileDiff>,
     /// Branches this repo can be compared against; None until detection has run once.
     pub bases: Option<BaseCandidates>,
-    /// The timeline strip, when open: commits from the base to HEAD plus the working tree.
-    pub timeline: Option<TimelineState>,
+    /// The timeline of the current comparison: every node between its base and its
+    /// "now", refreshed with each diff.
+    pub steps: Vec<TimelineStep>,
+    /// The step the diff is shown up to; None means now, the last step.
+    pub cursor_id: Option<String>,
+    /// Show only what the step under the cursor changed, instead of base → cursor.
+    pub step_only: bool,
+    /// Hunks of the current diff that the step under the cursor changed, by (path, hunk).
+    pub step_hunks: std::collections::HashSet<(String, usize)>,
+    /// The function the user was on before the last timeline move; kept while steps
+    /// that do not contain it go by so scrubbing snaps back to it when it reappears.
+    anchor: Option<(String, Option<String>)>,
+    anchor_missed: bool,
     /// Whether branch comparisons leave uncommitted work out. Remembered across mode
     /// switches so `b` comes back to the same view the picker last set up.
     pub commits_only: bool,
@@ -163,56 +174,6 @@ pub struct OutlineState {
     pub flow: bool,
 }
 
-/// Scrubbing through the commits between the base and the working tree.
-pub struct TimelineState {
-    pub steps: Vec<TimelineStep>,
-    /// Index into `steps`.
-    pub cursor: usize,
-    /// Show everything from the base up to the cursor, rather than the cursor's own step.
-    pub since: bool,
-    /// What the base was called when the timeline opened, for the strip's first node.
-    pub base_label: String,
-    /// The mode to return to when the timeline closes.
-    pub previous_mode: DiffMode,
-    /// Listing recent history rather than a branch range (a pushed trunk), so refreshes
-    /// re-list the same way.
-    pub history_only: bool,
-    /// The function the user was on before the last move, kept while steps that do not
-    /// contain it go by so scrubbing snaps back to it when it reappears.
-    pub anchor: Option<(String, Option<String>)>,
-    /// Whether the last move failed to find the anchor.
-    pub anchor_missed: bool,
-}
-
-impl TimelineState {
-    /// The diff to show for the step under the cursor.
-    pub fn mode(&self) -> DiffMode {
-        let step = &self.steps[self.cursor];
-        let to = match &step.id {
-            Some(id) => RangeEnd::Commit(id.clone()),
-            None => RangeEnd::Workdir,
-        };
-        let from = if self.since {
-            self.steps.first().and_then(|first| first.parent.clone())
-        } else {
-            step.parent.clone()
-        };
-        DiffMode::Range {
-            from,
-            to,
-            kind: if self.since {
-                RangeKind::Since
-            } else {
-                RangeKind::Step
-            },
-        }
-    }
-
-    pub fn current(&self) -> &TimelineStep {
-        &self.steps[self.cursor]
-    }
-}
-
 /// Diffs with at least this many files open in the outline first, so the shape of the
 /// change is visible before any single hunk.
 pub const OUTLINE_AUTO_OPEN_FILES: usize = 15;
@@ -267,7 +228,12 @@ impl App {
                 mode: DiffMode::Local,
                 files: Vec::new(),
                 bases: None,
-                timeline: None,
+                steps: Vec::new(),
+                cursor_id: None,
+                step_only: false,
+                step_hunks: std::collections::HashSet::new(),
+                anchor: None,
+                anchor_missed: false,
                 commits_only: false,
                 unified_layout: None,
                 sbs_layout: None,
@@ -373,7 +339,6 @@ impl App {
             push_base(Base::Trunk, "trunk");
         }
         push_base(Base::Upstream, "upstream, unpushed");
-        push_base(Base::Root, "everything since the first commit");
         rows.push(CompareRow::Staged);
         rows.push(CompareRow::Unstaged);
         rows.push(CompareRow::CommitsOnly);
@@ -450,135 +415,94 @@ impl App {
 
     // -- Timeline --
 
-    /// Rows the timeline strip occupies above the content, 0 when closed.
-    pub fn timeline_rows(&self) -> u16 {
-        if self.repos[self.active_tab].timeline.is_some() {
-            crate::ui::TIMELINE_ROWS
-        } else {
-            0
-        }
-    }
-
-    pub fn timeline(&self) -> Option<&TimelineState> {
-        self.repos[self.active_tab].timeline.as_ref()
-    }
-
-    /// Open the timeline on the working tree, or close it. Returns the diff mode to
-    /// switch to, or None when the repository has no commits to walk.
-    pub fn timeline_toggle(&mut self) -> Option<DiffMode> {
-        if let Some(state) = self.repos[self.active_tab].timeline.take() {
-            return Some(state.previous_mode);
-        }
-        // Base detection is lazy; the timeline needs it now to know where to start.
-        if self.repos[self.active_tab].bases.is_none() {
-            let path = self.repos[self.active_tab].info.path.clone();
-            self.repos[self.active_tab].bases = Some(git::detect_bases(&path));
-        }
+    /// Index of the step the diff is shown up to (the last step when the cursor is now).
+    pub fn cursor_index(&self) -> usize {
         let repo = &self.repos[self.active_tab];
-        let bases = self.current_bases();
-        let base = bases.resolve(&crate::git::Base::Parent);
-        let mut base_label = base.clone().unwrap_or_else(|| "start".to_string());
-        let branch = bases.branch.clone();
-        let mut steps = match git::timeline_steps(
-            &repo.info.path,
-            base.as_deref(),
-            git::MAX_TIMELINE_STEPS,
-            branch.as_deref(),
-        ) {
-            Ok(steps) => steps,
-            Err(error) => {
-                self.set_status(format!("Timeline unavailable: {error}"));
-                return None;
-            }
-        };
-        // Nothing unmerged (a pushed trunk, say): scrub recent history instead.
-        let history_only = steps.len() < 2;
-        if history_only {
-            steps = match git::timeline_steps(
-                &repo.info.path,
-                None,
-                git::HISTORY_TIMELINE_STEPS,
-                branch.as_deref(),
-            ) {
-                Ok(steps) => steps,
-                Err(error) => {
-                    self.set_status(format!("Timeline unavailable: {error}"));
-                    return None;
-                }
-            };
-            base_label = format!("{} earlier", git::HISTORY_TIMELINE_STEPS);
-            if steps.len() - 1 < git::HISTORY_TIMELINE_STEPS {
-                base_label = "repository start".to_string();
-            }
-        }
-        if steps.len() < 2 {
-            self.set_status("No commits to scrub through yet");
+        repo.cursor_id
+            .as_ref()
+            .and_then(|id| repo.steps.iter().position(|s| s.id.as_ref() == Some(id)))
+            .unwrap_or(repo.steps.len().saturating_sub(1))
+    }
+
+    /// The step under the cursor, if the timeline has any.
+    pub fn cursor_step(&self) -> Option<&TimelineStep> {
+        self.repos[self.active_tab].steps.get(self.cursor_index())
+    }
+
+    /// Move the cursor by `delta` steps. Returns the mode to refresh with, or None when
+    /// the cursor is already at that end.
+    pub fn timeline_move(&mut self, delta: isize) -> Option<DiffMode> {
+        let len = self.repos[self.active_tab].steps.len();
+        if len < 2 {
             return None;
         }
-        // Start on the working tree when there is uncommitted work, else on HEAD.
-        let clean = repo.mode == DiffMode::Local && repo.files.is_empty();
-        let state = TimelineState {
-            cursor: steps.len() - 1 - usize::from(clean),
-            steps,
-            since: false,
-            base_label,
-            previous_mode: repo.mode.clone(),
-            history_only,
-            anchor: None,
-            anchor_missed: false,
+        let next = self
+            .cursor_index()
+            .saturating_add_signed(delta)
+            .min(len - 1);
+        self.timeline_jump(next)
+    }
+
+    /// Put the cursor on step `index`; None when it is already there or out of range.
+    pub fn timeline_jump(&mut self, index: usize) -> Option<DiffMode> {
+        let len = self.repos[self.active_tab].steps.len();
+        if index >= len || index == self.cursor_index() {
+            return None;
+        }
+        let anchor = self.carry_anchor();
+        let repo = &mut self.repos[self.active_tab];
+        repo.cursor_id = if index + 1 == len {
+            None
+        } else {
+            repo.steps[index].id.clone()
         };
-        let mode = state.mode();
-        self.repos[self.active_tab].timeline = Some(state);
-        Some(mode)
+        self.pending_anchor = anchor;
+        Some(self.repos[self.active_tab].mode.clone())
+    }
+
+    /// Toggle between base → cursor and the cursor step alone.
+    pub fn timeline_toggle_step_only(&mut self) -> Option<DiffMode> {
+        if self.repos[self.active_tab].steps.len() < 2 {
+            return None;
+        }
+        let anchor = self.carry_anchor();
+        let repo = &mut self.repos[self.active_tab];
+        repo.step_only = !repo.step_only;
+        self.pending_anchor = anchor;
+        Some(self.repos[self.active_tab].mode.clone())
+    }
+
+    /// What the strip calls the left end of the timeline for the current comparison.
+    pub fn timeline_base_label(&self) -> String {
+        let bases = self.current_bases();
+        match self.current_mode() {
+            DiffMode::Local | DiffMode::Staged => "HEAD".to_string(),
+            DiffMode::Unstaged => "index".to_string(),
+            DiffMode::Branch { base, .. } => bases
+                .resolve(base)
+                .map(|name| {
+                    if name == crate::git::ROOT_BASE_NAME {
+                        "start".to_string()
+                    } else if let Some(n) = crate::git::last_n_commits(&name) {
+                        format!("HEAD~{n}")
+                    } else {
+                        name
+                    }
+                })
+                .unwrap_or_else(|| "base".to_string()),
+            DiffMode::Range { .. } => "base".to_string(),
+        }
     }
 
     /// The anchor to carry across a move: the focused function, unless the last move
     /// missed, in which case the earlier anchor stays so it can be found again.
     fn carry_anchor(&mut self) -> Option<(String, Option<String>)> {
         let focused = self.focus_anchor();
-        let state = self.repos[self.active_tab].timeline.as_mut()?;
-        if !state.anchor_missed || state.anchor.is_none() {
-            state.anchor = focused;
+        let repo = &mut self.repos[self.active_tab];
+        if !repo.anchor_missed || repo.anchor.is_none() {
+            repo.anchor = focused;
         }
-        state.anchor.clone()
-    }
-
-    /// Move the cursor by `delta` steps; None when already at the end.
-    pub fn timeline_move(&mut self, delta: isize) -> Option<DiffMode> {
-        let anchor = self.carry_anchor();
-        let state = self.repos[self.active_tab].timeline.as_mut()?;
-        let next = state
-            .cursor
-            .saturating_add_signed(delta)
-            .min(state.steps.len() - 1);
-        if next == state.cursor {
-            return None;
-        }
-        state.cursor = next;
-        let mode = state.mode();
-        self.pending_anchor = anchor;
-        Some(mode)
-    }
-
-    pub fn timeline_jump(&mut self, index: usize) -> Option<DiffMode> {
-        let anchor = self.carry_anchor();
-        let state = self.repos[self.active_tab].timeline.as_mut()?;
-        if index >= state.steps.len() || index == state.cursor {
-            return None;
-        }
-        state.cursor = index;
-        let mode = state.mode();
-        self.pending_anchor = anchor;
-        Some(mode)
-    }
-
-    pub fn timeline_toggle_since(&mut self) -> Option<DiffMode> {
-        let anchor = self.carry_anchor();
-        let state = self.repos[self.active_tab].timeline.as_mut()?;
-        state.since = !state.since;
-        let mode = state.mode();
-        self.pending_anchor = anchor;
-        Some(mode)
+        repo.anchor.clone()
     }
 
     /// The file and function the focused hunk is in, for re-anchoring after a refresh.
@@ -608,9 +532,7 @@ impl App {
                 .map(|symbol| symbol.hunk_idx)
         });
         let hit = hunk.is_some() || (ident.is_none() && file_idx.is_some());
-        if let Some(state) = self.repos[self.active_tab].timeline.as_mut() {
-            state.anchor_missed = !hit;
-        }
+        self.repos[self.active_tab].anchor_missed = !hit;
         match (file_idx, hunk) {
             (Some(file_idx), Some(hunk_idx)) => self.select_hunk(file_idx, hunk_idx),
             (Some(file_idx), None) => self.jump_to_file(file_idx),
@@ -629,49 +551,52 @@ impl App {
         Some((repo.info.path.clone(), branch))
     }
 
-    /// Re-list the timeline after a snapshot was recorded, keeping the cursor on the same
-    /// step. Returns true when the active tab's strip changed.
-    pub fn timeline_refresh(&mut self, repo_id: u64) -> bool {
-        let Some(idx) = self.find_repo(repo_id) else {
+    /// Store the timeline that came with a diff and work out which hunks the cursor
+    /// step touched. A cursor whose step vanished (a pruned snapshot) falls back to now.
+    fn apply_timeline(
+        &mut self,
+        idx: usize,
+        steps: Vec<TimelineStep>,
+        step_lines: std::collections::HashMap<String, Vec<u32>>,
+    ) {
+        let repo = &mut self.repos[idx];
+        repo.steps = steps;
+        if let Some(id) = &repo.cursor_id
+            && !repo.steps.iter().any(|s| s.id.as_ref() == Some(id))
+        {
+            repo.cursor_id = None;
+        }
+        repo.step_hunks.clear();
+        for file in &repo.files {
+            let Some(lines) = step_lines.get(&file.path) else {
+                continue;
+            };
+            for (hunk_idx, hunk) in file.hunks.iter().enumerate() {
+                let (Some(first), Some(last)) = (hunk.first_new_lineno(), hunk.last_new_lineno())
+                else {
+                    continue;
+                };
+                // A hunk belongs to the step when a line it covers changed in it; the
+                // one-line slack catches deletions marked by their following line.
+                let touched = lines
+                    .iter()
+                    .any(|&line| line + 1 >= first && line <= last + 1);
+                if touched {
+                    repo.step_hunks.insert((file.path.clone(), hunk_idx));
+                }
+            }
+        }
+    }
+
+    /// Whether the hunk changed in the step under the cursor.
+    pub fn is_step_hunk(&self, file_idx: usize, hunk_idx: usize) -> bool {
+        let repo = &self.repos[self.active_tab];
+        if repo.steps.len() < 2 {
             return false;
-        };
-        let Some(state) = self.repos[idx].timeline.as_ref() else {
-            return false;
-        };
-        let bases = self.repos[idx].bases.clone().unwrap_or_default();
-        let base = bases.resolve(&crate::git::Base::Parent);
-        let steps = if state.history_only {
-            git::timeline_steps(
-                &self.repos[idx].info.path,
-                None,
-                git::HISTORY_TIMELINE_STEPS,
-                bases.branch.as_deref(),
-            )
-        } else {
-            git::timeline_steps(
-                &self.repos[idx].info.path,
-                base.as_deref(),
-                git::MAX_TIMELINE_STEPS,
-                bases.branch.as_deref(),
-            )
-        };
-        let Ok(steps) = steps else {
-            return false;
-        };
-        let state = self.repos[idx].timeline.as_mut().expect("checked above");
-        let current_id = state.steps[state.cursor].id.clone();
-        let at_end = state.cursor + 1 == state.steps.len();
-        state.steps = steps;
-        state.cursor = if at_end {
-            state.steps.len() - 1
-        } else {
-            state
-                .steps
-                .iter()
-                .position(|s| s.id == current_id)
-                .unwrap_or(state.steps.len() - 1)
-        };
-        idx == self.active_tab
+        }
+        repo.files
+            .get(file_idx)
+            .is_some_and(|file| repo.step_hunks.contains(&(file.path.clone(), hunk_idx)))
     }
 
     // -- Outline (change shape) view --
@@ -952,8 +877,9 @@ impl App {
 
     pub fn set_mode(&mut self, mode: DiffMode, diff_tx: &mpsc::UnboundedSender<DiffResult>) {
         self.remember_mode(&mode);
-        if !matches!(mode, DiffMode::Range { .. }) {
-            self.repos[self.active_tab].timeline = None;
+        if mode != self.repos[self.active_tab].mode {
+            self.repos[self.active_tab].cursor_id = None;
+            self.repos[self.active_tab].step_only = false;
         }
         self.repos[self.active_tab].mode = mode;
         self.refresh_repo_async(self.active_tab, diff_tx);
@@ -964,9 +890,10 @@ impl App {
 
     pub(crate) fn set_mode_bounded(&mut self, mode: DiffMode, diff_tx: &mpsc::Sender<DiffResult>) {
         self.remember_mode(&mode);
-        // Leaving the timeline by any other route drops it; its moves keep the anchor.
-        if !matches!(mode, DiffMode::Range { .. }) {
-            self.repos[self.active_tab].timeline = None;
+        // A new comparison starts at its own "now"; a timeline move keeps the anchor.
+        if mode != self.repos[self.active_tab].mode {
+            self.repos[self.active_tab].cursor_id = None;
+            self.repos[self.active_tab].step_only = false;
         }
         self.repos[self.active_tab].mode = mode;
         self.refresh_repo_async_bounded(self.active_tab, diff_tx);
@@ -1524,7 +1451,12 @@ impl App {
             mode: DiffMode::Local,
             files: Vec::new(),
             bases: None,
-            timeline: None,
+            steps: Vec::new(),
+            cursor_id: None,
+            step_only: false,
+            step_hunks: std::collections::HashSet::new(),
+            anchor: None,
+            anchor_missed: false,
             commits_only: false,
             unified_layout: None,
             sbs_layout: None,
@@ -1651,7 +1583,6 @@ impl App {
                 self.request_index(idx, Some(changed_paths));
                 if idx == self.active_tab {
                     self.focused_file = self.focused_file_from_scroll();
-                    self.apply_pending_anchor();
                     let file_count = self.repos[idx].files.len();
                     if self.outline.is_some() {
                         self.rebuild_outline();
@@ -1685,6 +1616,8 @@ impl App {
             path: repo.info.path.clone(),
             mode: repo.mode.clone(),
             bases: repo.bases.clone(),
+            cursor_id: repo.cursor_id.clone(),
+            step_only: repo.step_only,
         };
         if let Some(worker) = &self.diff_worker
             && worker.submit(job.clone())
@@ -1775,18 +1708,17 @@ impl App {
 
     pub fn refresh_repo_async(&self, idx: usize, diff_tx: &mpsc::UnboundedSender<DiffResult>) {
         let repo = &self.repos[idx];
-        let id = repo.id;
-        let path = repo.info.path.clone();
-        let mode = repo.mode.clone();
-        let bases = repo.bases.clone();
+        let job = DiffJob {
+            repo_id: repo.id,
+            path: repo.info.path.clone(),
+            mode: repo.mode.clone(),
+            bases: repo.bases.clone(),
+            cursor_id: repo.cursor_id.clone(),
+            step_only: repo.step_only,
+        };
         let tx = diff_tx.clone();
         std::thread::spawn(move || {
-            let result = git::compute_diff(&path, &mode, bases.as_ref());
-            let _ = tx.send(DiffResult {
-                repo_id: id,
-                mode,
-                result,
-            });
+            let _ = tx.send(job.run());
         });
     }
 
@@ -1804,9 +1736,15 @@ impl App {
             .entry(result.repo_id)
             .or_default()
             .complete();
-        let applied = !pending && result.mode == self.repos[idx].mode;
+        let applied = !pending
+            && result.mode == self.repos[idx].mode
+            && result.cursor_id == self.repos[idx].cursor_id;
         if applied {
             self.apply_diff_result(idx, result.result);
+            self.apply_timeline(idx, result.steps, result.step_lines);
+            if idx == self.active_tab {
+                self.apply_pending_anchor();
+            }
         }
 
         if pending {
@@ -2238,6 +2176,26 @@ pub struct DiffResult {
     pub repo_id: u64,
     pub mode: DiffMode,
     pub result: anyhow::Result<Vec<FileDiff>>,
+    /// The comparison's timeline, base → now, listed alongside the diff.
+    pub steps: Vec<TimelineStep>,
+    /// The cursor the diff was computed for, so a stale result can be recognised.
+    pub cursor_id: Option<String>,
+    /// New-side lines the cursor step changed, per file, for highlighting its hunks.
+    pub step_lines: std::collections::HashMap<String, Vec<u32>>,
+}
+
+impl DiffResult {
+    /// A result carrying only files, for callers that have no timeline (tests).
+    pub fn files_only(repo_id: u64, mode: DiffMode, result: anyhow::Result<Vec<FileDiff>>) -> Self {
+        Self {
+            repo_id,
+            mode,
+            result,
+            steps: Vec::new(),
+            cursor_id: None,
+            step_lines: std::collections::HashMap::new(),
+        }
+    }
 }
 
 /// One diff computation to run off the UI thread.
@@ -2245,17 +2203,66 @@ pub struct DiffResult {
 struct DiffJob {
     repo_id: u64,
     path: PathBuf,
+    /// The comparison the user chose; the cursor narrows its "now".
     mode: DiffMode,
     bases: Option<BaseCandidates>,
+    cursor_id: Option<String>,
+    step_only: bool,
 }
 
 impl DiffJob {
     fn run(self) -> DiffResult {
-        let result = git::compute_diff(&self.path, &self.mode, self.bases.as_ref());
+        let bases = self
+            .bases
+            .clone()
+            .unwrap_or_else(|| git::detect_bases(&self.path));
+        let steps = git::timeline_for_mode(&self.path, &self.mode, &bases).unwrap_or_default();
+        let last = steps.len().saturating_sub(1);
+        let cursor = self
+            .cursor_id
+            .as_ref()
+            .and_then(|id| steps.iter().position(|s| s.id.as_ref() == Some(id)))
+            .unwrap_or(last);
+        let cursor_id = if cursor == last {
+            None
+        } else {
+            self.cursor_id.clone()
+        };
+
+        // What the cursor step changed, for marking hunks; also the step-only diff.
+        let step_to = steps.get(cursor).map(|step| match &step.id {
+            Some(id) => RangeEnd::Commit(id.clone()),
+            None => RangeEnd::Workdir,
+        });
+        let step_from = steps.get(cursor).and_then(|step| step.parent.clone());
+        let step_lines = match (&step_to, steps.len() >= 2 && !self.step_only) {
+            (Some(to), true) => {
+                git::step_changed_lines(&self.path, step_from.as_deref(), to).unwrap_or_default()
+            }
+            _ => std::collections::HashMap::new(),
+        };
+
+        let effective = match (&step_to, self.step_only, cursor == last) {
+            (Some(to), true, _) => DiffMode::Range {
+                from: step_from,
+                to: to.clone(),
+                kind: RangeKind::Step,
+            },
+            (Some(to), false, false) => DiffMode::Range {
+                from: steps.first().and_then(|s| s.parent.clone()),
+                to: to.clone(),
+                kind: RangeKind::Since,
+            },
+            _ => self.mode.clone(),
+        };
+        let result = git::compute_diff(&self.path, &effective, Some(&bases));
         DiffResult {
             repo_id: self.repo_id,
             mode: self.mode,
             result,
+            steps,
+            cursor_id,
+            step_lines,
         }
     }
 }
@@ -2758,52 +2765,49 @@ mod tests {
     }
 
     #[test]
-    fn timeline_state_maps_cursor_and_mode_to_a_range() {
-        use crate::git::{RangeEnd, RangeKind, TimelineStep};
-        let step = |id: Option<&str>, parent: Option<&str>| TimelineStep {
-            kind: if id.is_some() {
-                crate::git::StepKind::Commit
-            } else {
-                crate::git::StepKind::Workdir
-            },
+    fn timeline_cursor_follows_step_ids_and_marks_the_step_hunks() {
+        use crate::git::{StepKind, TimelineStep};
+        let step = |kind: StepKind, id: Option<&str>, parent: Option<&str>| TimelineStep {
+            kind,
             id: id.map(str::to_string),
             short: id.unwrap_or("now").chars().take(7).collect(),
             subject: String::new(),
             when: String::new(),
             parent: parent.map(str::to_string),
         };
-        let mut state = super::TimelineState {
-            steps: vec![
-                step(Some("aaaa"), Some("base")),
-                step(Some("bbbb"), Some("aaaa")),
-                step(None, Some("bbbb")),
-            ],
-            cursor: 1,
-            since: false,
-            base_label: "main".to_string(),
-            previous_mode: DiffMode::Local,
-            history_only: false,
-            anchor: None,
-            anchor_missed: false,
-        };
-        assert_eq!(
-            state.mode(),
-            DiffMode::Range {
-                from: Some("aaaa".to_string()),
-                to: RangeEnd::Commit("bbbb".to_string()),
-                kind: RangeKind::Step,
-            }
+        let mut app = app_with_two_files_of_three_hunks();
+        let steps = vec![
+            step(StepKind::Commit, Some("aaaa"), Some("base")),
+            step(StepKind::Snapshot, Some("bbbb"), Some("aaaa")),
+            step(StepKind::Workdir, None, Some("bbbb")),
+        ];
+        // The cursor step touched line 40 of a.rs: that is a.rs's second hunk (lines
+        // 40..40 in the synthetic file) and nothing in b.rs.
+        let step_lines = std::collections::HashMap::from([("a.rs".to_string(), vec![40u32])]);
+        app.apply_timeline(0, steps.clone(), step_lines);
+        assert_eq!(app.cursor_index(), 2, "cursor defaults to now");
+        assert!(app.is_step_hunk(0, 1));
+        assert!(!app.is_step_hunk(0, 0));
+        assert!(!app.is_step_hunk(1, 1));
+
+        // Moving back selects by id; the mode to refresh with is the user's comparison.
+        assert_eq!(app.timeline_move(-1), Some(DiffMode::Local));
+        assert_eq!(app.repos[0].cursor_id.as_deref(), Some("bbbb"));
+        assert_eq!(app.cursor_index(), 1);
+        assert!(app.timeline_move(-5).is_some());
+        assert_eq!(app.cursor_index(), 0);
+        assert!(app.timeline_move(-1).is_none(), "already at the first step");
+        assert!(app.timeline_jump(2).is_some());
+        assert_eq!(app.repos[0].cursor_id, None, "the last step is now");
+
+        // A pruned snapshot under the cursor falls back to now.
+        app.timeline_jump(1);
+        app.apply_timeline(
+            0,
+            vec![steps[0].clone(), steps[2].clone()],
+            Default::default(),
         );
-        state.since = true;
-        state.cursor = 2;
-        assert_eq!(
-            state.mode(),
-            DiffMode::Range {
-                from: Some("base".to_string()),
-                to: RangeEnd::Workdir,
-                kind: RangeKind::Since,
-            }
-        );
+        assert_eq!(app.repos[0].cursor_id, None);
     }
 
     #[test]
@@ -2830,7 +2834,9 @@ mod tests {
         let b = app.repos[0].files[1].clone();
         let mut a = app.repos[0].files[0].clone();
         a.hunks.remove(0);
-        app.apply_diff_result(0, Ok(vec![b, a]));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        let result = DiffResult::files_only(app.repos[0].id, DiffMode::Local, Ok(vec![b, a]));
+        assert!(app.apply_diff_refresh_result(result, &tx));
         let (file_idx, hunk_idx) = app.focused_hunk().unwrap();
         assert_eq!(app.repos[0].files[file_idx].path, "b.rs");
         let landed = crate::outline::file_symbols(&app.repos[0].files[file_idx])
@@ -2859,11 +2865,11 @@ mod tests {
         assert!(!gate.request());
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         let mut stale = test_app_with_files(&["stale.rs"]);
-        let result = DiffResult {
-            repo_id: app.repos[0].id,
-            mode: app.repos[0].mode.clone(),
-            result: Ok(stale.repos.remove(0).files),
-        };
+        let result = DiffResult::files_only(
+            app.repos[0].id,
+            app.repos[0].mode.clone(),
+            Ok(stale.repos.remove(0).files),
+        );
 
         assert!(!app.apply_diff_refresh_result(result, &tx));
         assert_eq!(app.repos[0].files[0].path, "old.rs");

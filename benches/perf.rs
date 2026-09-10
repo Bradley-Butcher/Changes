@@ -104,7 +104,7 @@ fn app_with(files: Vec<FileDiff>) -> App {
         name: "bench".to_string(),
         path: PathBuf::from("/bench"),
     }]);
-    let inner = ui::diff_inner_area(ratatui::layout::Rect::new(0, 0, COLS, ROWS), 0);
+    let inner = ui::diff_inner_area(ratatui::layout::Rect::new(0, 0, COLS, ROWS));
     app.layout.content_y = inner.y;
     app.layout.content_height = inner.height;
     app.layout.content_width = inner.width;
@@ -135,7 +135,7 @@ fn bench_scenario(name: &str, files: Vec<FileDiff>) {
     let highlighter = Highlighter::new();
     let mut terminal = Terminal::new(TestBackend::new(COLS, ROWS)).unwrap();
 
-    let width = ui::diff_inner_area(ratatui::layout::Rect::new(0, 0, COLS, ROWS), 0).width as usize;
+    let width = ui::diff_inner_area(ratatui::layout::Rect::new(0, 0, COLS, ROWS)).width as usize;
     time("DiffLayout::build unified (isolated)", 3, || {
         changes::viewport::DiffLayout::build(
             &files,

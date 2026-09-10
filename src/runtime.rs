@@ -173,7 +173,7 @@ async fn run_loop(
 
     loop {
         if needs_redraw {
-            let content_area = ui::diff_inner_area(terminal.size()?.into(), app.timeline_rows());
+            let content_area = ui::diff_inner_area(terminal.size()?.into());
             app.layout.content_y = content_area.y;
             app.layout.content_height = content_area.height;
             app.layout.content_width = content_area.width;
@@ -357,8 +357,11 @@ fn handle_event(
             }
         }
         AppEvent::Snapshot(result) => {
-            if result.recorded && app.timeline_refresh(result.repo_id) {
-                *needs_redraw = true;
+            // A new tick: re-list the timeline by refreshing the diff (which carries it).
+            if result.recorded
+                && let Some(idx) = app.find_repo(result.repo_id)
+            {
+                app.refresh_repo_async_bounded(idx, &ch.diff_tx);
             }
         }
         AppEvent::BaseBranch(result) => {

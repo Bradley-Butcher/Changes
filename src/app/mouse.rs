@@ -143,7 +143,7 @@ fn handle_mouse_with_sender(app: &mut App, mouse: event::MouseEvent, gap_tx: Gap
             }
 
             // Timeline strip: click a node to jump to that step.
-            if app.timeline().is_some() && click_row == app.layout.timeline_row {
+            if click_row == app.layout.timeline_row {
                 let hit = app
                     .layout
                     .timeline_positions

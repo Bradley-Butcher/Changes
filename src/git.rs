@@ -123,6 +123,14 @@ impl DiffMode {
             DiffMode::Staged => Cow::Borrowed("Staged"),
             DiffMode::Unstaged => Cow::Borrowed("Unstaged"),
             DiffMode::Branch { base, commits_only } => match bases.resolve(base) {
+                Some(name) if last_n_commits(&name).is_some() => {
+                    let n = last_n_commits(&name).unwrap_or(1);
+                    Cow::Owned(if *commits_only {
+                        format!("last {n} commit{}", if n == 1 { "" } else { "s" })
+                    } else {
+                        format!("last {n} + local")
+                    })
+                }
                 Some(name) if name == ROOT_BASE_NAME && *commits_only => {
                     Cow::Borrowed("All commits")
                 }
@@ -442,7 +450,7 @@ fn collect_files_serial(
 ) -> Result<Vec<FileDiff>> {
     expected
         .iter()
-        .map(|(idx, path)| file_from_patch(diff, *idx, path))
+        .filter_map(|(idx, path)| file_from_patch(diff, *idx, path).transpose())
         .collect()
 }
 
@@ -462,7 +470,7 @@ fn collect_files_parallel(
                     let diff = build_diff(&repo, spec)?;
                     chunk
                         .iter()
-                        .map(|(idx, path)| file_from_patch(&diff, *idx, path))
+                        .filter_map(|(idx, path)| file_from_patch(&diff, *idx, path).transpose())
                         .collect()
                 })
             })
@@ -516,7 +524,14 @@ fn line_content(line: &git2::DiffLine<'_>) -> String {
 }
 
 /// Build one delta's `FileDiff` from a lazily computed patch.
-fn file_from_patch(diff: &git2::Diff<'_>, idx: usize, expected_path: &str) -> Result<FileDiff> {
+/// `None` for a text file libgit2 lists as modified although nothing in it changed. A
+/// tree-to-workdir diff that consults the index reports every file whose index entry
+/// differs from the tree, even when the file on disk matches the tree byte for byte.
+fn file_from_patch(
+    diff: &git2::Diff<'_>,
+    idx: usize,
+    expected_path: &str,
+) -> Result<Option<FileDiff>> {
     let delta = diff
         .get_delta(idx)
         .context("delta disappeared while diffing")?;
@@ -539,8 +554,15 @@ fn file_from_patch(diff: &git2::Diff<'_>, idx: usize, expected_path: &str) -> Re
         sbs_cache: None,
     };
     let Some(patch) = git2::Patch::from_diff(diff, idx)? else {
-        return Ok(file);
+        return Ok(Some(file));
     };
+    if patch.num_hunks() == 0
+        && file.status == FileStatus::Modified
+        && !patch.delta().flags().is_binary()
+        && delta.old_file().mode() == delta.new_file().mode()
+    {
+        return Ok(None);
+    }
     for hunk_idx in 0..patch.num_hunks() {
         let (hunk, line_count) = patch.hunk(hunk_idx)?;
         let header = String::from_utf8_lossy(hunk.header()).trim().to_string();
@@ -570,7 +592,7 @@ fn file_from_patch(diff: &git2::Diff<'_>, idx: usize, expected_path: &str) -> Re
         }
         file.hunks.push(Hunk { header, lines });
     }
-    Ok(file)
+    Ok(Some(file))
 }
 
 /// Reference implementation: the original walk over libgit2's print callback. Kept only
@@ -789,7 +811,10 @@ pub fn timeline_steps(
     let repo = Repository::open(repo_path)
         .with_context(|| format!("Failed to open repo: {}", repo_path.display()))?;
     let head = repo.head()?.peel_to_commit()?;
-    let stop = match base {
+    let base = base
+        .map(|name| normalize_base_ref(&repo, name))
+        .transpose()?;
+    let stop = match base.as_deref() {
         Some(name) if name != ROOT_BASE_NAME => {
             let base_commit = base_commit(&repo, name)?;
             Some(repo.merge_base(base_commit.id(), head.id())?)
@@ -874,6 +899,97 @@ pub fn timeline_steps(
         parent: last_id.or_else(|| Some(head.id().to_string())),
     });
     Ok(steps)
+}
+
+/// The timeline for a user-chosen comparison: the nodes between its base and its "now".
+/// Local: recorded edits on top of HEAD, then the working tree. Branch: commits since
+/// the fork point with recorded edits between them, then the working tree (or just the
+/// commits when `commits_only`). Staged and unstaged have no intermediate states.
+pub fn timeline_for_mode(
+    repo_path: &Path,
+    mode: &DiffMode,
+    bases: &BaseCandidates,
+) -> Result<Vec<TimelineStep>> {
+    let branch = bases.branch.as_deref();
+    match mode {
+        DiffMode::Local => {
+            let repo = Repository::open(repo_path)?;
+            let head = repo.head()?.peel_to_commit()?.id().to_string();
+            // Only snapshots on top of HEAD; the commit itself is the base, not a node.
+            let mut steps = timeline_steps(repo_path, None, 1, branch)?;
+            steps.retain(|step| step.kind != StepKind::Commit);
+            // The first node's parent is the base, HEAD, whatever kind it is.
+            if let Some(first) = steps.first_mut() {
+                first.parent = Some(head);
+            }
+            Ok(steps)
+        }
+        DiffMode::Branch { base, commits_only } => {
+            let Some(base_ref) = bases.resolve(base) else {
+                return Ok(Vec::new());
+            };
+            let mut steps = timeline_steps(repo_path, Some(&base_ref), MAX_TIMELINE_STEPS, branch)?;
+            if *commits_only {
+                // The chain must stay contiguous: re-parent commits onto commits.
+                let mut previous: Option<String> = None;
+                steps.retain(|step| step.kind == StepKind::Commit);
+                for step in &mut steps {
+                    if let Some(prev) = &previous {
+                        step.parent = Some(prev.clone());
+                    }
+                    previous = step.id.clone();
+                }
+            }
+            Ok(steps)
+        }
+        DiffMode::Staged | DiffMode::Unstaged | DiffMode::Range { .. } => Ok(Vec::new()),
+    }
+}
+
+/// New-side line numbers `to` changed relative to `from`, per file: the added lines,
+/// and for deletions the line that now sits where the deleted block was. Used to mark
+/// which hunks of the accumulated diff belong to the step under the cursor.
+pub fn step_changed_lines(
+    repo_path: &Path,
+    from: Option<&str>,
+    to: &RangeEnd,
+) -> Result<std::collections::HashMap<String, Vec<u32>>> {
+    let mode = DiffMode::Range {
+        from: from.map(str::to_string),
+        to: to.clone(),
+        kind: RangeKind::Step,
+    };
+    let files = compute_diff(repo_path, &mode, None)?;
+    let mut lines = std::collections::HashMap::new();
+    for file in files {
+        let mut touched: Vec<u32> = Vec::new();
+        for hunk in &file.hunks {
+            let mut after_deletion = false;
+            for line in &hunk.lines {
+                match line.kind {
+                    LineKind::Addition => {
+                        touched.extend(line.new_lineno);
+                        after_deletion = false;
+                    }
+                    LineKind::Deletion => after_deletion = true,
+                    LineKind::Context => {
+                        if after_deletion {
+                            touched.extend(line.new_lineno);
+                            after_deletion = false;
+                        }
+                    }
+                }
+            }
+            if after_deletion {
+                // Deletion at the very end of the hunk: mark the last new line seen.
+                touched.extend(hunk.last_new_lineno());
+            }
+        }
+        if !touched.is_empty() {
+            lines.insert(file.path, touched);
+        }
+    }
+    Ok(lines)
 }
 
 fn relative_time(seconds: i64) -> String {
@@ -1080,6 +1196,7 @@ fn branch_exists(repo: &Repository, branch: &str) -> bool {
 /// Fork point of `base_ref` and HEAD → HEAD, or → the working tree unless `commits_only`.
 fn branch_diff_spec(repo: &Repository, base_ref: &str, commits_only: bool) -> Result<DiffSpec> {
     let head = repo.head()?.peel_to_commit()?;
+    let base_ref = &normalize_base_ref(repo, base_ref)?;
     if base_ref == ROOT_BASE_NAME {
         // The empty tree: every file the repository holds is an addition.
         return Ok(if commits_only {
@@ -1107,6 +1224,37 @@ fn branch_diff_spec(repo: &Repository, base_ref: &str, commits_only: bool) -> Re
     }
 }
 
+/// `-2`, `~2`, `2` and `HEAD~2` all mean "the last two commits". Returns how many.
+pub fn last_n_commits(base_ref: &str) -> Option<usize> {
+    let trimmed = base_ref.trim();
+    let digits = trimmed
+        .strip_prefix("HEAD~")
+        .or_else(|| trimmed.strip_prefix("@~"))
+        .or_else(|| trimmed.strip_prefix('-'))
+        .or_else(|| trimmed.strip_prefix('~'))
+        .unwrap_or(trimmed);
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    digits.parse().ok().filter(|n| *n > 0)
+}
+
+/// Turn a "last N commits" ref into the commit N first-parent steps behind HEAD, or the
+/// repository start when the history is shorter than that. Other refs pass through.
+fn normalize_base_ref(repo: &Repository, base_ref: &str) -> Result<String> {
+    let Some(n) = last_n_commits(base_ref) else {
+        return Ok(base_ref.to_string());
+    };
+    let mut commit = repo.head()?.peel_to_commit()?;
+    for _ in 0..n {
+        match commit.parent(0) {
+            Ok(parent) => commit = parent,
+            Err(_) => return Ok(ROOT_BASE_NAME.to_string()),
+        }
+    }
+    Ok(commit.id().to_string())
+}
+
 /// The commit `base_ref` names. Prefers `origin/<base_ref>`: it's almost always at or
 /// ahead of the rebase point, so merge-base finds the fork point, whereas the local
 /// branch often lags after a rebase onto origin. Falls back to whatever git can parse,
@@ -1128,9 +1276,9 @@ fn base_commit<'repo>(repo: &'repo Repository, base_ref: &str) -> Result<git2::C
 mod tests {
     use super::{
         Base, BaseCandidates, DiffMode, DiffSpec, MAX_UNTRACKED_FILE_BYTES, MAX_UNTRACKED_LINES,
-        PARALLEL_MIN_DELTAS, ROOT_BASE_NAME, build_diff, collect_files_parallel,
-        collect_files_serial, collect_files_via_print, compute_diff, count_lines, delta_path,
-        read_untracked_lines,
+        PARALLEL_MIN_DELTAS, ROOT_BASE_NAME, RangeEnd, RangeKind, build_diff,
+        collect_files_parallel, collect_files_serial, collect_files_via_print, compute_diff,
+        count_lines, delta_path, last_n_commits, read_untracked_lines,
     };
     use crate::diff::{FileDiff, FileStatus, LineKind};
     use git2::Delta;
@@ -1659,6 +1807,83 @@ mod tests {
         std::fs::remove_dir_all(repo_path).unwrap();
 
         assert_eq!(added_lines, ["first  ", "second\t\t"]);
+    }
+
+    #[test]
+    fn relative_refs_mean_the_last_n_commits_capped_at_the_first() {
+        assert_eq!(last_n_commits("-2"), Some(2));
+        assert_eq!(last_n_commits("~3"), Some(3));
+        assert_eq!(last_n_commits("HEAD~1"), Some(1));
+        assert_eq!(last_n_commits("1"), Some(1));
+        assert_eq!(last_n_commits("-0"), None);
+        assert_eq!(last_n_commits("main"), None);
+        assert_eq!(last_n_commits("-1a"), None);
+
+        let repo_path = temp_path("relative-refs");
+        std::fs::create_dir(&repo_path).unwrap();
+        let repo = git2::Repository::init(&repo_path).unwrap();
+        std::fs::write(repo_path.join("a.txt"), "one\n").unwrap();
+        commit_all(&repo, "first");
+        std::fs::write(repo_path.join("b.txt"), "two\n").unwrap();
+        commit_all(&repo, "second");
+        std::fs::write(repo_path.join("c.txt"), "three\n").unwrap();
+        commit_all(&repo, "third");
+        drop(repo);
+
+        let paths = |base: &str| -> Vec<String> {
+            let mode = DiffMode::Branch {
+                base: Base::Ref(base.to_string()),
+                commits_only: true,
+            };
+            let mut paths: Vec<String> = compute_diff(&repo_path, &mode, None)
+                .unwrap()
+                .into_iter()
+                .map(|file| file.path)
+                .collect();
+            paths.sort();
+            paths
+        };
+        let last_one = paths("-1");
+        let last_two = paths("-2");
+        let past_the_start = paths("-10");
+        std::fs::remove_dir_all(&repo_path).unwrap();
+
+        assert_eq!(last_one, ["c.txt"]);
+        assert_eq!(last_two, ["b.txt", "c.txt"]);
+        assert_eq!(past_the_start, ["a.txt", "b.txt", "c.txt"]);
+    }
+
+    #[test]
+    fn range_to_workdir_omits_files_that_match_the_from_tree() {
+        let repo_path = temp_path("range-phantoms");
+        std::fs::create_dir(&repo_path).unwrap();
+        let repo = git2::Repository::init(&repo_path).unwrap();
+        std::fs::write(repo_path.join("a.txt"), "a\n").unwrap();
+        std::fs::write(repo_path.join("b.txt"), "b\n").unwrap();
+        commit_all(&repo, "first");
+        drop(repo);
+
+        // Both files change, a snapshot records that state, then only b moves on. The
+        // index still holds the committed versions, so a diff that consults it lists
+        // a.txt too; the file matches the snapshot and must not show up.
+        std::fs::write(repo_path.join("a.txt"), "a edited\n").unwrap();
+        std::fs::write(repo_path.join("b.txt"), "b edited\n").unwrap();
+        let snapshot = crate::snapshots::record(&repo_path, "master")
+            .unwrap()
+            .expect("snapshot recorded");
+        std::fs::write(repo_path.join("b.txt"), "b edited twice\n").unwrap();
+
+        let mode = DiffMode::Range {
+            from: Some(snapshot.to_string()),
+            to: RangeEnd::Workdir,
+            kind: RangeKind::Step,
+        };
+        let files = compute_diff(&repo_path, &mode, None).unwrap();
+        std::fs::remove_dir_all(&repo_path).unwrap();
+
+        let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
+        assert_eq!(paths, ["b.txt"]);
+        assert_eq!(files[0].additions, 1);
     }
 
     #[test]

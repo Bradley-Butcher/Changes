@@ -16,7 +16,7 @@ It's also agent-agnostic. You shouldn't have to use a specific app or IDE just t
 
 - **Outline view** — press `o` for the shape of the change: a file tree with `+/-` counts and the functions, types and classes each hunk adds, removes or touches. Big diffs open here first
 - **Callers and callees** — every changed function shows who calls it and what it calls, resolved with tree-sitter across the whole repo (Rust, Python, Go, JS/TS). In the diff it's one line under the hunk header; in the outline it expands into a call tree. New functions nobody calls and deleted functions that are still called are flagged
-- **Timeline** — `l` opens a strip of the commits from your base to the working tree. `<` and `>` scrub through them one step at a time, keeping the same function in view as it evolves; `s` switches between "what this step changed" and "everything up to here"
+- **Timeline** — every view is "base → now", and the strip under the tabs shows the steps between the two: one dot per commit, a tick for each recorded edit, the working tree at the end. `<` and `>` rewind and advance "now" one step at a time, keeping the same function in view as it evolves. The diff stays cumulative from the base; hunks the current step touched are tagged `◆ this step`, and `s` narrows the view to that step alone. With a single step the strip is just a marker and the diff behaves as before
 - **Recorded edits** — while `changes` is running it records each settled state of the working tree (as git objects under `refs/changes/snapshots/`, invisible to `git log`). Those appear on the timeline as ticks between the commit dots, so you can replay an agent's edits in the order they happened, including attempts it later overwrote. Commits made before `changes` was running have no ticks and behave as plain commits
 - **Flow view** — `t` draws the change as a call-tree diff rooted at entry points: `main → run → handle_event → + your_new_function`. Unchanged steps are context, changed ones carry `+`/`~`/`-`, and code no user route reaches is listed separately
 - **Multi-repo tabs** — watch agent changes across repos simultaneously
@@ -138,11 +138,11 @@ The `┃` gutter bar marks the hunk that `y` / `n` / `N` act on. Click a hunk or
 |-----|--------|
 | `m` | Local: uncommitted work vs HEAD (staged, unstaged, untracked) |
 | `b` | Branch: everything since the fork point with the stack parent or trunk, uncommitted work included. On a repo that has never been pushed, or is still on its first commits, this is everything since the first commit |
-| `B` | Compare picker: trunk, upstream, repository start, staged, unstaged, a typed ref, and a "commits only" checkbox |
+| `B` | Compare picker: trunk, upstream, staged, unstaged, a typed ref, and a "commits only" checkbox. Type `-1` (or `-N`) for the last N commits; a number past the first commit means everything |
 | `v` | Toggle unified / side-by-side view |
 | `o` | Outline: file tree + changed symbols (`Enter` opens, `→`/`←` show/hide callers and callees, `y` copies as markdown) |
 | `t` | Flow: routes from entry points to the changed code (`o` and `t` switch between the two views; pressing the current view's key returns to the diff) |
-| `l` | Timeline: scrub the commits with `<` / `>` (`{` / `}` first / last, click a node), `s` toggles step / since, `l` or `Esc` closes |
+| `<` / `>` | Timeline: rewind / advance one step (`{` / `}` first / last, or click a dot); `s` shows the cursor step only |
 | `j` / `k`, `Ctrl+D` / `Ctrl+U`, `PgDn` / `PgUp` | Scroll by line, half page, page |
 | `g` / `G` | Jump to top / bottom |
 | `]` / `[` | Next / previous hunk |

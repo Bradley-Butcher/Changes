@@ -56,49 +56,42 @@ fn handle_key_with_set_mode(
         KeyCode::Char('c') if ctrl => return true,
         // Esc only ever closes something; quitting is `q` so a stray Esc can't end a review.
         KeyCode::Esc => {
-            if app.show_help {
-                app.show_help = false;
-            } else if app.timeline().is_some()
-                && let Some(mode) = app.timeline_toggle()
-            {
-                set_mode(app, mode);
-            }
+            app.show_help = false;
         }
 
-        // Timeline: scrub through the commits between the base and the working tree.
-        KeyCode::Char('l') => {
-            if let Some(mode) = app.timeline_toggle() {
-                set_mode(app, mode);
-            }
-        }
-        KeyCode::Char('>') | KeyCode::Char('.') if app.timeline().is_some() => {
+        // Timeline: the diff is base → cursor; these move the cursor.
+        KeyCode::Char('>') | KeyCode::Char('.') => {
             if let Some(mode) = app.timeline_move(1) {
                 set_mode(app, mode);
             } else {
-                app.set_status("At the working tree — the newest point on the timeline");
+                app.set_status("Already at now");
             }
         }
-        KeyCode::Char('<') | KeyCode::Char(',') if app.timeline().is_some() => {
+        KeyCode::Char('<') | KeyCode::Char(',') => {
             if let Some(mode) = app.timeline_move(-1) {
                 set_mode(app, mode);
+            } else if app.repos[app.active_tab].steps.len() < 2 {
+                app.set_status("Nothing between the base and now to step through");
             } else {
-                app.set_status("At the first commit on the timeline");
+                app.set_status("Already at the first step after the base");
             }
         }
-        KeyCode::Char('}') if app.timeline().is_some() => {
-            let last = app.timeline().map(|t| t.steps.len() - 1).unwrap_or(0);
+        KeyCode::Char('}') => {
+            let last = app.repos[app.active_tab].steps.len().saturating_sub(1);
             if let Some(mode) = app.timeline_jump(last) {
                 set_mode(app, mode);
             }
         }
-        KeyCode::Char('{') if app.timeline().is_some() => {
+        KeyCode::Char('{') => {
             if let Some(mode) = app.timeline_jump(0) {
                 set_mode(app, mode);
             }
         }
-        KeyCode::Char('s') if app.timeline().is_some() => {
-            if let Some(mode) = app.timeline_toggle_since() {
+        KeyCode::Char('s') => {
+            if let Some(mode) = app.timeline_toggle_step_only() {
                 set_mode(app, mode);
+            } else {
+                app.set_status("Nothing between the base and now to step through");
             }
         }
         KeyCode::Char('?') => {
@@ -1150,7 +1143,7 @@ mod tests {
                 _ => None,
             })
             .collect();
-        assert_eq!(names, ["pr2", "main", "origin/pr3", "repository start"]);
+        assert_eq!(names, ["pr2", "main", "origin/pr3"]);
 
         // On main, trunk and upstream both mean origin/main: one row, not two.
         app.repos[0].bases = Some(BaseCandidates {
@@ -1167,11 +1160,6 @@ mod tests {
                     base: Base::Trunk,
                     name: "origin/main".to_string(),
                     detail: "trunk",
-                },
-                CompareRow::Base {
-                    base: Base::Root,
-                    name: "repository start".to_string(),
-                    detail: "everything since the first commit",
                 },
                 CompareRow::Staged,
                 CompareRow::Unstaged,
