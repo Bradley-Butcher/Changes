@@ -18,6 +18,7 @@ It's also agent-agnostic. You shouldn't have to use a specific app or IDE just t
 - **Callers and callees** — every changed function shows who calls it and what it calls, resolved with tree-sitter across the whole repo (Rust, Python, Go, JS/TS). In the diff it's one line under the hunk header; in the outline it expands into a call tree. New functions nobody calls and deleted functions that are still called are flagged
 - **Timeline** — every view is "base → now", and the strip under the tabs shows the steps between the two: one dot per commit, a tick for each recorded edit, the working tree at the end. `<` and `>` rewind and advance "now" one step at a time, keeping the same function in view as it evolves. The diff stays cumulative from the base; hunks the current step touched are tagged `◆ this step`, and `s` narrows the view to that step alone. With a single step the strip is just a marker and the diff behaves as before
 - **Recorded edits** — while `changes` is running it records each settled state of the working tree (as git objects under `refs/changes/snapshots/`, invisible to `git log`). Those appear on the timeline as ticks between the commit dots, so you can replay an agent's edits in the order they happened, including attempts it later overwrote. Commits made before `changes` was running have no ticks and behave as plain commits
+- **Peek** — `p` swaps the focused file's diff for the file as it stands at that point, code kept at the same row, so a tangle of `+`/`-` lines can be read as plain code. Hold to peek, or tap to pin
 - **Flow view** — `t` draws the change as a call-tree diff rooted at entry points: `main → run → handle_event → + your_new_function`. Unchanged steps are context, changed ones carry `+`/`~`/`-`, and code no user route reaches is listed separately
 - **Multi-repo tabs** — watch agent changes across repos simultaneously
 - **Two views that matter** — `m` for everything uncommitted, `b` for the whole branch against its base (uncommitted work included). `B` picks anything else: trunk, upstream, staged only, a typed ref
@@ -156,7 +157,7 @@ The `┃` gutter bar marks the hunk that `y` / `n` / `N` act on. Click a hunk or
 | `Y` | Copy all notes + hunks as markdown |
 | `C` | Browse notes |
 | `D` | Clear all notes |
-| `p` | Preview focused markdown file |
+| `p` | Peek: the focused file as it stands at the cursor step, in place of its diff, with the hunk you were on kept at the same row. Hold to peek and release to return (terminals with the kitty keyboard protocol), or tap to pin and tap again to return. `]` / `[` step between added lines. Markdown files render instead |
 | `a` / `x` | Add / remove repo tab |
 | `Tab` / `Shift+Tab` / `1`-`9` | Switch tabs |
 | Click `↕ N` | Expand hidden context lines |

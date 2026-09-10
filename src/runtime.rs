@@ -6,6 +6,7 @@ use crate::watcher::{self, WatchEvent};
 use anyhow::Result;
 use crossterm::event::{
     self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -64,6 +65,8 @@ struct Channels {
 
 fn restore_terminal() {
     let _ = disable_raw_mode();
+    // Harmless where the flags were never pushed.
+    let _ = crossterm::execute!(io::stdout(), PopKeyboardEnhancementFlags);
     let _ = crossterm::execute!(io::stdout(), LeaveAlternateScreen, DisableMouseCapture);
     let _ = crossterm::execute!(io::stdout(), crossterm::cursor::Show);
 }
@@ -100,6 +103,17 @@ pub async fn run(path: PathBuf) -> Result<()> {
     let _guard = TerminalGuard;
     let mut stdout = io::stdout();
     crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
+    // Key release events, where the terminal offers them, so holding `p` peeks for as
+    // long as it is held. Elsewhere the peek is a toggle.
+    if matches!(
+        crossterm::terminal::supports_keyboard_enhancement(),
+        Ok(true)
+    ) {
+        let _ = crossterm::execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_EVENT_TYPES)
+        );
+    }
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
@@ -255,7 +269,18 @@ fn handle_event(
 ) -> Result<bool> {
     match event {
         AppEvent::Terminal(Event::Key(key)) => {
-            if key.kind != KeyEventKind::Press {
+            // Only the peek key cares about releases and repeats; everything else
+            // treats a repeat as another press.
+            if key.kind == KeyEventKind::Release {
+                if key.code == KeyCode::Char('p') && app.peek.is_some() {
+                    app.peek_release();
+                    *needs_redraw = true;
+                }
+                return Ok(false);
+            }
+            if app.peek.is_some() {
+                keys::handle_peek_key(app, key);
+                *needs_redraw = true;
                 return Ok(false);
             }
             if app.markdown_preview.is_some() {

@@ -3,7 +3,7 @@ use super::{
     MarkdownPreviewState, RepoAdderState,
 };
 use crate::git::{Base, DiffMode};
-use crossterm::event::{self, KeyCode, KeyModifiers};
+use crossterm::event::{self, KeyCode, KeyEventKind, KeyModifiers};
 use std::path::PathBuf;
 use tokio::sync::mpsc;
 
@@ -288,7 +288,7 @@ fn handle_key_with_set_mode(
             }
         }
 
-        // Markdown preview
+        // Peek at the file as it stands: rendered for markdown, the code itself otherwise.
         KeyCode::Char('p') => {
             let focused = app.focused_file.or_else(|| app.focused_file_from_scroll());
             let Some(file_idx) = focused else {
@@ -302,7 +302,11 @@ fn handle_key_with_set_mode(
                 return false;
             };
             if !file.path.ends_with(".md") {
-                app.set_status(format!("Preview only works for .md files ({})", file.path));
+                if key.kind == KeyEventKind::Repeat {
+                    app.peek_repeat();
+                } else {
+                    app.peek_press();
+                }
                 return false;
             }
             let preview_path = file.path.clone();
@@ -610,6 +614,29 @@ pub fn handle_repo_adder_key(app: &mut App, key: event::KeyEvent) -> Vec<usize> 
         _ => {}
     }
     Vec::new()
+}
+
+/// Keys while the peek is up: `p` again (or Esc) closes it, the usual keys scroll,
+/// `]` / `[` step between the added lines.
+pub fn handle_peek_key(app: &mut App, key: event::KeyEvent) {
+    let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+    let half = (app.layout.content_height as isize / 2).max(1);
+    match key.code {
+        KeyCode::Char('p') if key.kind == KeyEventKind::Repeat => app.peek_repeat(),
+        KeyCode::Char('p') => app.peek_press(),
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Enter => app.close_peek(),
+        KeyCode::Down | KeyCode::Char('j') => app.peek_scroll_by(1),
+        KeyCode::Up | KeyCode::Char('k') => app.peek_scroll_by(-1),
+        KeyCode::Char('d') if ctrl => app.peek_scroll_by(half),
+        KeyCode::Char('u') if ctrl => app.peek_scroll_by(-half),
+        KeyCode::PageDown => app.peek_scroll_by(half * 2),
+        KeyCode::PageUp => app.peek_scroll_by(-(half * 2)),
+        KeyCode::Char('g') => app.peek_scroll_to(0),
+        KeyCode::Char('G') => app.peek_scroll_to_bottom(),
+        KeyCode::Char(']') => app.peek_next_change(true),
+        KeyCode::Char('[') => app.peek_next_change(false),
+        _ => {}
+    }
 }
 
 pub fn handle_markdown_preview_key(app: &mut App, key: event::KeyEvent) {

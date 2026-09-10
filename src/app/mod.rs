@@ -1,7 +1,7 @@
 pub mod keys;
 pub mod mouse;
 
-use crate::diff::{DiffLine, FileDiff, LineKind};
+use crate::diff::{DiffLine, FileDiff, Hunk, LineKind};
 use crate::git::{
     self, Base, BaseCandidates, DiffMode, RangeEnd, RangeKind, RepoInfo, TimelineStep,
 };
@@ -92,7 +92,7 @@ pub struct RepoState {
     pub step_hunks: std::collections::HashSet<(String, usize)>,
     /// The function the user was on before the last timeline move; kept while steps
     /// that do not contain it go by so scrubbing snaps back to it when it reappears.
-    anchor: Option<(String, Option<String>)>,
+    anchor: Option<Anchor>,
     anchor_missed: bool,
     /// Whether branch comparisons leave uncommitted work out. Remembered across mode
     /// switches so `b` comes back to the same view the picker last set up.
@@ -156,6 +156,42 @@ pub struct RepoAdderState {
     pub checked: std::collections::HashSet<usize>,
 }
 
+/// Where the user was before a timeline move: the file, the function the focused hunk
+/// changes (when it has one), and the new-side line the hunk starts at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Anchor {
+    pub path: String,
+    pub ident: Option<String>,
+    pub line: Option<u32>,
+    /// How far below the top of the viewport the hunk's header sat, when it was on
+    /// screen, so the hunk lands on the same row afterwards.
+    pub row_offset: Option<usize>,
+}
+
+/// The file as it stands on the new side of the comparison, shown in place of its
+/// diff while `p` is held (or until it is pressed again).
+pub struct PeekState {
+    pub file_idx: usize,
+    pub path: String,
+    pub lines: Vec<String>,
+    pub scroll: usize,
+    /// New-side line numbers the diff added, marked in the gutter.
+    pub changed: std::collections::HashSet<u32>,
+    /// Which version this is: "working tree", "as of 9b9713c …".
+    pub label: String,
+    opened_at: Instant,
+    /// Last `p` press or repeat, to tell a held key from a second tap on terminals
+    /// that report holding as repeated presses.
+    key_at: Instant,
+    /// The key has repeated: this is a hold, so its release ends the peek.
+    held: bool,
+}
+
+/// How long after opening a release still counts as a tap (which leaves the peek up).
+const PEEK_TAP: Duration = Duration::from_millis(300);
+/// A `p` press this soon after the last one is key repeat, not a second tap.
+const PEEK_REPEAT: Duration = Duration::from_millis(1000);
+
 pub struct MarkdownPreviewState {
     pub content: String,
     pub path: String,
@@ -202,6 +238,7 @@ pub struct App {
     pub comment_input: Option<CommentInputState>,
     pub comment_browser: Option<CommentBrowserState>,
     pub markdown_preview: Option<MarkdownPreviewState>,
+    pub peek: Option<PeekState>,
     pub outline: Option<OutlineState>,
     pub(crate) markdown_render_cache:
         std::cell::RefCell<Option<(u16, Vec<ratatui::text::Line<'static>>)>>,
@@ -209,9 +246,9 @@ pub struct App {
     pub last_click: Option<(u16, u16, Instant)>,
     diff_worker: Option<DiffWorker>,
     index_worker: Option<IndexWorker>,
-    /// Where to land after the next diff arrives: (file path, function identifier).
-    /// Set when the timeline moves, so scrubbing keeps the same function in view.
-    pending_anchor: Option<(String, Option<String>)>,
+    /// Where to land after the next diff arrives. Set when the timeline moves, so
+    /// scrubbing keeps the same function in view.
+    pending_anchor: Option<Anchor>,
     /// A mode change requested from somewhere without a diff channel (mouse clicks);
     /// the run loop applies it after the event.
     pub pending_mode: Option<DiffMode>,
@@ -276,6 +313,7 @@ impl App {
             comment_input: None,
             comment_browser: None,
             markdown_preview: None,
+            peek: None,
             outline: None,
             markdown_render_cache: std::cell::RefCell::new(None),
             layout: LayoutHints::default(),
@@ -424,6 +462,227 @@ impl App {
             .unwrap_or(repo.steps.len().saturating_sub(1))
     }
 
+    /// Show the focused file as it stands at the cursor step, with the line under the
+    /// focused hunk kept at the same screen row so the code does not move.
+    pub fn open_peek(&mut self) {
+        let Some(file_idx) = self
+            .focused_file
+            .or_else(|| self.focused_file_from_scroll())
+        else {
+            return;
+        };
+        let mode = self.shown_mode();
+        let repo = &self.repos[self.active_tab];
+        let Some(file) = repo.files.get(file_idx) else {
+            return;
+        };
+        if file.status == crate::diff::FileStatus::Deleted {
+            self.set_status(format!("{} no longer exists on this side", file.path));
+            return;
+        }
+        let lines = match git::read_new_side_lines(
+            &repo.info.path,
+            Path::new(&file.path),
+            &mode,
+            1,
+            usize::MAX,
+        ) {
+            Ok(lines) => lines,
+            Err(error) => {
+                self.set_status(format!("Cannot read {}: {error}", file.path));
+                return;
+            }
+        };
+        let changed: std::collections::HashSet<u32> = file
+            .hunks
+            .iter()
+            .flat_map(|hunk| &hunk.lines)
+            .filter(|line| line.kind == LineKind::Addition)
+            .filter_map(|line| line.new_lineno)
+            .collect();
+        let label = match mode.new_side() {
+            git::NewSide::Workdir => "working tree".to_string(),
+            git::NewSide::Index => "index".to_string(),
+            git::NewSide::Head => "HEAD".to_string(),
+            git::NewSide::Commit(id) => {
+                match repo.steps.iter().find(|s| s.id.as_ref() == Some(&id)) {
+                    Some(step) if step.kind == git::StepKind::Commit => {
+                        format!("as of {} {}", step.short, step.subject)
+                    }
+                    Some(step) => format!("as of the recorded edit {}", step.when),
+                    None => format!("as of {}", &id[..7.min(id.len())]),
+                }
+            }
+        };
+        // Keep the first new-side line of the focused hunk on the screen row it has
+        // now; peek row 0 is the header, so content row r shows line scroll + r - 1.
+        let anchor = self.peek_anchor(file_idx);
+        let scroll = anchor
+            .map(|(row, lineno)| (lineno as usize).saturating_sub(row.max(1)))
+            .or_else(|| {
+                file.hunks
+                    .first()
+                    .and_then(Hunk::first_new_lineno)
+                    .map(|lineno| (lineno as usize).saturating_sub(4))
+            })
+            .unwrap_or(0);
+        let now = Instant::now();
+        self.peek = Some(PeekState {
+            file_idx,
+            path: file.path.clone(),
+            lines,
+            scroll,
+            changed,
+            label,
+            opened_at: now,
+            key_at: now,
+            held: false,
+        });
+    }
+
+    /// The screen row (within the content area) and new-side line number of the first
+    /// visible line of the focused hunk, or failing that of the file.
+    fn peek_anchor(&self, file_idx: usize) -> Option<(usize, u32)> {
+        let layout = self.current_layout()?;
+        let files = self.current_files()?;
+        let focused = self.focused_hunk();
+        let visible = self.visible_row_range(layout.total_lines(), self.viewport_height());
+        let sticky = self.sticky_header_file().is_some();
+        let mut fallback = None;
+        for (screen_row, row) in visible.enumerate() {
+            if sticky && screen_row == 0 {
+                continue; // hidden behind the pinned file header
+            }
+            let (f, h, lineno) = match layout.row(row)? {
+                RowRef::UnifiedLine {
+                    file_idx: f,
+                    hunk_idx,
+                    line_idx,
+                    chunk_idx: 0,
+                } => {
+                    let line = files.get(f)?.hunks.get(hunk_idx)?.lines.get(line_idx)?;
+                    (f, hunk_idx, line.new_lineno)
+                }
+                RowRef::SideBySideLine {
+                    file_idx: f,
+                    hunk_idx,
+                    line_idx,
+                    chunk_idx: 0,
+                } => {
+                    let pair = files
+                        .get(f)?
+                        .sbs_cache
+                        .as_ref()?
+                        .get(hunk_idx)?
+                        .get(line_idx)?;
+                    (f, hunk_idx, pair.right.as_ref().and_then(|l| l.new_lineno))
+                }
+                _ => continue,
+            };
+            let Some(lineno) = lineno else {
+                continue;
+            };
+            if f != file_idx {
+                continue;
+            }
+            if focused == Some((f, h)) {
+                return Some((screen_row, lineno));
+            }
+            if fallback.is_none() {
+                fallback = Some((screen_row, lineno));
+            }
+        }
+        fallback
+    }
+
+    pub fn close_peek(&mut self) {
+        self.peek = None;
+    }
+
+    /// `p` pressed. Opens the peek, or closes it on a second tap; a press that follows
+    /// the last one closely is key repeat from a held key and keeps it open.
+    pub fn peek_press(&mut self) {
+        let now = Instant::now();
+        match &mut self.peek {
+            None => self.open_peek(),
+            Some(peek) if now.duration_since(peek.key_at) < PEEK_REPEAT => {
+                peek.held = true;
+                peek.key_at = now;
+            }
+            Some(_) => self.peek = None,
+        }
+    }
+
+    /// `p` reported as repeating: the key is held.
+    pub fn peek_repeat(&mut self) {
+        if let Some(peek) = &mut self.peek {
+            peek.held = true;
+            peek.key_at = Instant::now();
+        }
+    }
+
+    /// `p` released: a held key ends the peek, a quick tap leaves it up.
+    pub fn peek_release(&mut self) {
+        if let Some(peek) = &self.peek
+            && (peek.held || peek.opened_at.elapsed() > PEEK_TAP)
+        {
+            self.peek = None;
+        }
+    }
+
+    pub fn peek_scroll_by(&mut self, delta: isize) {
+        let height = self.viewport_height().saturating_sub(1);
+        if let Some(peek) = &mut self.peek {
+            let max = peek.lines.len().saturating_sub(height);
+            peek.scroll = peek.scroll.saturating_add_signed(delta).min(max);
+        }
+    }
+
+    pub fn peek_scroll_to(&mut self, row: usize) {
+        let height = self.viewport_height().saturating_sub(1);
+        if let Some(peek) = &mut self.peek {
+            let max = peek.lines.len().saturating_sub(height);
+            peek.scroll = row.min(max);
+        }
+    }
+
+    pub fn peek_scroll_to_bottom(&mut self) {
+        self.peek_scroll_to(usize::MAX);
+    }
+
+    /// Jump to the next (or previous) run of added lines, placing it a few rows down.
+    pub fn peek_next_change(&mut self, forward: bool) {
+        let Some(peek) = &self.peek else {
+            return;
+        };
+        let current = peek.scroll + 4;
+        let mut starts: Vec<u32> = peek
+            .changed
+            .iter()
+            .copied()
+            .filter(|line| !peek.changed.contains(&line.saturating_sub(1)))
+            .collect();
+        starts.sort_unstable();
+        let target = if forward {
+            starts.iter().find(|&&line| line as usize > current + 1)
+        } else {
+            starts
+                .iter()
+                .rev()
+                .find(|&&line| (line as usize) < current + 1)
+        };
+        if let Some(&line) = target {
+            self.peek_scroll_to((line as usize).saturating_sub(4));
+        }
+    }
+
+    /// The comparison the active tab is showing, cursor included; what to read the new
+    /// side of a file from.
+    pub fn shown_mode(&self) -> DiffMode {
+        let repo = &self.repos[self.active_tab];
+        effective_mode(&repo.mode, &repo.steps, self.cursor_index(), repo.step_only)
+    }
+
     /// The step under the cursor, if the timeline has any.
     pub fn cursor_step(&self) -> Option<&TimelineStep> {
         self.repos[self.active_tab].steps.get(self.cursor_index())
@@ -496,7 +755,7 @@ impl App {
 
     /// The anchor to carry across a move: the focused function, unless the last move
     /// missed, in which case the earlier anchor stays so it can be found again.
-    fn carry_anchor(&mut self) -> Option<(String, Option<String>)> {
+    fn carry_anchor(&mut self) -> Option<Anchor> {
         let focused = self.focus_anchor();
         let repo = &mut self.repos[self.active_tab];
         if !repo.anchor_missed || repo.anchor.is_none() {
@@ -506,7 +765,7 @@ impl App {
     }
 
     /// The file and function the focused hunk is in, for re-anchoring after a refresh.
-    fn focus_anchor(&self) -> Option<(String, Option<String>)> {
+    fn focus_anchor(&self) -> Option<Anchor> {
         let (file_idx, hunk_idx) = self.focused_hunk()?;
         let repo = self.repos.get(self.active_tab)?;
         let file = repo.files.get(file_idx)?;
@@ -514,30 +773,88 @@ impl App {
             .into_iter()
             .find(|symbol| symbol.hunk_idx == hunk_idx)
             .and_then(|symbol| symbol.ident);
-        Some((file.path.clone(), ident))
+        let line = file.hunks.get(hunk_idx).and_then(Hunk::first_new_lineno);
+        let row_offset = self.current_layout().and_then(|layout| {
+            let rows = layout.hunk_row_range(file_idx, hunk_idx)?;
+            let visible = self.visible_row_range(layout.total_lines(), self.viewport_height());
+            visible
+                .contains(&rows.start)
+                .then(|| rows.start - visible.start)
+        });
+        Some(Anchor {
+            path: file.path.clone(),
+            ident,
+            line,
+            row_offset,
+        })
     }
 
-    /// After a timeline move, land on the same function (or file) in the new diff.
+    /// After a timeline move, land on the same function in the new diff; failing that,
+    /// the hunk nearest the same lines of the same file. When neither exists the scroll
+    /// position stays where it was rather than jumping to the top.
     fn apply_pending_anchor(&mut self) {
-        let Some((path, ident)) = self.pending_anchor.take() else {
+        let Some(anchor) = self.pending_anchor.take() else {
             return;
         };
         let repo = &self.repos[self.active_tab];
-        let file_idx = repo.files.iter().position(|file| file.path == path);
-        let hunk = file_idx.and_then(|file_idx| {
-            let ident = ident.as_deref()?;
+        let file_idx = repo.files.iter().position(|file| file.path == anchor.path);
+        let by_ident = file_idx.and_then(|file_idx| {
+            let ident = anchor.ident.as_deref()?;
             outline::file_symbols_with(&repo.files[file_idx], repo.symbols.as_deref())
                 .into_iter()
                 .find(|symbol| symbol.ident.as_deref() == Some(ident))
                 .map(|symbol| symbol.hunk_idx)
         });
-        let hit = hunk.is_some() || (ident.is_none() && file_idx.is_some());
+        let by_line = file_idx.and_then(|file_idx| {
+            let line = anchor.line?;
+            repo.files[file_idx]
+                .hunks
+                .iter()
+                .enumerate()
+                .filter_map(|(hunk_idx, hunk)| {
+                    let start = hunk.first_new_lineno()?;
+                    let end = hunk.last_new_lineno().unwrap_or(start);
+                    let distance = start.saturating_sub(line) + line.saturating_sub(end);
+                    Some((distance, hunk_idx))
+                })
+                .min()
+                .map(|(_, hunk_idx)| hunk_idx)
+        });
+        let hit = by_ident.is_some() || (anchor.ident.is_none() && file_idx.is_some());
         self.repos[self.active_tab].anchor_missed = !hit;
-        match (file_idx, hunk) {
-            (Some(file_idx), Some(hunk_idx)) => self.select_hunk(file_idx, hunk_idx),
-            (Some(file_idx), None) => self.jump_to_file(file_idx),
-            (None, _) => self.jump_active_viewport_top(),
+        if let (Some(file_idx), Some(hunk_idx)) = (file_idx, by_ident.or(by_line)) {
+            self.select_hunk_at_offset(file_idx, hunk_idx, anchor.row_offset);
+        } else if let Some(file_idx) = file_idx {
+            self.jump_to_file(file_idx);
         }
+    }
+
+    /// Select a hunk and put its header `row_offset` rows below the top of the viewport;
+    /// with no offset, scroll only if the hunk is not on screen at all.
+    fn select_hunk_at_offset(
+        &mut self,
+        file_idx: usize,
+        hunk_idx: usize,
+        row_offset: Option<usize>,
+    ) {
+        self.prepare_active_layout();
+        let Some(rows) = self
+            .current_layout()
+            .and_then(|layout| layout.hunk_row_range(file_idx, hunk_idx))
+        else {
+            return;
+        };
+        let total = self.total_display_lines();
+        let height = self.viewport_height();
+        let visible = self.visible_row_range(total, height);
+        let on_screen = rows.start < visible.end && rows.end > visible.start;
+        match row_offset {
+            Some(offset) => self.jump_active_viewport_to(rows.start.saturating_sub(offset)),
+            None if !on_screen => self.jump_active_viewport_to(rows.start.saturating_sub(1)),
+            None => {}
+        }
+        self.hunk_cursor = Some((file_idx, hunk_idx));
+        self.focused_file = Some(file_idx);
     }
 
     /// Path and branch to record a snapshot for, if the repo is known and on a branch.
@@ -1240,6 +1557,7 @@ impl App {
         file_idx: usize,
         gap_idx: usize,
     ) -> Option<GapExpandRequest> {
+        let mode = self.shown_mode();
         let repo = self.repos.get(self.active_tab)?;
         let file = repo.files.get(file_idx)?;
         if file.hunks.is_empty() {
@@ -1293,7 +1611,7 @@ impl App {
             file_idx,
             gap_idx,
             repo_path: repo.info.path.clone(),
-            mode: repo.mode.clone(),
+            mode,
             diff_file_path: file.path.clone(),
             gap_start,
             gap_end,
@@ -2242,19 +2560,7 @@ impl DiffJob {
             _ => std::collections::HashMap::new(),
         };
 
-        let effective = match (&step_to, self.step_only, cursor == last) {
-            (Some(to), true, _) => DiffMode::Range {
-                from: step_from,
-                to: to.clone(),
-                kind: RangeKind::Step,
-            },
-            (Some(to), false, false) => DiffMode::Range {
-                from: steps.first().and_then(|s| s.parent.clone()),
-                to: to.clone(),
-                kind: RangeKind::Since,
-            },
-            _ => self.mode.clone(),
-        };
+        let effective = effective_mode(&self.mode, &steps, cursor, self.step_only);
         let result = git::compute_diff(&self.path, &effective, Some(&bases));
         DiffResult {
             repo_id: self.repo_id,
@@ -2264,6 +2570,39 @@ impl DiffJob {
             cursor_id,
             step_lines,
         }
+    }
+}
+
+/// The comparison actually computed for a timeline position: base → cursor, the cursor
+/// step alone, or the user's own mode when the cursor is at now.
+pub fn effective_mode(
+    mode: &DiffMode,
+    steps: &[TimelineStep],
+    cursor: usize,
+    step_only: bool,
+) -> DiffMode {
+    let last = steps.len().saturating_sub(1);
+    let Some(step) = steps.get(cursor) else {
+        return mode.clone();
+    };
+    let to = match &step.id {
+        Some(id) => RangeEnd::Commit(id.clone()),
+        None => RangeEnd::Workdir,
+    };
+    if step_only {
+        DiffMode::Range {
+            from: step.parent.clone(),
+            to,
+            kind: RangeKind::Step,
+        }
+    } else if cursor < last {
+        DiffMode::Range {
+            from: steps.first().and_then(|s| s.parent.clone()),
+            to,
+            kind: RangeKind::Since,
+        }
+    } else {
+        mode.clone()
     }
 }
 
@@ -2415,11 +2754,12 @@ impl GapExpandRequest {
 
 #[cfg(test)]
 mod tests {
-    use super::{App, DiffResult, RefreshGate};
+    use super::{Anchor, App, DiffResult, PEEK_REPEAT, PeekState, RefreshGate};
     use crate::diff::{DiffLine, FileDiff, FileStatus, Hunk, LineKind};
     use crate::git::DiffMode;
     use crate::git::RepoInfo;
     use std::path::PathBuf;
+    use std::time::{Duration, Instant};
 
     fn test_app_with_files(paths: &[&str]) -> App {
         let mut app = App::new(vec![RepoInfo {
@@ -2810,6 +3150,45 @@ mod tests {
         assert_eq!(app.repos[0].cursor_id, None);
     }
 
+    fn peek_state(opened: Instant) -> PeekState {
+        PeekState {
+            file_idx: 0,
+            path: "a.rs".to_string(),
+            lines: vec!["fn a() {}".to_string()],
+            scroll: 0,
+            changed: std::collections::HashSet::new(),
+            label: "working tree".to_string(),
+            opened_at: opened,
+            key_at: opened,
+            held: false,
+        }
+    }
+
+    #[test]
+    fn peek_tap_pins_it_and_a_hold_ends_on_release() {
+        let mut app = app_with_two_files_of_three_hunks();
+        // A quick tap: the release right after opening leaves the peek up.
+        app.peek = Some(peek_state(Instant::now()));
+        app.peek_release();
+        assert!(app.peek.is_some());
+        // The key repeats (held), so its release closes the peek.
+        app.peek_repeat();
+        app.peek_release();
+        assert!(app.peek.is_none());
+        // Terminals without release events: a press long after the last one is a second
+        // tap and closes; one right after is repeat and keeps it open.
+        app.peek = Some(peek_state(Instant::now()));
+        app.peek_press();
+        assert!(
+            app.peek.is_some(),
+            "repeat within the window keeps the peek"
+        );
+        let earlier = Instant::now() - PEEK_REPEAT - Duration::from_millis(1);
+        app.peek = Some(peek_state(earlier));
+        app.peek_press();
+        assert!(app.peek.is_none(), "a later press is a second tap");
+    }
+
     #[test]
     fn scrubbing_keeps_the_same_function_in_view() {
         let mut app = app_with_two_files_of_three_hunks();
@@ -2827,7 +3206,12 @@ mod tests {
             .into_iter()
             .find(|s| s.hunk_idx == 1)
             .unwrap();
-        app.pending_anchor = Some(("b.rs".to_string(), symbol.ident.clone()));
+        app.pending_anchor = Some(Anchor {
+            path: "b.rs".to_string(),
+            ident: symbol.ident.clone(),
+            line: None,
+            row_offset: None,
+        });
 
         // The next diff lists the files the other way round and drops a.rs's first hunk;
         // the anchor still lands on the same function of b.rs.

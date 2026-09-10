@@ -594,13 +594,78 @@ fn draw_diff_area(frame: &mut Frame, app: &App, highlighter: &Highlighter, area:
         return;
     }
 
-    if app.outline.is_some() {
+    if app.peek.is_some() {
+        draw_peek(frame, app, highlighter, area);
+    } else if app.outline.is_some() {
         draw_outline(frame, app, area);
     } else if app.side_by_side {
         draw_side_by_side(frame, app, highlighter, files, layout, area);
     } else {
         draw_unified(frame, app, highlighter, files, layout, area);
     }
+}
+
+/// The file as it stands, in place of its diff: a header naming the version, then the
+/// code with new-side line numbers. Added lines get an accent mark in the gutter.
+fn draw_peek(frame: &mut Frame, app: &App, highlighter: &Highlighter, area: Rect) {
+    let t = theme();
+    let inner = content_inner(area);
+    let Some(peek) = app.peek.as_ref() else {
+        return;
+    };
+    let height = inner.height as usize;
+    let width = inner.width as usize;
+
+    let bg = t.surface;
+    let title = format!(" {} ", peek.path);
+    let label = format!("  peek · {}", peek.label);
+    let hint = "p or esc back  ";
+    let used = UnicodeWidthStr::width(title.as_str()) + UnicodeWidthStr::width(hint);
+    let label = fit_to_width(&label, width.saturating_sub(used));
+    let pad = width.saturating_sub(used + UnicodeWidthStr::width(label.as_str()));
+    let mut lines: Vec<Line> = vec![Line::from(vec![
+        Span::styled(
+            title,
+            Style::default()
+                .fg(t.text)
+                .bg(bg)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(label, Style::default().fg(t.accent).bg(bg)),
+        Span::styled(" ".repeat(pad), Style::default().bg(bg)),
+        Span::styled(hint, Style::default().fg(t.muted).bg(bg)),
+    ])];
+
+    let lno_width = peek.lines.len().max(1).to_string().len().max(3);
+    let gutter = lno_width + 3; // "NNN ▎ "
+    let available = width.saturating_sub(gutter);
+    for (offset, text) in peek
+        .lines
+        .iter()
+        .enumerate()
+        .skip(peek.scroll)
+        .take(height.saturating_sub(1))
+    {
+        let lineno = offset as u32 + 1;
+        let added = peek.changed.contains(&lineno);
+        let mut spans = vec![
+            Span::styled(
+                format!("{lineno:>lno_width$} "),
+                Style::default().fg(t.muted),
+            ),
+            if added {
+                Span::styled("▎", Style::default().fg(t.accent))
+            } else {
+                Span::styled("│", Style::default().fg(t.surface_raised))
+            },
+            Span::raw(" "),
+        ];
+        let shown = fit_to_width(text, available);
+        let mut code = highlighter.highlight_line_content(&shown, &peek.path, None);
+        spans.append(&mut code.spans);
+        lines.push(Line::from(spans));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// The change-shape view: directory tree, per-file counts, and changed declarations.
@@ -1995,7 +2060,13 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
         // A few key hints for the current view, dropped from the right when space is tight.
         let in_flow = app.outline.as_ref().is_some_and(|o| o.flow);
         let scrubbable = app.repos[app.active_tab].steps.len() > 1;
-        let hints_full: &[(&str, &str)] = if scrubbable && app.outline.is_none() {
+        let hints_full: &[(&str, &str)] = if app.peek.is_some() {
+            &[
+                ("p", "back to the diff"),
+                ("] [", "next / prev change"),
+                ("j k", "scroll"),
+            ]
+        } else if scrubbable && app.outline.is_none() {
             &[
                 ("< >", "scrub"),
                 ("s", "this step only"),
@@ -2487,7 +2558,7 @@ const HELP_LEFT: HelpColumn = &[
             ("t", "Flow: routes into the change"),
             ("< >", "Timeline: rewind / advance"),
             ("s", "Show the cursor step only"),
-            ("p", "Preview focused .md file"),
+            ("p", "Peek at the file itself"),
         ],
     ),
     (
