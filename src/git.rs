@@ -851,6 +851,22 @@ pub fn timeline_steps(
     // Steps chain: each diffs from the step before it, so a commit made after recorded
     // edits shows only what changed since the last edit, not the whole commit again.
     let mut chain_prev: Option<String> = None;
+
+    // Edits recorded on the base commit itself lead up to the first commit after it
+    // (or straight to the working tree when the base is HEAD).
+    if let Some(stop) = stop {
+        let base_tree = repo.find_commit(stop)?.tree_id();
+        let next_tree = commits.first().map(|(_, tree)| *tree).or(workdir_tree);
+        chain_prev = push_snapshot_steps(
+            &mut steps,
+            &snapshots,
+            stop,
+            base_tree,
+            stop.to_string(),
+            next_tree,
+            now,
+        );
+    }
     for (index, (commit, tree)) in commits.iter().enumerate() {
         let id = commit.id().to_string();
         steps.push(TimelineStep {
@@ -863,53 +879,20 @@ pub fn timeline_steps(
                 .clone()
                 .or_else(|| commit.parent_id(0).ok().map(|p| p.to_string())),
         });
-        // The state after the next commit (or the working tree) is already a node; a
-        // snapshot identical to either, or to its predecessor, adds nothing.
         let next_tree = commits
             .get(index + 1)
             .map(|(_, tree)| *tree)
             .or(workdir_tree);
-        let mut previous_tree = *tree;
-        let mut previous_id = id;
-        for snapshot in snapshots.iter().filter(|s| s.head == commit.id()) {
-            if snapshot.tree == previous_tree || Some(snapshot.tree) == next_tree {
-                continue;
-            }
-            let snapshot_id = snapshot.id.to_string();
-            steps.push(TimelineStep {
-                kind: StepKind::Snapshot,
-                short: String::new(),
-                id: Some(snapshot_id.clone()),
-                subject: "recorded edit".to_string(),
-                when: relative_time(now - snapshot.time),
-                parent: Some(previous_id),
-            });
-            previous_tree = snapshot.tree;
-            previous_id = snapshot_id;
-        }
-        chain_prev = Some(previous_id);
-    }
-    // Base at HEAD (a pushed trunk, say): no commit nodes, but edits recorded on top of
-    // HEAD are still steps between the base and the working tree.
-    if commits.is_empty() {
-        let mut previous_tree = head.tree()?.id();
-        let mut previous_id = head.id().to_string();
-        for snapshot in snapshots.iter().filter(|s| s.head == head.id()) {
-            if snapshot.tree == previous_tree || Some(snapshot.tree) == workdir_tree {
-                continue;
-            }
-            let snapshot_id = snapshot.id.to_string();
-            steps.push(TimelineStep {
-                kind: StepKind::Snapshot,
-                short: String::new(),
-                id: Some(snapshot_id.clone()),
-                subject: "recorded edit".to_string(),
-                when: relative_time(now - snapshot.time),
-                parent: Some(previous_id),
-            });
-            previous_tree = snapshot.tree;
-            previous_id = snapshot_id;
-        }
+        let last_edit = push_snapshot_steps(
+            &mut steps,
+            &snapshots,
+            commit.id(),
+            *tree,
+            id.clone(),
+            next_tree,
+            now,
+        );
+        chain_prev = Some(last_edit.unwrap_or(id));
     }
     let last_id = steps.last().and_then(|s| s.id.clone());
     steps.push(TimelineStep {
@@ -921,6 +904,39 @@ pub fn timeline_steps(
         parent: last_id.or_else(|| Some(head.id().to_string())),
     });
     Ok(steps)
+}
+
+/// Append the edits recorded while HEAD was `on`, chained from `previous_id`. A snapshot
+/// identical to its predecessor adds nothing; one identical to `next_tree` (the next
+/// commit, or the working tree) is already a node. Returns the last id pushed.
+fn push_snapshot_steps(
+    steps: &mut Vec<TimelineStep>,
+    snapshots: &[crate::snapshots::Snapshot],
+    on: Oid,
+    mut previous_tree: Oid,
+    mut previous_id: String,
+    next_tree: Option<Oid>,
+    now: i64,
+) -> Option<String> {
+    let mut pushed = None;
+    for snapshot in snapshots.iter().filter(|s| s.head == on) {
+        if snapshot.tree == previous_tree || Some(snapshot.tree) == next_tree {
+            continue;
+        }
+        let snapshot_id = snapshot.id.to_string();
+        steps.push(TimelineStep {
+            kind: StepKind::Snapshot,
+            short: String::new(),
+            id: Some(snapshot_id.clone()),
+            subject: "recorded edit".to_string(),
+            when: relative_time(now - snapshot.time),
+            parent: Some(previous_id),
+        });
+        previous_tree = snapshot.tree;
+        previous_id = snapshot_id.clone();
+        pushed = Some(snapshot_id);
+    }
+    pushed
 }
 
 /// The timeline for a user-chosen comparison: the nodes between its base and its "now".
@@ -1698,6 +1714,28 @@ mod tests {
         let kinds: Vec<StepKind> = at_head.iter().map(|s| s.kind).collect();
         assert_eq!(kinds, [StepKind::Snapshot, StepKind::Workdir]);
         assert_eq!(at_head[1].parent, at_head[0].id);
+
+        // Base one commit back: the edits recorded on the base commit lead up to the
+        // commit after it, and that commit diffs from the last of them.
+        let from_first = super::timeline_steps(&root, Some("-1"), 50, Some("main")).unwrap();
+        let kinds: Vec<StepKind> = from_first.iter().map(|s| s.kind).collect();
+        assert_eq!(
+            kinds,
+            [
+                StepKind::Snapshot,
+                StepKind::Commit,
+                StepKind::Snapshot,
+                StepKind::Workdir
+            ]
+        );
+        assert_eq!(from_first[1].parent, from_first[0].id);
+        let first_edit = DiffMode::Range {
+            from: from_first[0].parent.clone(),
+            to: super::RangeEnd::Commit(from_first[0].id.clone().unwrap()),
+            kind: super::RangeKind::Step,
+        };
+        let files = compute_diff(&root, &first_edit, None).unwrap();
+        assert_eq!(files[0].additions, 1);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
