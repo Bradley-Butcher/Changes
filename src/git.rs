@@ -889,6 +889,28 @@ pub fn timeline_steps(
         }
         chain_prev = Some(previous_id);
     }
+    // Base at HEAD (a pushed trunk, say): no commit nodes, but edits recorded on top of
+    // HEAD are still steps between the base and the working tree.
+    if commits.is_empty() {
+        let mut previous_tree = head.tree()?.id();
+        let mut previous_id = head.id().to_string();
+        for snapshot in snapshots.iter().filter(|s| s.head == head.id()) {
+            if snapshot.tree == previous_tree || Some(snapshot.tree) == workdir_tree {
+                continue;
+            }
+            let snapshot_id = snapshot.id.to_string();
+            steps.push(TimelineStep {
+                kind: StepKind::Snapshot,
+                short: String::new(),
+                id: Some(snapshot_id.clone()),
+                subject: "recorded edit".to_string(),
+                when: relative_time(now - snapshot.time),
+                parent: Some(previous_id),
+            });
+            previous_tree = snapshot.tree;
+            previous_id = snapshot_id;
+        }
+    }
     let last_id = steps.last().and_then(|s| s.id.clone());
     steps.push(TimelineStep {
         kind: StepKind::Workdir,
@@ -1668,6 +1690,14 @@ mod tests {
         // Without a branch name there are no ticks: plain commit behaviour.
         let plain = super::timeline_steps(&root, Some(ROOT_BASE_NAME), 50, None).unwrap();
         assert_eq!(plain.len(), 3);
+
+        // Base at HEAD, as on a pushed trunk: no commits, but the edits recorded on top
+        // of HEAD are still steps. One more edit so a snapshot differs from the tree.
+        std::fs::write(root.join("a.txt"), "one\ntwo\nthree\nfour\nfive\n").unwrap();
+        let at_head = super::timeline_steps(&root, Some("HEAD"), 50, Some("main")).unwrap();
+        let kinds: Vec<StepKind> = at_head.iter().map(|s| s.kind).collect();
+        assert_eq!(kinds, [StepKind::Snapshot, StepKind::Workdir]);
+        assert_eq!(at_head[1].parent, at_head[0].id);
         std::fs::remove_dir_all(&root).unwrap();
     }
 
