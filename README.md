@@ -19,7 +19,7 @@ It's also agent-agnostic. You shouldn't have to use a specific app or IDE just t
 - **Timeline** — every view is "base → now", and the strip under the tabs shows the steps between the two: one dot per commit, a tick for each recorded edit, the working tree at the end. `<` and `>` rewind and advance "now" one step at a time, keeping the same function in view as it evolves. The diff stays cumulative from the base; hunks the current step touched are tagged `◆ this step`, and `s` narrows the view to that step alone. With a single step the strip is just a marker and the diff behaves as before
 - **Recorded edits** — while `changes` is running it records each settled state of the working tree (as git objects under `refs/changes/snapshots/`, invisible to `git log`). Those appear on the timeline as ticks between the commit dots, so you can replay an agent's edits in the order they happened, including attempts it later overwrote. Commits made before `changes` was running have no ticks and behave as plain commits
 - **Peek** — `p` swaps the focused file's diff for the file as it stands at that point, code kept at the same row, so a tangle of `+`/`-` lines can be read as plain code. Hold to peek, or tap to pin
-- **Flow view** — `t` draws the change as a call-tree diff rooted at entry points: `main → run → handle_event → + your_new_function`. Unchanged steps are context, changed ones carry `+`/`~`/`-`, and code no user route reaches is listed separately
+- **Flow view** — `t` shows the change as a diff of the call tree, the way you'd sketch it for a colleague. For each entry point the change reaches, its calls in call order as the code stands now: `+` on calls the diff added, `-` on calls it removed, `~` on callees whose body changed, unchanged callees folded into one line of context. Only branches that lead to a change open. Objects handed to a framework list the hooks it will call beneath the point they're built (`↳ on_save ← TrainerCallback`). Changed code no entry point reaches is listed after
 - **Multi-repo tabs** — watch agent changes across repos simultaneously
 - **Two views that matter** — `m` for everything uncommitted, `b` for the whole branch against its base (uncommitted work included). `B` picks anything else: trunk, upstream, staged only, a typed ref
 - **Annotate hunks** — right-click to add review comments, `Y` to copy all as markdown for your agent
@@ -143,7 +143,7 @@ The `┃` gutter bar marks the hunk that `y` / `n` / `N` act on. Click a hunk or
 | `B` | Compare picker: trunk, upstream, staged, unstaged, a typed ref, and a "commits only" checkbox. Type `-1` (or `-N`) for the last N commits; a number past the first commit means everything |
 | `v` | Toggle unified / side-by-side view |
 | `o` | Outline: file tree + changed symbols (`Enter` opens, `→`/`←` show/hide callers and callees, `y` copies as markdown) |
-| `t` | Flow: routes from entry points to the changed code (`o` and `t` switch between the two views; pressing the current view's key returns to the diff) |
+| `t` | Flow: the change as a call-tree diff (`o` and `t` switch between the two views; pressing the current view's key returns to the diff) |
 | `<` / `>` | Timeline: rewind / advance one step (`{` / `}` first / last, or click a dot); `s` shows the cursor step only |
 | `j` / `k`, `Ctrl+D` / `Ctrl+U`, `PgDn` / `PgUp` | Scroll by line, half page, page |
 | `g` / `G` | Jump to top / bottom |

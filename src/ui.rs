@@ -682,7 +682,7 @@ fn draw_outline(frame: &mut Frame, app: &App, area: Rect) {
         (true, true) => ("Flow", "indexing calls…"),
         (false, true) => (
             "Flow",
-            "routes from entry points to changed code · ↵ open · o outline · y copy · t diff",
+            "the change as a call tree · + added  - removed  ~ changed · ↵ open · o outline · y copy · t diff",
         ),
         (false, false) => ("Outline", "↵ open · → callers · t flow · y copy · o diff"),
     };
@@ -2569,7 +2569,7 @@ const HELP_LEFT: HelpColumn = &[
             ("B", "Pick what to compare against"),
             ("v", "Unified ↔ side-by-side"),
             ("o", "Outline: files and symbols"),
-            ("t", "Flow: routes into the change"),
+            ("t", "Flow: the change's call tree"),
             ("< >", "Timeline: rewind / advance"),
             ("s", "Show the cursor step only"),
             ("p", "Peek at the file itself"),

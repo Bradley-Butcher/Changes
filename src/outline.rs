@@ -4,7 +4,7 @@
 
 use crate::diff::{FileDiff, FileStatus, LineKind};
 use crate::symbols::{DefKind, SymbolIndex};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SymbolChange {
@@ -209,70 +209,172 @@ struct Context<'a> {
 /// Routes per changed function gathered before choosing the one to draw. Enough that a
 /// long product route survives alongside shorter routes from examples and tests.
 const MAX_FLOW_ROUTES: usize = 6;
+/// How far below a root the tree is drawn.
+const MAX_FLOW_DEPTH: usize = 8;
+/// Unchanged callees folded into one context line before "+N more".
+const MAX_CONTEXT_NAMES: usize = 5;
 
-/// The flow view: a call-tree diff rooted at entry points. Every route from a call-graph
-/// root down to a changed function is merged into one tree per root; unchanged steps
-/// are context, changed ones carry their mark. Roots with the most changed code first,
-/// then functions no route reaches, then removed functions.
+/// The flow view: the change as a diff of the call tree. For each entry point the change
+/// reaches, its call tree as the code stands now, in call order: `+` on calls the diff
+/// added, `-` on calls it removed, `~` on callees whose body changed, and unchanged
+/// callees folded into one line of context so the order reads. Only branches that lead
+/// to a change are opened. Objects handed to a framework show the hooks it will call
+/// beneath the point they are built. Changed code no root reaches is listed after.
 pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
-    // Every changed function symbol across the diff, keyed for marking route steps.
-    let mut changed: Vec<(usize, Symbol)> = Vec::new();
-    for (file_idx, file) in files.iter().enumerate() {
-        for symbol in file_symbols_with(file, Some(index)) {
-            if symbol.ident.is_some() {
-                changed.push((file_idx, symbol));
+    let mut flow = Flow::new(files, index);
+    flow.plan();
+    flow.render()
+}
+
+/// A root worth drawing: the step, how entry-point-like it is (auxiliary path, edges
+/// matched by name, entry rank, route length; lower is better), and how many changed
+/// functions it reaches.
+type RootScore = (crate::symbols::PathStep, (bool, usize, u8, usize), usize);
+
+/// A changed function as the flow sees it: where it is in the diff and how it changed.
+#[derive(Clone)]
+struct Changed {
+    file_idx: usize,
+    hunk_idx: usize,
+    change: SymbolChange,
+}
+
+struct Flow<'a> {
+    files: &'a [FileDiff],
+    index: &'a SymbolIndex,
+    /// Changed functions by (path, ident).
+    changed: HashMap<(String, String), Changed>,
+    /// New-side line numbers the diff added, per path.
+    added_lines: HashMap<String, HashSet<u32>>,
+    /// Functions on some route from a root to a change, by (path, line); these are
+    /// the branches worth opening.
+    on_path: HashSet<(String, u32)>,
+    /// Roots to draw, best first: (path, line) of the root, or a top-level pseudo-root.
+    roots: Vec<crate::symbols::PathStep>,
+    /// Changed functions no route reaches.
+    unreached: Vec<(String, String)>,
+    /// Hooks drawn beneath a constructor, so the framework section skips them.
+    placed_hooks: HashSet<(String, u32)>,
+    /// Functions already drawn under the current root, against cycles and repeats.
+    drawn: HashSet<(String, u32)>,
+    /// Removed functions already drawn as `-` beneath their old caller.
+    drawn_removed: HashSet<String>,
+    rows: Vec<OutlineRow>,
+}
+
+impl<'a> Flow<'a> {
+    fn new(files: &'a [FileDiff], index: &'a SymbolIndex) -> Self {
+        let mut changed = HashMap::new();
+        let mut added_lines: HashMap<String, HashSet<u32>> = HashMap::new();
+        for (file_idx, file) in files.iter().enumerate() {
+            for symbol in file_symbols_with(file, Some(index)) {
+                if let Some(ident) = &symbol.ident {
+                    changed.insert(
+                        (file.path.clone(), ident.clone()),
+                        Changed {
+                            file_idx,
+                            hunk_idx: symbol.hunk_idx,
+                            change: symbol.change,
+                        },
+                    );
+                }
             }
+            let lines = added_lines.entry(file.path.clone()).or_default();
+            for hunk in &file.hunks {
+                for line in &hunk.lines {
+                    if line.kind == LineKind::Addition
+                        && let Some(lineno) = line.new_lineno
+                    {
+                        lines.insert(lineno);
+                    }
+                }
+            }
+        }
+        Self {
+            files,
+            index,
+            changed,
+            added_lines,
+            on_path: HashSet::new(),
+            roots: Vec::new(),
+            unreached: Vec::new(),
+            placed_hooks: HashSet::new(),
+            drawn: HashSet::new(),
+            drawn_removed: HashSet::new(),
+            rows: Vec::new(),
         }
     }
-    let change_of = |path: &str, ident: &str| -> Option<SymbolChange> {
-        changed
-            .iter()
-            .find(|(file_idx, symbol)| {
-                files[*file_idx].path == path && symbol.ident.as_deref() == Some(ident)
-            })
-            .map(|(_, symbol)| symbol.change)
-    };
 
-    let mut roots: Vec<FlowNode> = Vec::new();
-    let mut unreachable: Vec<(usize, Symbol)> = Vec::new();
-    // Methods a framework calls (an overridden base-class method, a dunder), with
-    // what calls them.
-    let mut hooks: Vec<(usize, Symbol, String)> = Vec::new();
-    let mut removed: Vec<(usize, Symbol)> = Vec::new();
-    let mut truncated: Vec<FlowNode> = Vec::new();
+    fn change_of(&self, path: &str, ident: &str) -> Option<&Changed> {
+        self.changed.get(&(path.to_string(), ident.to_string()))
+    }
 
-    for (file_idx, symbol) in &changed {
-        let file = &files[*file_idx];
-        let ident = symbol.ident.as_deref().expect("filtered above");
-        if symbol.change == SymbolChange::Removed {
-            if !ident.starts_with("test_") && !crate::symbols::is_test_path(&file.path) {
-                removed.push((*file_idx, symbol.clone()));
-            }
-            continue;
-        }
-        let Some(def) = index
-            .defs_named(ident, &file.path)
+    fn def_of(&self, path: &str, ident: &str) -> Option<crate::symbols::Def> {
+        self.index
+            .defs_named(ident, path)
             .into_iter()
-            .find(|def| def.kind == DefKind::Function && def.path == file.path)
+            .find(|def| def.kind == DefKind::Function && def.path == path)
             .cloned()
-        else {
-            continue; // unsupported language, or the index has not caught up yet
-        };
-        if def.is_test {
-            continue; // tests are not user-facing code
-        }
-        let mut paths = index.paths_to_roots(&def, MAX_FLOW_ROUTES);
-        let only_itself = paths.len() == 1 && paths[0].steps.len() == 1;
-        if only_itself && !is_entry_point(ident, &file.path) {
-            match &def.hook_of {
-                Some(hook) => hooks.push((*file_idx, symbol.clone(), hook.clone())),
-                None => unreachable.push((*file_idx, symbol.clone())),
+    }
+
+    /// Find a route to a root for every changed function; remember the roots and every
+    /// function along the way.
+    fn plan(&mut self) {
+        let mut keys: Vec<(String, String)> = self.changed.keys().cloned().collect();
+        keys.sort();
+        let mut root_scores: Vec<RootScore> = Vec::new();
+        for (path, ident) in keys {
+            let change = self.changed[&(path.clone(), ident.clone())].change;
+            if change == SymbolChange::Removed {
+                // A removed function is drawn as `-` under whoever used to call it.
+                for caller in self.index.callers_of_removed(&ident, &path) {
+                    if caller.from_test {
+                        continue;
+                    }
+                    match caller.from_name.as_deref() {
+                        Some(from) => {
+                            if let Some(def) = self.def_of(&caller.path, from) {
+                                self.mark_routes(&def, &mut root_scores);
+                            }
+                        }
+                        None => {
+                            let root = top_level_step(&caller.path, caller.line);
+                            let score = (is_auxiliary_path(&caller.path), 0, 0, 1);
+                            if !root_scores
+                                .iter()
+                                .any(|(r, _, _)| r.path == root.path && r.name.is_empty())
+                            {
+                                root_scores.push((root, score, 1));
+                            }
+                        }
+                    }
+                }
+                continue;
             }
-            continue;
+            let Some(def) = self.def_of(&path, &ident) else {
+                continue; // unsupported language, or the index has not caught up yet
+            };
+            if def.is_test {
+                continue;
+            }
+            if !self.mark_routes(&def, &mut root_scores) {
+                self.unreached.push((path, ident));
+            }
         }
-        // Draw the route from the most entry-point-like root (main, a handler, product
-        // code over examples), shortest among those; count the rest on the target so the
-        // tree keeps one copy of each subtree.
+        root_scores.sort_by(|a, b| a.1.cmp(&b.1).then(b.2.cmp(&a.2)));
+        self.roots = root_scores.into_iter().map(|(root, _, _)| root).collect();
+    }
+
+    /// Record the best route from `def` up to a root. Returns false when nothing but
+    /// tests reaches it and it is not an entry point itself.
+    fn mark_routes(&mut self, def: &crate::symbols::Def, root_scores: &mut Vec<RootScore>) -> bool {
+        let mut paths = self.index.paths_to_roots(def, MAX_FLOW_ROUTES);
+        let only_itself = paths.len() == 1 && paths[0].steps.len() == 1;
+        if only_itself && !is_entry_point(&def.name, &def.path) {
+            // Nothing calls it. A hook is drawn under its class's constructor when a
+            // route reaches that, otherwise listed with its framework.
+            return false;
+        }
         paths.sort_by_key(|route| {
             let root = &route.steps[0];
             (
@@ -282,268 +384,465 @@ pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
                 route.steps.len(),
             )
         });
-        let other_routes = paths.len().saturating_sub(1);
-        if let Some(route) = paths.into_iter().next() {
-            let forest = if route.complete {
-                &mut roots
-            } else {
-                &mut truncated
-            };
-            insert_route(forest, &route.steps, files, &change_of, other_routes);
-        }
-    }
-
-    // A changed function nothing calls may still be the root of routes to other changed
-    // code (it calls them). Warn on that root rather than listing it twice.
-    unreachable.retain(|(file_idx, symbol)| {
-        let path = &files[*file_idx].path;
-        let ident = symbol.ident.as_deref().unwrap_or_default();
-        let Some(def) = index
-            .defs_named(ident, path)
-            .into_iter()
-            .find(|d| d.path == *path)
-        else {
-            return true;
+        let Some(route) = paths.into_iter().next() else {
+            return false;
         };
-        match roots
-            .iter_mut()
-            .find(|root| root.path == def.path && root.line == def.line)
-        {
-            Some(root) => {
-                let from_tests = !index.callers(ident, path, None).is_empty();
-                root.warning = Some(match symbol.change {
-                    SymbolChange::Added if from_tests => "only called from tests".to_string(),
-                    SymbolChange::Added => "no callers".to_string(),
-                    _ => "no callers found (registered by name?)".to_string(),
-                });
-                false
-            }
-            None => true,
+        for step in &route.steps {
+            self.on_path.insert((step.path.clone(), step.line));
         }
-    });
-
-    // A hook that roots routes of its own (it calls other changed code) is drawn there,
-    // with the framework noted, rather than listed twice.
-    hooks.retain(|(file_idx, symbol, hook)| {
-        let path = &files[*file_idx].path;
-        let ident = symbol.ident.as_deref().unwrap_or_default();
-        let Some(def) = index
-            .defs_named(ident, path)
-            .into_iter()
-            .find(|d| d.path == *path)
-        else {
-            return true;
-        };
-        match roots
-            .iter_mut()
-            .find(|root| root.path == def.path && root.line == def.line)
-        {
-            Some(root) => {
-                root.note = Some(hook.clone());
-                false
-            }
-            None => true,
-        }
-    });
-
-    // Product entry points first, examples and benches last, more changed code first.
-    roots.sort_by_key(|root| {
-        (
+        let root = route.steps[0].clone();
+        let score = (
             is_auxiliary_path(&root.path),
-            std::cmp::Reverse(root.targets()),
-        )
-    });
-    let mut rows = Vec::new();
-    for root in &roots {
-        root.emit(0, &mut rows);
-    }
-    if !truncated.is_empty() {
-        rows.push(OutlineRow::Section {
-            prefix: String::new(),
-            label: "routes longer than the search depth (entry point not reached)",
-            count: 0,
-        });
-        for root in &truncated {
-            root.emit(1, &mut rows);
-        }
-    }
-    if !hooks.is_empty() {
-        rows.push(OutlineRow::Section {
-            prefix: String::new(),
-            label: "called by a framework",
-            count: hooks.len(),
-        });
-        for (file_idx, symbol, hook) in hooks {
-            let ident = symbol.ident.as_deref().unwrap_or_default();
-            let display = index
-                .defs_named(ident, &files[file_idx].path)
-                .first()
-                .map(|def| def.display.clone())
-                .unwrap_or_else(|| ident.to_string());
-            rows.push(OutlineRow::Flow {
-                depth: 1,
-                name: display,
-                location: format!("{}  ← {hook}", files[file_idx].path),
-                mark: Some(symbol.change),
-                file_idx: Some(file_idx),
-                hunk_idx: Some(symbol.hunk_idx),
-                is_target: true,
-                warning: None,
-            });
-        }
-    }
-    if !unreachable.is_empty() {
-        rows.push(OutlineRow::Section {
-            prefix: String::new(),
-            label: "no route from any entry point",
-            count: unreachable.len(),
-        });
-        for (file_idx, symbol) in unreachable {
-            let ident = symbol.ident.as_deref().unwrap_or_default();
-            let display = index
-                .defs_named(ident, &files[file_idx].path)
-                .first()
-                .map(|def| def.display.clone())
-                .unwrap_or_else(|| ident.to_string());
-            // A modified function nothing calls is usually registered by name (a
-            // decorator, a route table, a plugin hook) rather than forgotten.
-            let from_tests = !index.callers(ident, &files[file_idx].path, None).is_empty();
-            let warning = match symbol.change {
-                SymbolChange::Added if from_tests => "only called from tests",
-                SymbolChange::Added => "no callers",
-                _ => "no callers found (registered by name?)",
-            };
-            rows.push(OutlineRow::Flow {
-                depth: 1,
-                name: display,
-                location: files[file_idx].path.clone(),
-                mark: Some(symbol.change),
-                file_idx: Some(file_idx),
-                hunk_idx: Some(symbol.hunk_idx),
-                is_target: true,
-                warning: Some(warning.to_string()),
-            });
-        }
-    }
-    if !removed.is_empty() {
-        rows.push(OutlineRow::Section {
-            prefix: String::new(),
-            label: "removed",
-            count: removed.len(),
-        });
-        for (file_idx, symbol) in removed {
-            let ident = symbol.ident.as_deref().unwrap_or_default();
-            let survivors = index.callers_of_removed(ident, &files[file_idx].path).len();
-            rows.push(OutlineRow::Flow {
-                depth: 1,
-                name: ident.to_string(),
-                location: files[file_idx].path.clone(),
-                mark: Some(SymbolChange::Removed),
-                file_idx: Some(file_idx),
-                hunk_idx: Some(symbol.hunk_idx),
-                is_target: true,
-                warning: (survivors > 0).then(|| format!("still called by {survivors}")),
-            });
-        }
-    }
-    rows
-}
-
-struct FlowNode {
-    path: String,
-    line: u32,
-    name: String,
-    /// The edge from this node to its child was matched by name only.
-    ambiguous: bool,
-    warning: Option<String>,
-    /// The framework that calls this root, when nothing in the repository does.
-    note: Option<String>,
-    mark: Option<SymbolChange>,
-    file_idx: Option<usize>,
-    hunk_idx: Option<usize>,
-    is_target: bool,
-    /// Routes to this target beyond the drawn one.
-    other_routes: usize,
-    children: Vec<FlowNode>,
-}
-
-impl FlowNode {
-    /// Changed functions in this subtree, for ordering roots.
-    fn targets(&self) -> usize {
-        usize::from(self.is_target) + self.children.iter().map(FlowNode::targets).sum::<usize>()
-    }
-
-    fn emit(&self, depth: usize, rows: &mut Vec<OutlineRow>) {
-        let mut location = format!("{}:{}", self.path, self.line);
-        if let Some(note) = &self.note {
-            location.push_str(&format!("  ← {note}"));
-        }
-        if self.ambiguous {
-            location.push_str("  (matched by name)");
-        }
-        rows.push(OutlineRow::Flow {
-            depth,
-            name: self.name.clone(),
-            location,
-            mark: self.mark,
-            file_idx: self.file_idx,
-            hunk_idx: self.hunk_idx,
-            is_target: self.is_target,
-            warning: self.warning.clone(),
-        });
-        for child in &self.children {
-            child.emit(depth + 1, rows);
-        }
-    }
-}
-
-/// Merge one root-first route into the forest, sharing prefixes with existing routes.
-fn insert_route(
-    forest: &mut Vec<FlowNode>,
-    steps: &[crate::symbols::PathStep],
-    files: &[FileDiff],
-    change_of: &dyn Fn(&str, &str) -> Option<SymbolChange>,
-    other_routes: usize,
-) {
-    let mut level = forest;
-    let last = steps.len().saturating_sub(1);
-    for (i, step) in steps.iter().enumerate() {
-        let position = match level
-            .iter()
-            .position(|node| node.path == step.path && node.line == step.line)
-        {
-            Some(position) => position,
-            None => {
-                let mark = if step.name.is_empty() {
-                    None
-                } else {
-                    change_of(&step.path, &step.name)
-                };
-                let (file_idx, hunk_idx, _) =
-                    locate_in_diff(files, &step.path, step.line, Some(&step.name));
-                level.push(FlowNode {
-                    path: step.path.clone(),
-                    line: step.line,
-                    name: step.display.clone(),
-                    ambiguous: step.ambiguous,
-                    warning: None,
-                    note: None,
-                    mark,
-                    file_idx,
-                    hunk_idx,
-                    is_target: false,
-                    other_routes: 0,
-                    children: Vec::new(),
-                });
-                level.len() - 1
+            route.ambiguous_edges(),
+            entry_point_rank(&root.name, &root.path),
+            route.steps.len(),
+        );
+        // One pseudo-root per file's top-level code, whichever line reached it first.
+        match root_scores.iter_mut().find(|(r, _, _)| {
+            r.path == root.path
+                && (r.line == root.line || (r.name.is_empty() && root.name.is_empty()))
+        }) {
+            Some(entry) => {
+                entry.1 = entry.1.min(score);
+                entry.2 += 1;
             }
-        };
-        if i == last {
-            level[position].is_target = true;
-            level[position].other_routes = other_routes;
+            None => root_scores.push((root, score, 1)),
         }
-        level = &mut level[position].children;
+        true
     }
+
+    fn render(mut self) -> Vec<OutlineRow> {
+        let roots = std::mem::take(&mut self.roots);
+        for root in &roots {
+            self.drawn.clear();
+            if root.name.is_empty() {
+                // Top-level code: draw what it calls as if it were a function.
+                self.push_row(
+                    0,
+                    root.display.clone(),
+                    format!("{}:{}", root.path, root.line),
+                    None,
+                    None,
+                    None,
+                );
+                self.draw_top_level(&root.path, 1);
+            } else if let Some(def) = self.def_of(&root.path, &root.name) {
+                self.draw_function(&def, 0, None, None);
+            }
+        }
+
+        let unreached = std::mem::take(&mut self.unreached);
+        let mut orphans = Vec::new();
+        let mut hooks = Vec::new();
+        for (path, ident) in unreached {
+            match self.def_of(&path, &ident) {
+                Some(def) if def.hook_of.is_some() => hooks.push((path, ident, def)),
+                _ => orphans.push((path, ident)),
+            }
+        }
+        hooks.retain(|(_, _, def)| !self.placed_hooks.contains(&(def.path.clone(), def.line)));
+        if !hooks.is_empty() {
+            self.rows.push(OutlineRow::Section {
+                prefix: String::new(),
+                label: "called by a framework",
+                count: hooks.len(),
+            });
+            for (path, ident, def) in hooks {
+                let changed = self.change_of(&path, &ident).cloned();
+                let hook = def.hook_of.clone().unwrap_or_default();
+                self.push_row(
+                    1,
+                    def.display.clone(),
+                    format!("{path}  ← {hook}"),
+                    changed.as_ref().map(|c| c.change),
+                    changed.as_ref().map(|c| (c.file_idx, c.hunk_idx)),
+                    None,
+                );
+            }
+        }
+        if !orphans.is_empty() {
+            self.rows.push(OutlineRow::Section {
+                prefix: String::new(),
+                label: "no route from any entry point",
+                count: orphans.len(),
+            });
+            for (path, ident) in orphans {
+                let changed = self.change_of(&path, &ident).cloned();
+                let display = self
+                    .index
+                    .defs_named(&ident, &path)
+                    .first()
+                    .map(|def| def.display.clone())
+                    .unwrap_or_else(|| ident.clone());
+                let from_tests = !self.index.callers(&ident, &path, None).is_empty();
+                // A modified function nothing calls is usually registered by name (a
+                // decorator, a plugin hook) rather than forgotten.
+                let warning = match changed.as_ref().map(|c| c.change) {
+                    Some(SymbolChange::Added) if from_tests => "only called from tests",
+                    Some(SymbolChange::Added) => "no callers",
+                    _ => "no callers found (registered by name?)",
+                };
+                self.push_row(
+                    1,
+                    display,
+                    path.clone(),
+                    changed.as_ref().map(|c| c.change),
+                    changed.as_ref().map(|c| (c.file_idx, c.hunk_idx)),
+                    Some(warning.to_string()),
+                );
+            }
+        }
+        // Removed functions whose old callers are gone too (a deleted file, say).
+        let mut removed: Vec<(String, String)> = self
+            .changed
+            .iter()
+            .filter(|(_, c)| c.change == SymbolChange::Removed)
+            .map(|(key, _)| key.clone())
+            .filter(|(path, ident)| {
+                !is_test_like(ident, path) && !self.drawn_removed.contains(ident)
+            })
+            .collect();
+        removed.sort();
+        if !removed.is_empty() {
+            self.rows.push(OutlineRow::Section {
+                prefix: String::new(),
+                label: "removed",
+                count: removed.len(),
+            });
+            for (path, ident) in removed {
+                let changed = self.change_of(&path, &ident).cloned();
+                let survivors = self.index.callers_of_removed(&ident, &path).len();
+                self.push_row(
+                    1,
+                    ident.clone(),
+                    path.clone(),
+                    Some(SymbolChange::Removed),
+                    changed.as_ref().map(|c| (c.file_idx, c.hunk_idx)),
+                    (survivors > 0).then(|| format!("still called by {survivors}")),
+                );
+            }
+        }
+        self.rows
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn push_row(
+        &mut self,
+        depth: usize,
+        name: String,
+        location: String,
+        mark: Option<SymbolChange>,
+        target: Option<(usize, usize)>,
+        warning: Option<String>,
+    ) {
+        self.rows.push(OutlineRow::Flow {
+            depth,
+            name,
+            location,
+            mark,
+            file_idx: target.map(|(file_idx, _)| file_idx),
+            hunk_idx: target.map(|(_, hunk_idx)| hunk_idx),
+            is_target: mark.is_some(),
+            warning,
+        });
+    }
+
+    /// Draw `def` and, when it leads to a change, the calls it makes in order.
+    fn draw_function(
+        &mut self,
+        def: &crate::symbols::Def,
+        depth: usize,
+        call_added: Option<bool>,
+        hook: Option<&str>,
+    ) {
+        let key = (def.path.clone(), def.line);
+        let changed = self.change_of(&def.path, &def.name).cloned();
+        let mark = match (call_added, changed.as_ref().map(|c| c.change)) {
+            (_, Some(SymbolChange::Added)) | (Some(true), _) => Some(SymbolChange::Added),
+            (_, Some(SymbolChange::Modified)) => Some(SymbolChange::Modified),
+            _ => None,
+        };
+        let mut location = format!("{}:{}", def.path, def.line);
+        if let Some(hook) = hook {
+            location.push_str(&format!("  ← {hook}"));
+        }
+        let repeat = !self.drawn.insert(key.clone());
+        if repeat {
+            location.push_str("  (above)");
+        }
+        let name = match hook {
+            Some(_) => format!("↳ {}", def.display),
+            None => def.display.clone(),
+        };
+        self.push_row(
+            depth,
+            name,
+            location,
+            mark,
+            changed.as_ref().map(|c| (c.file_idx, c.hunk_idx)),
+            None,
+        );
+        if repeat || depth >= MAX_FLOW_DEPTH {
+            return;
+        }
+        let opens = self.on_path.contains(&key)
+            || changed
+                .as_ref()
+                .is_some_and(|c| c.change == SymbolChange::Added);
+        if !opens {
+            return;
+        }
+        self.draw_calls(def, depth + 1);
+    }
+
+    /// Top-level code of a file (`if __name__ == "__main__"`, a route table): the calls
+    /// it makes outside any function.
+    fn draw_top_level(&mut self, path: &str, depth: usize) {
+        let sites = self.index.top_level_call_sites(path);
+        self.draw_sites(path, sites, depth);
+    }
+
+    fn draw_calls(&mut self, def: &crate::symbols::Def, depth: usize) {
+        let sites = self.index.call_sites(def);
+        let removed = self.removed_calls(def);
+        self.draw_sites_with_removed(&def.path, sites, removed, depth);
+    }
+
+    fn draw_sites(&mut self, path: &str, sites: Vec<crate::symbols::CallSite<'a>>, depth: usize) {
+        self.draw_sites_with_removed(path, sites, Vec::new(), depth);
+    }
+
+    /// Draw callees in call order. Unchanged callees that lead nowhere are folded into
+    /// context lines; the rest get a line each, opened when they lead to a change.
+    fn draw_sites_with_removed(
+        &mut self,
+        path: &str,
+        sites: Vec<crate::symbols::CallSite<'a>>,
+        removed: Vec<(u32, String)>,
+        depth: usize,
+    ) {
+        // One entry per target, first call wins; a later call on an added line still
+        // counts as new if the first one was.
+        let added = self.added_lines.get(path).cloned().unwrap_or_default();
+        let mut entries: Vec<(u32, crate::symbols::Def, bool, bool)> = Vec::new(); // line, target, call added, reference
+        for site in sites {
+            for target in site.targets {
+                let is_new = added.contains(&site.line);
+                match entries
+                    .iter_mut()
+                    .find(|(_, t, _, _)| t.path == target.path && t.line == target.line)
+                {
+                    Some(entry) => entry.2 |= is_new,
+                    None => entries.push((site.line, target.clone(), is_new, site.is_reference)),
+                }
+            }
+        }
+        let mut items: Vec<(u32, Item)> = entries
+            .into_iter()
+            .map(|(line, target, is_new, is_reference)| {
+                (line, Item::Call(target, is_new, is_reference))
+            })
+            .collect();
+        for (line, name) in removed {
+            items.push((line, Item::Removed(name)));
+        }
+        // A removed call sits after whatever survives on the line it was anchored to.
+        items.sort_by_key(|(line, item)| (*line, matches!(item, Item::Removed(_))));
+
+        // A function whose calls are all unchanged has no story to tell below it.
+        let anything_matters = items.iter().any(|(_, item)| match item {
+            Item::Removed(_) => true,
+            Item::Call(target, is_new, _) => {
+                *is_new
+                    || self.change_of(&target.path, &target.name).is_some()
+                    || self.on_path.contains(&(target.path.clone(), target.line))
+            }
+        });
+        if !anything_matters {
+            return;
+        }
+        let mut context: Vec<String> = Vec::new();
+        let flush = |context: &mut Vec<String>, this: &mut Self| {
+            if context.is_empty() {
+                return;
+            }
+            let shown: Vec<&str> = context
+                .iter()
+                .take(MAX_CONTEXT_NAMES)
+                .map(String::as_str)
+                .collect();
+            let mut text = shown.join(" · ");
+            if context.len() > MAX_CONTEXT_NAMES {
+                text.push_str(&format!(" · +{} more", context.len() - MAX_CONTEXT_NAMES));
+            }
+            this.push_row(depth, text, String::new(), None, None, None);
+            context.clear();
+        };
+        for (_, item) in items {
+            match item {
+                Item::Removed(name) => {
+                    flush(&mut context, self);
+                    self.push_row(
+                        depth,
+                        name,
+                        String::new(),
+                        Some(SymbolChange::Removed),
+                        None,
+                        None,
+                    );
+                }
+                Item::Call(target, is_new, _is_reference) => {
+                    let key = (target.path.clone(), target.line);
+                    let changed = self.change_of(&target.path, &target.name);
+                    let opens = self.on_path.contains(&key)
+                        || changed.is_some_and(|c| c.change == SymbolChange::Added);
+                    let matters = is_new || changed.is_some() || opens;
+                    if !matters {
+                        context.push(target.display.clone());
+                        continue;
+                    }
+                    flush(&mut context, self);
+                    self.draw_function(&target, depth, Some(is_new), None);
+                    // An object handed to a framework: the hooks it will call.
+                    let is_constructor = target.container.is_some()
+                        && matches!(
+                            target.name.as_str(),
+                            "__init__" | "__new__" | "new" | "constructor"
+                        );
+                    if is_constructor {
+                        let hooks: Vec<crate::symbols::Def> = self
+                            .index
+                            .hook_methods(&target)
+                            .into_iter()
+                            .cloned()
+                            .collect();
+                        // Unchanged hooks fold into one line, like unchanged calls.
+                        let mut quiet: Vec<&crate::symbols::Def> = Vec::new();
+                        for hook in &hooks {
+                            self.placed_hooks.insert((hook.path.clone(), hook.line));
+                            let matters = self.change_of(&hook.path, &hook.name).is_some()
+                                || self.on_path.contains(&(hook.path.clone(), hook.line));
+                            if matters {
+                                let framework = hook.hook_of.clone().unwrap_or_default();
+                                self.draw_function(hook, depth + 1, None, Some(&framework));
+                            } else {
+                                quiet.push(hook);
+                            }
+                        }
+                        if let Some(first) = quiet.first() {
+                            let names: Vec<&str> = quiet.iter().map(|h| h.name.as_str()).collect();
+                            let framework = first.hook_of.clone().unwrap_or_default();
+                            self.push_row(
+                                depth + 1,
+                                format!("↳ {}", names.join(" · ")),
+                                format!("← {framework}"),
+                                None,
+                                None,
+                                None,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        flush(&mut context, self);
+    }
+
+    /// Calls the diff removed from `def`: names followed by `(` on deleted lines of its
+    /// hunks that resolve in the index and no longer appear among its calls. Each is
+    /// anchored to the new-side line just above where it was.
+    fn removed_calls(&mut self, def: &crate::symbols::Def) -> Vec<(u32, String)> {
+        let Some(changed) = self.change_of(&def.path, &def.name).cloned() else {
+            return Vec::new();
+        };
+        let Some(file) = self.files.get(changed.file_idx) else {
+            return Vec::new();
+        };
+        let still_called = self.index.call_names_in(def);
+        let mut out = Vec::new();
+        for hunk in &file.hunks {
+            let mut anchor = hunk.first_new_lineno().unwrap_or(def.line);
+            let in_def = |line: u32| line >= def.line && line <= def.end_line;
+            for line in &hunk.lines {
+                match line.kind {
+                    LineKind::Deletion => {
+                        if !in_def(anchor) {
+                            continue;
+                        }
+                        for name in called_names(&line.content) {
+                            // A name the diff removed is no longer in the index; one
+                            // that survives elsewhere is. Anything else is a library.
+                            let removed_here = self
+                                .change_of(&def.path, &name)
+                                .is_some_and(|c| c.change == SymbolChange::Removed);
+                            if still_called.contains(&name)
+                                || out.iter().any(|(_, n)| *n == name)
+                                || (!removed_here
+                                    && self.index.defs_named(&name, &def.path).is_empty())
+                            {
+                                continue;
+                            }
+                            self.drawn_removed.insert(name.clone());
+                            out.push((anchor, name));
+                        }
+                    }
+                    _ => {
+                        if let Some(lineno) = line.new_lineno {
+                            anchor = lineno;
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+enum Item {
+    /// A resolved callee: the target, whether the call line is new, a reference.
+    Call(crate::symbols::Def, bool, bool),
+    /// A call the diff deleted.
+    Removed(String),
+}
+
+/// The pseudo-root for a file's top-level code.
+fn top_level_step(path: &str, line: u32) -> crate::symbols::PathStep {
+    crate::symbols::PathStep {
+        display: format!("{} (top level)", path.rsplit('/').next().unwrap_or(path)),
+        name: String::new(),
+        path: path.to_string(),
+        line,
+        ambiguous: false,
+    }
+}
+
+/// Identifiers followed by `(` in a line of code, the candidates for calls it made.
+fn called_names(text: &str) -> Vec<String> {
+    let bytes = text.as_bytes();
+    let mut names = Vec::new();
+    let mut start = None;
+    for (i, &b) in bytes.iter().enumerate() {
+        let ident = b.is_ascii_alphanumeric() || b == b'_';
+        match (ident, start) {
+            (true, None) => start = Some(i),
+            (false, Some(s)) => {
+                let declared = ["fn ", "def ", "func ", "function ", "async "]
+                    .iter()
+                    .any(|keyword| text[..s].ends_with(keyword));
+                if b == b'(' && !bytes[s].is_ascii_digit() && !declared {
+                    names.push(text[s..i].to_string());
+                }
+                start = None;
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
+/// Tests and their fixtures, which the flow leaves out.
+fn is_test_like(ident: &str, path: &str) -> bool {
+    ident.starts_with("test_") || crate::symbols::is_test_path(path)
 }
 
 /// Markdown rendering of the outline, for pasting into an agent prompt or PR body.
@@ -1693,6 +1992,138 @@ mod tests {
         );
     }
 
+    fn render_flow(rows: &[OutlineRow]) -> Vec<String> {
+        rows.iter()
+            .map(|row| match row {
+                OutlineRow::Flow {
+                    depth,
+                    name,
+                    mark,
+                    warning,
+                    location,
+                    ..
+                } => format!(
+                    "{}{}{name}{}{}",
+                    mark.map(super::change_glyph).unwrap_or(" "),
+                    "  ".repeat(*depth + 1),
+                    match location.find('←') {
+                        Some(pos) => format!("  {}", &location[pos..]),
+                        None => String::new(),
+                    },
+                    warning
+                        .as_ref()
+                        .map(|w| format!(" ⚠ {w}"))
+                        .unwrap_or_default()
+                ),
+                OutlineRow::Section { label, count, .. } => format!("[{label} {count}]"),
+                other => format!("{other:?}"),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn flow_is_a_call_tree_diff_in_call_order() {
+        use super::build_flow;
+        use crate::symbols::SymbolIndex;
+        let root = std::env::temp_dir().join(format!("changes-flow-diff-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("src")).unwrap();
+        // After the change: main calls setup, fresh (new, calls inner), finish; a call
+        // to old was removed. Attempt is handed to a framework and overrides on_save.
+        std::fs::write(
+            root.join("src/main.rs"),
+            "fn main() {\n    setup();\n    fresh();\n    finish();\n    let a = Attempt::new();\n}\n\
+             fn setup() {}\nfn fresh() { inner(); }\nfn inner() {}\nfn finish() {}\n\
+             struct Attempt;\nimpl Attempt { fn new() -> Self { Attempt } }\n\
+             impl Callback for Attempt {\n    fn on_save(&self) { inner(); }\n    fn on_log(&self) {}\n}\n",
+        )
+        .unwrap();
+        let index = SymbolIndex::build(&root, &["src/main.rs".to_string()]);
+        let numbered =
+            |kind: LineKind, content: &str, old: Option<u32>, new: Option<u32>| DiffLine {
+                old_lineno: old,
+                new_lineno: new,
+                ..line(kind, content)
+            };
+        let file = file(
+            "src/main.rs",
+            FileStatus::Modified,
+            vec![
+                Hunk {
+                    header: "@@ -1,5 +1,6 @@".to_string(),
+                    lines: vec![
+                        numbered(LineKind::Context, "fn main() {", Some(1), Some(1)),
+                        numbered(LineKind::Context, "    setup();", Some(2), Some(2)),
+                        numbered(LineKind::Deletion, "    old();", Some(3), None),
+                        numbered(LineKind::Addition, "    fresh();", None, Some(3)),
+                        numbered(LineKind::Context, "    finish();", Some(4), Some(4)),
+                        numbered(
+                            LineKind::Addition,
+                            "    let a = Attempt::new();",
+                            None,
+                            Some(5),
+                        ),
+                        numbered(LineKind::Context, "}", Some(5), Some(6)),
+                    ],
+                },
+                Hunk {
+                    header: "@@ -8,1 +8,2 @@".to_string(),
+                    lines: vec![
+                        numbered(LineKind::Deletion, "fn old() {}", Some(8), None),
+                        numbered(LineKind::Addition, "fn fresh() { inner(); }", None, Some(8)),
+                        numbered(LineKind::Addition, "fn inner() {}", None, Some(9)),
+                    ],
+                },
+                Hunk {
+                    header: "@@ -11,0 +12,5 @@".to_string(),
+                    lines: vec![
+                        numbered(
+                            LineKind::Addition,
+                            "impl Attempt { fn new() -> Self { Attempt } }",
+                            None,
+                            Some(12),
+                        ),
+                        numbered(
+                            LineKind::Addition,
+                            "impl Callback for Attempt {",
+                            None,
+                            Some(13),
+                        ),
+                        numbered(
+                            LineKind::Addition,
+                            "    fn on_save(&self) { inner(); }",
+                            None,
+                            Some(14),
+                        ),
+                        numbered(
+                            LineKind::Addition,
+                            "    fn on_log(&self) {}",
+                            None,
+                            Some(15),
+                        ),
+                        numbered(LineKind::Addition, "}", None, Some(16)),
+                    ],
+                },
+            ],
+        );
+        let rows = build_flow(&[file], &index);
+        std::fs::remove_dir_all(&root).unwrap();
+        assert_eq!(
+            render_flow(&rows),
+            [
+                "~  main",
+                "     setup",
+                "-    old",
+                "+    fresh",
+                "+      inner",
+                "     finish",
+                "+    Attempt::new",
+                "+      ↳ Attempt::on_save  ← Callback",
+                "+        inner",
+                "+      ↳ Attempt::on_log  ← Callback",
+            ]
+        );
+    }
+
     #[test]
     fn flow_view_roots_routes_at_entry_points_and_lists_orphans() {
         use super::build_flow;
@@ -1712,8 +2143,16 @@ mod tests {
             vec![Hunk {
                 header: "@@ -3,0 +4,2 @@".to_string(),
                 lines: vec![
-                    line(LineKind::Addition, "fn leaf() {}"),
-                    line(LineKind::Addition, "fn orphan() {}"),
+                    DiffLine {
+                        new_lineno: Some(4),
+                        old_lineno: None,
+                        ..line(LineKind::Addition, "fn leaf() {}")
+                    },
+                    DiffLine {
+                        new_lineno: Some(5),
+                        old_lineno: None,
+                        ..line(LineKind::Addition, "fn orphan() {}")
+                    },
                 ],
             }],
         );

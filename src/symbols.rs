@@ -190,6 +190,15 @@ fn crate_root(path: &str) -> &str {
     }
 }
 
+/// One resolved call inside a function, for drawing its call tree in source order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallSite<'a> {
+    pub name: String,
+    pub line: u32,
+    pub is_reference: bool,
+    pub targets: Vec<&'a Def>,
+}
+
 /// A call site pointing at some definition, with the function it lives in.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Caller {
@@ -351,7 +360,7 @@ impl SymbolIndex {
     /// supported language. Rust, Python and JavaScript then need the name imported;
     /// Go shares names across a package's files, and Rust macros travel on their own.
     fn bare_call_reaches(&self, call: &Call, file: &FileSymbols, def: &Def) -> bool {
-        if call.qualifier.is_some() || call.is_scoped || file.path == def.path {
+        if call.qualifier.is_some() || call.is_scoped {
             return true;
         }
         if call.is_method {
@@ -367,6 +376,9 @@ impl SymbolIndex {
                 }
                 _ => true,
             };
+        }
+        if file.path == def.path {
+            return true;
         }
         if file
             .defs
@@ -388,15 +400,36 @@ impl SymbolIndex {
     }
 
     /// Function definitions a call could target, after every rule this index knows.
+    /// For `x.finish()` on an unknown receiver, methods of classes the calling file
+    /// defines or imports win over same-named methods of classes it never mentions.
     fn targets_of<'a>(&'a self, call: &Call, file: &FileSymbols) -> Vec<&'a Def> {
-        self.defs_named(&call.name, &file.path)
+        let targets: Vec<&Def> = self
+            .defs_named(&call.name, &file.path)
             .into_iter()
             .filter(|def| {
                 def.kind == DefKind::Function
                     && call.may_target(def)
                     && self.bare_call_reaches(call, file, def)
             })
-            .collect()
+            .collect();
+        if !call.is_method || call.qualifier.is_some() || targets.len() < 2 {
+            return targets;
+        }
+        let known = |def: &Def| {
+            def.path == file.path
+                || def.container.as_deref().is_some_and(|class| {
+                    file.imports.iter().any(|import| import.name == class)
+                        || file
+                            .defs
+                            .iter()
+                            .any(|d| d.name == class && d.kind == DefKind::Type)
+                })
+        };
+        if targets.iter().any(|def| known(def)) {
+            targets.into_iter().filter(|def| known(def)).collect()
+        } else {
+            targets
+        }
     }
 
     /// Every call site that may target `name` (or `def` precisely, when known), outside
@@ -624,6 +657,132 @@ impl SymbolIndex {
         } else {
             complete
         }
+    }
+
+    /// Every call site inside `def` that resolves to a function in this index, in source
+    /// order. A call to a class (`Attempt(...)`, `new Store()`, `Store::new()`) resolves
+    /// to its constructor. Library calls drop out; recursion is skipped.
+    pub fn call_sites(&self, def: &Def) -> Vec<CallSite<'_>> {
+        let Some(file) = self.files.get(&def.path) else {
+            return Vec::new();
+        };
+        let Some(def_idx) = file
+            .defs
+            .iter()
+            .position(|candidate| candidate.line == def.line && candidate.name == def.name)
+        else {
+            return Vec::new();
+        };
+        let mut sites = Vec::new();
+        for call in file.calls.iter().filter(|c| c.enclosing == Some(def_idx)) {
+            if call.name == def.name {
+                continue;
+            }
+            let mut targets = self.targets_of(call, file);
+            if targets.is_empty() && !call.is_method {
+                // `Attempt(...)`: the class is the target, its constructor the code run.
+                targets = self
+                    .defs_named(&call.name, &def.path)
+                    .into_iter()
+                    .filter(|d| d.kind == DefKind::Type && call.may_target(d))
+                    .filter_map(|class| self.constructor_of(class))
+                    .collect();
+            }
+            if targets.is_empty() {
+                continue;
+            }
+            sites.push(CallSite {
+                name: call.name.clone(),
+                line: call.line,
+                is_reference: call.is_reference,
+                targets,
+            });
+        }
+        sites
+    }
+
+    /// Calls made by a file's top-level code (a `__main__` block, a route table), in
+    /// source order, resolved like `call_sites`.
+    pub fn top_level_call_sites(&self, path: &str) -> Vec<CallSite<'_>> {
+        let Some(file) = self.files.get(path) else {
+            return Vec::new();
+        };
+        let mut sites = Vec::new();
+        for call in file.calls.iter().filter(|c| c.enclosing.is_none()) {
+            let mut targets = self.targets_of(call, file);
+            if targets.is_empty() && !call.is_method {
+                targets = self
+                    .defs_named(&call.name, path)
+                    .into_iter()
+                    .filter(|d| d.kind == DefKind::Type && call.may_target(d))
+                    .filter_map(|class| self.constructor_of(class))
+                    .collect();
+            }
+            if targets.is_empty() {
+                continue;
+            }
+            sites.push(CallSite {
+                name: call.name.clone(),
+                line: call.line,
+                is_reference: call.is_reference,
+                targets,
+            });
+        }
+        sites
+    }
+
+    /// Every name called inside `def` as the code stands, resolved or not.
+    pub fn call_names_in(&self, def: &Def) -> std::collections::HashSet<String> {
+        let Some(file) = self.files.get(&def.path) else {
+            return std::collections::HashSet::new();
+        };
+        let Some(def_idx) = file
+            .defs
+            .iter()
+            .position(|candidate| candidate.line == def.line && candidate.name == def.name)
+        else {
+            return std::collections::HashSet::new();
+        };
+        file.calls
+            .iter()
+            .filter(|c| c.enclosing == Some(def_idx))
+            .map(|c| c.name.clone())
+            .collect()
+    }
+
+    /// The constructor of a class, when it defines one.
+    pub fn constructor_of(&self, class: &Def) -> Option<&Def> {
+        self.files.get(&class.path)?.defs.iter().find(|d| {
+            d.kind == DefKind::Function
+                && d.container.as_deref() == Some(class.name.as_str())
+                && matches!(
+                    d.name.as_str(),
+                    "__init__" | "__new__" | "new" | "constructor"
+                )
+        })
+    }
+
+    /// Methods of the class `constructor` builds that a framework calls: overrides of
+    /// a base class or trait (or dunders) which nothing in the repository calls.
+    pub fn hook_methods(&self, constructor: &Def) -> Vec<&Def> {
+        let Some(class) = constructor.container.as_deref() else {
+            return Vec::new();
+        };
+        let Some(file) = self.files.get(&constructor.path) else {
+            return Vec::new();
+        };
+        file.defs
+            .iter()
+            .filter(|d| {
+                d.kind == DefKind::Function
+                    && d.container.as_deref() == Some(class)
+                    && d.line != constructor.line
+                    && d.hook_of.is_some()
+                    && self
+                        .production_callers(&d.name, &d.path, Some(d))
+                        .is_empty()
+            })
+            .collect()
     }
 
     /// Names called from inside `def` that resolve to a definition in this index, in
