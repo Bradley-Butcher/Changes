@@ -306,6 +306,9 @@ fn draw_tab_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rec
 /// are dots, recorded edits are ticks, the working tree is hollow), the cursor in the
 /// accent color, and a hairline rail. It windows around the cursor when the steps do
 /// not fit. Always drawn; with nothing in between it reads "○ base ─◉".
+/// The strip under the tabs: base on the left, now on the right, the steps between
+/// them on one rail. The rail is solid up to the cursor (what the diff shows) and
+/// dotted beyond it; a caption after "now" says which step the cursor is on.
 fn draw_timeline(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Rect) {
     let t = theme();
     hints.timeline_row = area.y;
@@ -314,13 +317,12 @@ fn draw_timeline(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Re
     let repo = &app.repos[app.active_tab];
     let steps = &repo.steps;
     let cursor = app.cursor_index();
-
-    let base_token = format!("○ {} ", app.timeline_base_label());
-    let base_width = UnicodeWidthStr::width(base_token.as_str());
-    let node_width = 2usize; // glyph plus a hairline
-    let available = strip.width as usize;
     let count = steps.len();
-    let rail = Style::default().fg(t.surface_raised);
+    let available = strip.width as usize;
+
+    let shown = Style::default().fg(t.accent);
+    let ahead = Style::default().fg(t.surface_raised);
+    let cursor_style = Style::default().fg(t.accent).add_modifier(Modifier::BOLD);
 
     let mut spans: Vec<Span> = Vec::new();
     let mut col = strip.x as usize;
@@ -329,64 +331,90 @@ fn draw_timeline(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Re
         spans.push(Span::styled(text, style));
     };
 
+    push(
+        &mut spans,
+        &mut col,
+        format!("{} ", app.timeline_base_label()),
+        t.muted_style(),
+    );
+    push(&mut spans, &mut col, "○".to_string(), t.text_style());
+
     if count == 0 {
-        // A comparison with no intermediate states and no "now" node (staged, say).
-        push(&mut spans, &mut col, base_token, t.muted_style());
-        push(&mut spans, &mut col, "─".to_string(), rail);
-        push(
-            &mut spans,
-            &mut col,
-            "◉".to_string(),
-            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-        );
-        let tail = available.saturating_sub(col - strip.x as usize);
-        push(&mut spans, &mut col, "─".repeat(tail), rail);
+        // Staged or unstaged: two anchors and nothing to step through.
+        push(&mut spans, &mut col, "━━━".to_string(), shown);
+        push(&mut spans, &mut col, "◉".to_string(), cursor_style);
+        push(&mut spans, &mut col, " now".to_string(), t.text_style());
         frame.render_widget(Paragraph::new(Line::from(spans)), strip);
         return;
     }
 
-    // Window around the cursor when the steps do not fit, with counts for the hidden.
-    let marker_width = 10;
-    let fits = available.saturating_sub(base_width) / node_width;
-    let (first, last) = if count <= fits {
-        (0, count - 1)
+    let head_width = col - strip.x as usize;
+    let now_width = 4; // " now"
+    let mut caption = timeline_caption(repo, cursor, 48);
+    let caption_width = |caption: &[(String, Style)]| -> usize {
+        caption
+            .iter()
+            .map(|(text, _)| UnicodeWidthStr::width(text.as_str()))
+            .sum::<usize>()
+    };
+    // Steps sit `gap` columns apart, at most 6 and at least 2. When even 2 does not fit,
+    // the caption loses its subject, then the strip windows around the cursor.
+    let rail_budget =
+        |caption_width: usize| available.saturating_sub(head_width + now_width + caption_width);
+    let gap_for = |budget: usize| (budget / count).saturating_sub(1).min(6);
+    let mut gap = gap_for(rail_budget(caption_width(&caption)));
+    if gap < 2 {
+        caption = timeline_caption(repo, cursor, 0);
+        gap = gap_for(rail_budget(caption_width(&caption)));
+    }
+    if gap < 2 {
+        caption.clear();
+        gap = gap_for(rail_budget(0));
+    }
+    let (first, last, gap) = if gap >= 2 {
+        (0, count - 1, gap)
     } else {
-        let visible = available.saturating_sub(marker_width * 2) / node_width;
-        let half = visible / 2;
-        let first = cursor.saturating_sub(half).min(count - visible);
-        (first, (first + visible - 1).min(count - 1))
+        let marker_width = 8; // "‹ 12 " and " 8 ›"
+        let budget = rail_budget(caption_width(&caption)).saturating_sub(marker_width * 2);
+        let visible = (budget / 3).clamp(1, count);
+        let first = cursor.saturating_sub(visible / 2).min(count - visible);
+        (first, first + visible - 1, 2)
     };
 
-    if first == 0 {
-        push(&mut spans, &mut col, base_token, t.muted_style());
-    } else {
+    if first > 0 {
         push(
             &mut spans,
             &mut col,
-            format!("‹ {first} more "),
+            format!(" ‹ {first} "),
             t.muted_style(),
         );
     }
     for (index, step) in steps.iter().enumerate().take(last + 1).skip(first) {
         let is_cursor = index == cursor;
-        let included = index < cursor && !repo.step_only;
-        let (glyph, style) = match (step.kind, is_cursor, included) {
-            (StepKind::Snapshot, true, _) => (
-                "╽",
-                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-            ),
-            (_, true, _) => (
-                "◉",
-                Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-            ),
-            (StepKind::Workdir, false, _) => ("◌", t.muted_style()),
-            (StepKind::Snapshot, false, true) => ("╵", t.text_style()),
-            (StepKind::Snapshot, false, false) => ("╵", t.muted_style()),
-            (StepKind::Commit, false, true) => ("●", t.text_style()),
-            (StepKind::Commit, false, false) => ("●", t.muted_style()),
+        // The segment leading into a step is solid when the diff covers that step.
+        let in_view = if repo.step_only {
+            is_cursor
+        } else {
+            index <= cursor
         };
         let start = col as u16;
-        push(&mut spans, &mut col, "─".to_string(), rail);
+        let (rail, rail_style) = if in_view {
+            ("━", shown)
+        } else {
+            ("┄", ahead)
+        };
+        push(&mut spans, &mut col, rail.repeat(gap), rail_style);
+        let node_style = if in_view {
+            t.text_style()
+        } else {
+            t.muted_style()
+        };
+        let (glyph, style) = match (step.kind, is_cursor) {
+            (_, true) => ("◉", cursor_style),
+            (StepKind::Commit, false) => ("●", node_style),
+            (StepKind::Snapshot, false) => ("◦", node_style),
+            (StepKind::Workdir, false) => ("○", node_style),
+        };
         push(&mut spans, &mut col, glyph.to_string(), style);
         hints.timeline_positions.push((index, start, col as u16));
     }
@@ -394,15 +422,95 @@ fn draw_timeline(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: Re
         push(
             &mut spans,
             &mut col,
-            format!("─ {} more ›", count - last - 1),
+            format!(" {} › ", count - last - 1),
             t.muted_style(),
         );
-    } else {
-        // Trail the rail to the edge so the strip reads as one continuous line.
-        let tail = available.saturating_sub(col - strip.x as usize);
-        push(&mut spans, &mut col, "─".repeat(tail), rail);
+    }
+    push(
+        &mut spans,
+        &mut col,
+        " now".to_string(),
+        if cursor + 1 == count {
+            t.text_style()
+        } else {
+            t.muted_style()
+        },
+    );
+    for (text, style) in caption {
+        push(&mut spans, &mut col, text, style);
     }
     frame.render_widget(Paragraph::new(Line::from(spans)), strip);
+}
+
+/// What the cursor is on, for the end of the strip: "up to 3/6 · 9b9713c Make the lint
+/// target … · 18h ago". At now it is a summary of the steps instead. `subject_width`
+/// of 0 drops the commit subject.
+fn timeline_caption(
+    repo: &crate::app::RepoState,
+    cursor: usize,
+    subject_width: usize,
+) -> Vec<(String, Style)> {
+    let t = theme();
+    let steps = &repo.steps;
+    let count = steps.len();
+    let mut caption: Vec<(String, Style)> = Vec::new();
+    if count < 2 {
+        return caption;
+    }
+    let Some(step) = steps.get(cursor) else {
+        return caption;
+    };
+    let at_now = cursor + 1 == count && !repo.step_only;
+    if at_now {
+        let commits = steps.iter().filter(|s| s.kind == StepKind::Commit).count();
+        let edits = steps
+            .iter()
+            .filter(|s| s.kind == StepKind::Snapshot)
+            .count();
+        let mut parts = Vec::new();
+        if commits > 0 {
+            parts.push(format!(
+                "{commits} commit{}",
+                if commits == 1 { "" } else { "s" }
+            ));
+        }
+        if edits > 0 {
+            parts.push(format!("{edits} edit{}", if edits == 1 { "" } else { "s" }));
+        }
+        caption.push((format!("  {}", parts.join(" · ")), t.muted_style()));
+        return caption;
+    }
+    caption.push((
+        if repo.step_only {
+            "  just "
+        } else {
+            "  up to "
+        }
+        .to_string(),
+        t.muted_style(),
+    ));
+    caption.push((
+        format!("{}/{count}", cursor + 1),
+        Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
+    ));
+    let what = match step.kind {
+        StepKind::Commit if subject_width > 0 => {
+            format!(
+                "{} {}",
+                step.short,
+                fit_to_width(&step.subject, subject_width)
+            )
+        }
+        StepKind::Commit => step.short.clone(),
+        StepKind::Snapshot => "recorded edit".to_string(),
+        StepKind::Workdir => "working tree".to_string(),
+    };
+    caption.push((" · ".to_string(), t.muted_style()));
+    caption.push((what, t.text_style()));
+    if !step.when.is_empty() {
+        caption.push((format!(" · {}", step.when), t.muted_style()));
+    }
+    caption
 }
 
 fn draw_empty_state(frame: &mut Frame, app: &App, area: Rect) {
@@ -1820,35 +1928,6 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
         format!("  {branch_name}"),
         Style::default().fg(t.text),
     ));
-    // When the cursor is not at now, say which step the diff runs up to.
-    let cursor = app.cursor_index();
-    let step = app.cursor_step();
-    let at_now = step.is_none_or(|s| s.kind == StepKind::Workdir)
-        && cursor + 1 >= repo.map_or(0, |r| r.steps.len());
-    if let Some(step) = step
-        && (!at_now || repo.is_some_and(|r| r.step_only))
-    {
-        let total = repo.map_or(0, |r| r.steps.len());
-        let what = match step.kind {
-            StepKind::Commit => format!("{}  {}", step.short, fit_to_width(&step.subject, 40)),
-            StepKind::Snapshot => "recorded edit".to_string(),
-            StepKind::Workdir => "working tree".to_string(),
-        };
-        let prefix = if repo.is_some_and(|r| r.step_only) {
-            "  ·  step only  "
-        } else {
-            "  ·  up to  "
-        };
-        spans.push(Span::styled(prefix, t.muted_style()));
-        spans.push(Span::styled(
-            format!("{}/{total}  ", cursor + 1),
-            Style::default().fg(t.accent).add_modifier(Modifier::BOLD),
-        ));
-        spans.push(Span::styled(what, t.text_style()));
-        if !step.when.is_empty() {
-            spans.push(Span::styled(format!("  {}", step.when), t.muted_style()));
-        }
-    }
     spans.push(Span::styled(
         format!(
             "  ·  {} file{}  ",
