@@ -235,6 +235,9 @@ pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
 
     let mut roots: Vec<FlowNode> = Vec::new();
     let mut unreachable: Vec<(usize, Symbol)> = Vec::new();
+    // Methods a framework calls (an overridden base-class method, a dunder), with
+    // what calls them.
+    let mut hooks: Vec<(usize, Symbol, String)> = Vec::new();
     let mut removed: Vec<(usize, Symbol)> = Vec::new();
     let mut truncated: Vec<FlowNode> = Vec::new();
 
@@ -261,7 +264,10 @@ pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
         let mut paths = index.paths_to_roots(&def, MAX_FLOW_ROUTES);
         let only_itself = paths.len() == 1 && paths[0].steps.len() == 1;
         if only_itself && !is_entry_point(ident, &file.path) {
-            unreachable.push((*file_idx, symbol.clone()));
+            match &def.hook_of {
+                Some(hook) => hooks.push((*file_idx, symbol.clone(), hook.clone())),
+                None => unreachable.push((*file_idx, symbol.clone())),
+            }
             continue;
         }
         // Draw the route from the most entry-point-like root (main, a handler, product
@@ -304,10 +310,36 @@ pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
             .find(|root| root.path == def.path && root.line == def.line)
         {
             Some(root) => {
+                let from_tests = !index.callers(ident, path, None).is_empty();
                 root.warning = Some(match symbol.change {
+                    SymbolChange::Added if from_tests => "only called from tests".to_string(),
                     SymbolChange::Added => "no callers".to_string(),
                     _ => "no callers found (registered by name?)".to_string(),
                 });
+                false
+            }
+            None => true,
+        }
+    });
+
+    // A hook that roots routes of its own (it calls other changed code) is drawn there,
+    // with the framework noted, rather than listed twice.
+    hooks.retain(|(file_idx, symbol, hook)| {
+        let path = &files[*file_idx].path;
+        let ident = symbol.ident.as_deref().unwrap_or_default();
+        let Some(def) = index
+            .defs_named(ident, path)
+            .into_iter()
+            .find(|d| d.path == *path)
+        else {
+            return true;
+        };
+        match roots
+            .iter_mut()
+            .find(|root| root.path == def.path && root.line == def.line)
+        {
+            Some(root) => {
+                root.note = Some(hook.clone());
                 false
             }
             None => true,
@@ -335,6 +367,31 @@ pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
             root.emit(1, &mut rows);
         }
     }
+    if !hooks.is_empty() {
+        rows.push(OutlineRow::Section {
+            prefix: String::new(),
+            label: "called by a framework",
+            count: hooks.len(),
+        });
+        for (file_idx, symbol, hook) in hooks {
+            let ident = symbol.ident.as_deref().unwrap_or_default();
+            let display = index
+                .defs_named(ident, &files[file_idx].path)
+                .first()
+                .map(|def| def.display.clone())
+                .unwrap_or_else(|| ident.to_string());
+            rows.push(OutlineRow::Flow {
+                depth: 1,
+                name: display,
+                location: format!("{}  ← {hook}", files[file_idx].path),
+                mark: Some(symbol.change),
+                file_idx: Some(file_idx),
+                hunk_idx: Some(symbol.hunk_idx),
+                is_target: true,
+                warning: None,
+            });
+        }
+    }
     if !unreachable.is_empty() {
         rows.push(OutlineRow::Section {
             prefix: String::new(),
@@ -350,7 +407,9 @@ pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
                 .unwrap_or_else(|| ident.to_string());
             // A modified function nothing calls is usually registered by name (a
             // decorator, a route table, a plugin hook) rather than forgotten.
+            let from_tests = !index.callers(ident, &files[file_idx].path, None).is_empty();
             let warning = match symbol.change {
+                SymbolChange::Added if from_tests => "only called from tests",
                 SymbolChange::Added => "no callers",
                 _ => "no callers found (registered by name?)",
             };
@@ -374,7 +433,7 @@ pub fn build_flow(files: &[FileDiff], index: &SymbolIndex) -> Vec<OutlineRow> {
         });
         for (file_idx, symbol) in removed {
             let ident = symbol.ident.as_deref().unwrap_or_default();
-            let survivors = index.callers(ident, &files[file_idx].path, None).len();
+            let survivors = index.callers_of_removed(ident, &files[file_idx].path).len();
             rows.push(OutlineRow::Flow {
                 depth: 1,
                 name: ident.to_string(),
@@ -397,6 +456,8 @@ struct FlowNode {
     /// The edge from this node to its child was matched by name only.
     ambiguous: bool,
     warning: Option<String>,
+    /// The framework that calls this root, when nothing in the repository does.
+    note: Option<String>,
     mark: Option<SymbolChange>,
     file_idx: Option<usize>,
     hunk_idx: Option<usize>,
@@ -414,15 +475,11 @@ impl FlowNode {
 
     fn emit(&self, depth: usize, rows: &mut Vec<OutlineRow>) {
         let mut location = format!("{}:{}", self.path, self.line);
-        if self.ambiguous {
-            location.push_str("  (next step matched by name only)");
+        if let Some(note) = &self.note {
+            location.push_str(&format!("  ← {note}"));
         }
-        if self.other_routes > 0 {
-            location.push_str(&format!(
-                "  ({} other route{})",
-                self.other_routes,
-                if self.other_routes == 1 { "" } else { "s" }
-            ));
+        if self.ambiguous {
+            location.push_str("  (matched by name)");
         }
         rows.push(OutlineRow::Flow {
             depth,
@@ -470,6 +527,7 @@ fn insert_route(
                     name: step.display.clone(),
                     ambiguous: step.ambiguous,
                     warning: None,
+                    note: None,
                     mark,
                     file_idx,
                     hunk_idx,
@@ -724,6 +782,7 @@ fn push_call_rows(
         callers,
         callees,
         warning,
+        ..
     }) = call_summary(index, file, ident, change)
     else {
         return; // unknown to the index (unsupported language, or only in the old tree)
@@ -881,6 +940,8 @@ pub struct CallSummary<'a> {
     pub callers: Vec<crate::symbols::Caller>,
     pub callees: Vec<(String, Vec<&'a crate::symbols::Def>)>,
     pub warning: Option<String>,
+    /// The framework that calls this method when nothing in the repository does.
+    pub hook_of: Option<String>,
 }
 
 /// Callers, callees and the review warning for a function symbol, or None when the
@@ -906,14 +967,17 @@ pub fn call_summary<'a>(
         return None;
     }
     let production = callers.iter().filter(|c| !c.from_test).count();
+    let hook = def.as_ref().and_then(|d| d.hook_of.clone());
     if def.as_ref().is_some_and(|d| d.is_test) {
         return Some(CallSummary {
             callers,
             callees,
             warning: None,
+            hook_of: hook,
         });
     }
     let warning = match change {
+        SymbolChange::Added if callers.is_empty() && hook.is_some() => None,
         SymbolChange::Added if callers.is_empty() && !is_entry_point(ident, &file.path) => {
             Some("no callers".to_string())
         }
@@ -929,6 +993,7 @@ pub fn call_summary<'a>(
         callers,
         callees,
         warning,
+        hook_of: hook,
     })
 }
 
@@ -943,15 +1008,27 @@ pub fn inline_call_context(summary: &CallSummary<'_>, label: Option<&str>, width
     if let Some(warning) = &summary.warning {
         parts.push(format!("⚠ {warning}"));
     }
-    if !summary.callers.is_empty() {
-        let names: Vec<String> = summary
-            .callers
+    let (called, used): (Vec<_>, Vec<_>) = summary
+        .callers
+        .iter()
+        .partition(|caller| !caller.is_reference);
+    let names = |callers: &[&crate::symbols::Caller]| -> Vec<String> {
+        callers
             .iter()
             .map(|c| c.from.clone().unwrap_or_else(|| "(top level)".to_string()))
-            .collect();
-        parts.push(format!("called by {}", join_limited(&names, 4)));
-    } else if summary.warning.is_none() {
-        parts.push("no callers".to_string());
+            .collect()
+    };
+    if !called.is_empty() {
+        parts.push(format!("called by {}", join_limited(&names(&called), 4)));
+    }
+    if !used.is_empty() {
+        parts.push(format!("used by {}", join_limited(&names(&used), 4)));
+    }
+    if summary.callers.is_empty() && summary.warning.is_none() {
+        match &summary.hook_of {
+            Some(hook) => parts.push(format!("called by {hook}")),
+            None => parts.push("no callers".to_string()),
+        }
     }
     if !summary.callees.is_empty() {
         let names: Vec<String> = summary
@@ -1672,7 +1749,7 @@ mod tests {
                 "       handle",
                 "+        leaf",
                 "[no route from any entry point 1]",
-                "+    orphan ⚠ no callers",
+                "+    orphan ⚠ only called from tests",
             ]
         );
     }
