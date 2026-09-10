@@ -94,6 +94,19 @@ fn handle_key_with_set_mode(
                 app.set_status("Nothing between the base and now to step through");
             }
         }
+        KeyCode::Char('M') if !ctrl && key.kind == KeyEventKind::Press => {
+            if app.music.take().is_some() {
+                app.set_status("Music off");
+            } else {
+                match crate::music::Music::start() {
+                    Ok(music) => {
+                        app.music = Some(music);
+                        app.set_status("Music on - M to stop");
+                    }
+                    Err(error) => app.set_status(format!("Cannot play music: {error}")),
+                }
+            }
+        }
         KeyCode::Char('?') => {
             app.show_help = !app.show_help;
         }
@@ -1073,6 +1086,28 @@ mod tests {
     fn main_key(app: &mut App, code: KeyCode, modifiers: KeyModifiers) -> bool {
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
         super::handle_key_bounded(app, KeyEvent::new(code, modifiers), &tx)
+    }
+
+    #[test]
+    fn music_starts_off_and_ignores_repeat_release_and_control() {
+        let mut app = app_with_filtered_comment_browser();
+        assert!(app.music.is_none());
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        for kind in [
+            crossterm::event::KeyEventKind::Repeat,
+            crossterm::event::KeyEventKind::Release,
+        ] {
+            let key = KeyEvent::new_with_kind(KeyCode::Char('M'), KeyModifiers::SHIFT, kind);
+            assert!(!super::handle_key_bounded(&mut app, key, &tx));
+            assert!(app.music.is_none());
+        }
+        assert!(!main_key(
+            &mut app,
+            KeyCode::Char('M'),
+            KeyModifiers::CONTROL
+        ));
+        assert!(app.music.is_none());
+        assert!(app.status_message.is_none());
     }
 
     #[test]

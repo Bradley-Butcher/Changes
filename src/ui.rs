@@ -2032,6 +2032,20 @@ fn draw_status_bar(frame: &mut Frame, app: &App, hints: &mut LayoutHints, area: 
     ));
     hints.view_badge_pos = (col_before_view, col_before_view + view_width);
     hints.status_bar_row = area.y;
+    if let Some(music) = &app.music {
+        spans.push(Span::styled("  ·  M ", t.muted_style()));
+        let bars = music.animation();
+        for (index, bar) in bars.chars().enumerate() {
+            let colour = if index < 4 {
+                t.muted
+            } else if index < 8 {
+                t.add_fg
+            } else {
+                t.text
+            };
+            spans.push(Span::styled(bar.to_string(), Style::default().fg(colour)));
+        }
+    }
 
     // Transient message, error, or warning takes precedence over the key hints.
     let message: Option<(String, Style)> = if let Some((ref msg, _)) = app.status_message {
@@ -2598,6 +2612,7 @@ const HELP_RIGHT: HelpColumn = &[
     (
         "General",
         &[
+            ("M", "Music on / off"),
             ("?", "Toggle this help"),
             ("Esc", "Close popup"),
             ("q  Ctrl+C", "Quit"),

@@ -204,6 +204,9 @@ async fn run_loop(
         } else {
             IDLE_TICK
         };
+        if app.music.is_some() {
+            tick_dur = tick_dur.min(Duration::from_millis(100));
+        }
         // Wake for the earliest settle deadline so snapshots are taken on time.
         let now = Instant::now();
         if let Some(deadline) = ch.settle.values().min() {
@@ -404,6 +407,7 @@ fn handle_event(
             }
         }
         AppEvent::Tick => {
+            *needs_redraw |= app.music.is_some();
             let now = Instant::now();
             let due: Vec<u64> = ch
                 .settle

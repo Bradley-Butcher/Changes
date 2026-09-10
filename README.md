@@ -72,6 +72,7 @@ sudo mv changes /usr/local/bin/
 ### From source
 
 ```sh
+# Linux build requirement: sudo apt install libasound2-dev
 cargo install --path .
 ```
 
@@ -161,6 +162,7 @@ The `┃` gutter bar marks the hunk that `y` / `n` / `N` act on. Click a hunk or
 | `a` / `x` | Add / remove repo tab |
 | `Tab` / `Shift+Tab` / `1`-`9` | Switch tabs |
 | Click `↕ N` | Expand hidden context lines |
+| `M` | Start / stop bit-style instrumental music (off at startup) |
 | `?` | Help |
 | `q` / `Ctrl+C` | Quit |
 
