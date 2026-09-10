@@ -226,6 +226,11 @@ enum DiffSpec {
     TreeToWorkdir {
         old_tree: Option<Oid>,
     },
+    /// A recorded working tree against the files on disk, the index left out of it: a
+    /// file the recording holds and the index does not is untracked, not deleted.
+    SnapshotToWorkdir {
+        old_tree: Oid,
+    },
     TreeToTree {
         old_tree: Oid,
         new_tree: Oid,
@@ -236,7 +241,9 @@ impl DiffSpec {
     fn new_side_is_workdir(self) -> bool {
         matches!(
             self,
-            DiffSpec::IndexToWorkdir | DiffSpec::TreeToWorkdir { .. }
+            DiffSpec::IndexToWorkdir
+                | DiffSpec::TreeToWorkdir { .. }
+                | DiffSpec::SnapshotToWorkdir { .. }
         )
     }
 }
@@ -266,6 +273,10 @@ fn build_diff(repo: &Repository, spec: DiffSpec) -> Result<git2::Diff<'_>> {
         DiffSpec::TreeToWorkdir { old_tree } => {
             let tree = old_tree.map(|id| repo.find_tree(id)).transpose()?;
             repo.diff_tree_to_workdir_with_index(tree.as_ref(), Some(&mut opts))?
+        }
+        DiffSpec::SnapshotToWorkdir { old_tree } => {
+            let tree = repo.find_tree(old_tree)?;
+            repo.diff_tree_to_workdir(Some(&tree), Some(&mut opts))?
         }
         DiffSpec::TreeToTree { old_tree, new_tree } => {
             let old = repo.find_tree(old_tree)?;
@@ -313,7 +324,10 @@ pub fn compute_diff(
                 None => None,
             };
             match to {
-                RangeEnd::Workdir => DiffSpec::TreeToWorkdir { old_tree },
+                RangeEnd::Workdir => match old_tree {
+                    Some(old_tree) => DiffSpec::SnapshotToWorkdir { old_tree },
+                    None => DiffSpec::TreeToWorkdir { old_tree: None },
+                },
                 RangeEnd::Commit(id) => DiffSpec::TreeToTree {
                     old_tree: match old_tree {
                         Some(tree) => tree,
@@ -1952,6 +1966,39 @@ mod tests {
         let paths: Vec<&str> = files.iter().map(|file| file.path.as_str()).collect();
         assert_eq!(paths, ["b.txt"]);
         assert_eq!(files[0].additions, 1);
+    }
+
+    #[test]
+    fn untracked_files_in_a_snapshot_are_not_deleted_at_the_working_tree() {
+        let repo_path = temp_path("snapshot-untracked");
+        std::fs::create_dir(&repo_path).unwrap();
+        let repo = git2::Repository::init(&repo_path).unwrap();
+        std::fs::write(repo_path.join("a.txt"), "a\n").unwrap();
+        commit_all(&repo, "first");
+        drop(repo);
+
+        // Untracked files appear and are recorded; they are still on disk, untouched.
+        std::fs::write(repo_path.join("new.txt"), "new\n").unwrap();
+        std::fs::create_dir_all(repo_path.join("docs/deep")).unwrap();
+        std::fs::write(repo_path.join("docs/deep/note.md"), "note\n").unwrap();
+        let snapshot = crate::snapshots::record(&repo_path, "master")
+            .unwrap()
+            .expect("snapshot recorded");
+        std::fs::write(repo_path.join("a.txt"), "a edited\n").unwrap();
+
+        let step = DiffMode::Range {
+            from: Some(snapshot.to_string()),
+            to: RangeEnd::Workdir,
+            kind: RangeKind::Step,
+        };
+        let files = compute_diff(&repo_path, &step, None).unwrap();
+        std::fs::remove_dir_all(&repo_path).unwrap();
+
+        let described: Vec<(String, FileStatus)> = files
+            .iter()
+            .map(|file| (file.path.clone(), file.status))
+            .collect();
+        assert_eq!(described, [("a.txt".to_string(), FileStatus::Modified)]);
     }
 
     #[test]

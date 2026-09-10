@@ -3,7 +3,7 @@ use ratatui::text::{Line, Span};
 use std::collections::HashMap;
 use std::path::Path;
 use syntect::easy::HighlightLines;
-use syntect::highlighting::{self, ThemeSet};
+use syntect::highlighting::{self, FontStyle, ScopeSelectors, StyleModifier, Theme, ThemeItem};
 use syntect::parsing::{SyntaxReference, SyntaxSet};
 
 const MAX_SYNTAX_CACHE_ENTRIES: usize = 128;
@@ -50,7 +50,7 @@ impl HighlightCache {
 
 pub struct Highlighter {
     syntax_set: SyntaxSet,
-    theme_set: ThemeSet,
+    theme: Theme,
     /// Maps file extensions, or extensionless file names, to syntax names.
     syntax_cache: std::cell::RefCell<HashMap<String, String>>,
     highlight_cache: std::cell::RefCell<HighlightCache>,
@@ -66,7 +66,7 @@ impl Highlighter {
     pub fn new() -> Self {
         Self {
             syntax_set: SyntaxSet::load_defaults_newlines(),
-            theme_set: ThemeSet::load_defaults(),
+            theme: ansi_theme(),
             syntax_cache: std::cell::RefCell::new(HashMap::new()),
             highlight_cache: std::cell::RefCell::new(HighlightCache::default()),
         }
@@ -131,8 +131,7 @@ impl Highlighter {
         let cached = if let Some(cached) = self.highlight_cache.borrow_mut().get(&cache_key) {
             cached
         } else {
-            let theme = &self.theme_set.themes[crate::theme::theme().syntax];
-            let mut h = HighlightLines::new(syntax, theme);
+            let mut h = HighlightLines::new(syntax, &self.theme);
             let regions = match h.highlight_line(text, &self.syntax_set) {
                 Ok(regions) => regions,
                 Err(_) => {
@@ -145,17 +144,8 @@ impl Highlighter {
                 .map(|(style, content)| CachedSpan {
                     content: content.to_string(),
                     fg: syntect_color_to_ratatui(style.foreground),
-                    bg: if style.background
-                        != (highlighting::Color {
-                            r: 0,
-                            g: 0,
-                            b: 0,
-                            a: 0,
-                        }) {
-                        Some(syntect_color_to_ratatui(style.background))
-                    } else {
-                        None
-                    },
+                    // The theme paints no backgrounds; the diff tints are the only ones.
+                    bg: None,
                     modifiers: syntect_modifiers(style.font_style),
                 })
                 .collect();
@@ -221,8 +211,113 @@ struct CachedSpan {
     modifiers: Modifier,
 }
 
+/// The terminal's own palette, encoded in syntect colours: alpha 0 marks an ANSI slot
+/// held in the red channel, `DEFAULT_FG` the terminal's default foreground.
+const ANSI_ALPHA: u8 = 0;
+const DEFAULT_FG: u8 = 255;
+
+const fn ansi(index: u8) -> highlighting::Color {
+    highlighting::Color {
+        r: index,
+        g: 0,
+        b: 0,
+        a: ANSI_ALPHA,
+    }
+}
+
+/// Syntax colours from the terminal's palette, so code reads the way it does in the
+/// user's editor and shell rather than in a theme of our own. No backgrounds: the diff
+/// tints supply those.
+fn ansi_theme() -> Theme {
+    const RED: u8 = 1;
+    const GREEN: u8 = 2;
+    const YELLOW: u8 = 3;
+    const BLUE: u8 = 4;
+    const MAGENTA: u8 = 5;
+    const CYAN: u8 = 6;
+    const MUTED: u8 = 8;
+    let item = |scope: &str, fg: Option<u8>, font: FontStyle| ThemeItem {
+        scope: scope
+            .parse::<ScopeSelectors>()
+            .expect("valid scope selector"),
+        style: StyleModifier {
+            foreground: fg.map(ansi),
+            background: None,
+            font_style: Some(font),
+        },
+    };
+    let plain = FontStyle::empty();
+    let mut theme = Theme::default();
+    theme.settings.foreground = Some(ansi(DEFAULT_FG));
+    theme.settings.background = Some(highlighting::Color::BLACK);
+    theme.scopes = vec![
+        item("comment", Some(MUTED), FontStyle::ITALIC),
+        item("string", Some(GREEN), plain),
+        item("string.regexp", Some(RED), plain),
+        item(
+            "constant.numeric, constant.language, constant.character",
+            Some(MAGENTA),
+            plain,
+        ),
+        item("constant.other", Some(CYAN), plain),
+        item("keyword, storage", Some(BLUE), plain),
+        item("keyword.control", Some(MAGENTA), plain),
+        item(
+            "keyword.operator, keyword.other.unit",
+            Some(DEFAULT_FG),
+            plain,
+        ),
+        item(
+            "entity.name.type, entity.name.class, entity.name.struct, entity.name.enum, entity.name.trait, entity.name.namespace, entity.other.inherited-class, support.type, support.class",
+            Some(CYAN),
+            plain,
+        ),
+        item(
+            "entity.name.function, support.function, support.macro, entity.name.macro",
+            Some(YELLOW),
+            plain,
+        ),
+        item(
+            "meta.annotation, meta.attribute, entity.name.function.decorator, punctuation.definition.annotation",
+            Some(YELLOW),
+            plain,
+        ),
+        item("entity.name.tag", Some(BLUE), plain),
+        item("entity.other.attribute-name", Some(CYAN), plain),
+        item("variable.parameter", None, plain),
+        item("markup.heading", Some(BLUE), FontStyle::BOLD),
+        item("markup.bold", None, FontStyle::BOLD),
+        item("markup.italic", None, FontStyle::ITALIC),
+        item("markup.raw, markup.inline.raw", Some(GREEN), plain),
+        item(
+            "markup.underline.link, markup.link",
+            Some(CYAN),
+            FontStyle::UNDERLINE,
+        ),
+        item(
+            "markup.list.numbered.bullet, markup.list.unnumbered.bullet, punctuation.definition.list_item",
+            Some(MUTED),
+            plain,
+        ),
+        item("markup.quote", Some(MUTED), FontStyle::ITALIC),
+        item("meta.diff.header, meta.separator", Some(MUTED), plain),
+        item("markup.inserted", Some(GREEN), plain),
+        item("markup.deleted", Some(RED), plain),
+        item("invalid", Some(RED), plain),
+    ];
+    theme
+}
+
 fn syntect_color_to_ratatui(c: highlighting::Color) -> Color {
-    Color::Rgb(c.r, c.g, c.b)
+    if c.a == ANSI_ALPHA {
+        if c.r == DEFAULT_FG {
+            Color::Reset
+        } else {
+            Color::Indexed(c.r)
+        }
+    } else {
+        Color::Rgb(c.r, c.g, c.b)
+    }
 }
 
 fn syntect_modifiers(font_style: highlighting::FontStyle) -> Modifier {

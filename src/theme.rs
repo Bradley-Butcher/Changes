@@ -52,8 +52,6 @@ pub struct Theme {
     pub popup_bg: Color,
     /// Brief highlight after a copy.
     pub flash: Color,
-    /// syntect theme name for code highlighting.
-    pub syntax: &'static str,
 }
 
 const DARK: Theme = Theme {
@@ -73,7 +71,6 @@ const DARK: Theme = Theme {
     surface_raised: Color::Rgb(48, 52, 64),
     popup_bg: Color::Rgb(26, 28, 35),
     flash: Color::Rgb(78, 74, 28),
-    syntax: "base16-ocean.dark",
 };
 
 const LIGHT: Theme = Theme {
@@ -93,7 +90,6 @@ const LIGHT: Theme = Theme {
     surface_raised: Color::Rgb(214, 218, 228),
     popup_bg: Color::Rgb(246, 247, 250),
     flash: Color::Rgb(252, 240, 170),
-    syntax: "InspiredGitHub",
 };
 
 static ACTIVE: OnceLock<Theme> = OnceLock::new();
