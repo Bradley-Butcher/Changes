@@ -866,7 +866,7 @@ impl App {
             .bases
             .as_ref()
             .and_then(|b| b.branch.clone())
-            .or_else(|| git::detect_bases(&repo.info.path).branch)?;
+            .or_else(|| git::detect_bases_quickly(&repo.info.path).branch)?;
         Some((repo.info.path.clone(), branch))
     }
 
@@ -2532,10 +2532,13 @@ struct DiffJob {
 
 impl DiffJob {
     fn run(self) -> DiffResult {
+        // Before detection has finished (the first diff), the cheap bases will do: the
+        // Graphite parent only matters to a branch comparison, and the base refresh
+        // recomputes the diff when it arrives with one.
         let bases = self
             .bases
             .clone()
-            .unwrap_or_else(|| git::detect_bases(&self.path));
+            .unwrap_or_else(|| git::detect_bases_quickly(&self.path));
         let steps = git::timeline_for_mode(&self.path, &self.mode, &bases).unwrap_or_default();
         let last = steps.len().saturating_sub(1);
         let cursor = self

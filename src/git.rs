@@ -1107,12 +1107,18 @@ fn count_blob_lines(bytes: &[u8]) -> usize {
 /// Everything the current branch could be compared against. Runs `gt parent` (bounded
 /// by a timeout), so it belongs off the UI thread.
 pub fn detect_bases(repo_path: &Path) -> BaseCandidates {
-    let parent = graphite_parent(repo_path);
+    BaseCandidates {
+        parent: graphite_parent(repo_path),
+        ..detect_bases_quickly(repo_path)
+    }
+}
+
+/// The bases libgit2 alone can answer, in a few milliseconds: the branch, its upstream
+/// and the trunk. No Graphite parent, which needs a subprocess that can take seconds.
+/// What the first diff uses, so hunks appear before `gt` has answered.
+pub fn detect_bases_quickly(repo_path: &Path) -> BaseCandidates {
     let Ok(repo) = Repository::open(repo_path) else {
-        return BaseCandidates {
-            parent,
-            ..BaseCandidates::default()
-        };
+        return BaseCandidates::default();
     };
     let branch = repo
         .head()
@@ -1121,7 +1127,7 @@ pub fn detect_bases(repo_path: &Path) -> BaseCandidates {
     let trunk = remote_default_branch(&repo).or_else(|| find_common_base_branch(&repo));
     let upstream = branch.as_deref().and_then(|name| upstream_of(&repo, name));
     BaseCandidates {
-        parent,
+        parent: None,
         trunk,
         upstream,
         branch,
